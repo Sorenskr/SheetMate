@@ -1,0 +1,16 @@
+# 虚拟环境与构建产物
+.venv/
+venv/
+build/
+dist/
+_release_*/
+__pycache__/
+*.py[cod]
+
+# 运行时数据、日志与个人登录态（严禁上传）
+browser_data/
+temp/
+*.log
+config.json
+_sheetmate_tmp*.png
+_sheetmate_check_tmp.png
