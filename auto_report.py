@@ -1026,13 +1026,20 @@ def _active_cell_rect(page, cell):
     return box, rect
 
 
-def _select_wps_range(page, last_row, use_mouse=True):
-    """选中 C6:AJ{last_row}：优先 20% 缩放鼠标框选，未命中则自动键盘精确选区。"""
+def _select_wps_range(page, last_row, end_col="AK", use_mouse=True):
+    """选中 C6:AK{last_row}（允许 AJ~AK 列）：20% 缩放框选，失败改用 Shift+终点点击，彻底绕开合并单元格跳列。"""
+    def _verify_range(selection):
+        m = re.search(r"(\d+)R\s*x\s*(\d+)C", selection or "")
+        rows = int(m.group(1)) if m else 0
+        cols = int(m.group(2)) if m else 0
+        if rows != last_row - 5 or not (34 <= cols <= 35):
+            raise RuntimeError(f"框选回读为 {selection or '未知'}")
+
     if use_mouse:
         try:
             _set_wps_zoom(page, 20)
             box, sr = _active_cell_rect(page, "C6")
-            _, er = _active_cell_rect(page, f"AJ{last_row}")
+            _, er = _active_cell_rect(page, f"{end_col}{last_row}")
             box, sr = _active_cell_rect(page, "C6")
             sx = box["x"] + sr[0] + 5
             sy = box["y"] + sr[1] + max(2, (sr[3] - sr[1]) // 2)
@@ -1044,31 +1051,40 @@ def _select_wps_range(page, last_row, use_mouse=True):
             time.sleep(0.25)
             selection = page.eval_on_selector("input.edit-box", "e=>e.value")
             page.mouse.up()
-            m = re.search(r"(\d+)R\s*x\s*(\d+)C", selection or "")
-            rows = int(m.group(1)) if m else 0
-            cols = int(m.group(2)) if m else 0
-            if rows != last_row - 5 or cols < 34:
-                raise RuntimeError(f"框选回读为 {selection or '未知'}")
-            log(f"  已用鼠标框选 C6:AJ{last_row}")
-            return
+            _verify_range(selection)
+            log(f"  已用鼠标框选 C6:{end_col}{last_row}（{selection}）")
+            return True
         except Exception as e:
             try:
                 page.mouse.up()
             except Exception:
                 pass
-            log(f"  鼠标框选未命中，改为键盘精确选区：{human_error(e)}")
+            log(f"  鼠标框选未命中，改为 Shift+终点精确框选：{human_error(e)}")
 
+    _set_wps_zoom(page, 20)
+    box, er = _active_cell_rect(page, f"{end_col}{last_row}")
+    ex = box["x"] + (er[0] + er[2]) // 2
+    ey = box["y"] + (er[1] + er[3]) // 2
     _goto_cell(page, "C6")
-    for _ in range(max(0, last_row - 6)):
-        page.keyboard.press("Shift+ArrowDown")
-    for _ in range(_col_letter_to_idx("AJ") - _col_letter_to_idx("C")):
-        page.keyboard.press("Shift+ArrowRight")
+    time.sleep(0.25)
+    page.keyboard.down("Shift")
+    try:
+        page.mouse.click(ex, ey)
+    finally:
+        page.keyboard.up("Shift")
     time.sleep(0.35)
-    log(f"  已选中区域 C6:AJ{last_row}")
+    try:
+        selection = page.eval_on_selector("input.edit-box", "e=>e.value")
+        _verify_range(selection)
+        log(f"  已精准框选 C6:{end_col}{last_row}（{selection}）")
+        return True
+    except Exception as e2:
+        log(f"  Shift+点击回读异常，按当前选区继续并依赖白边兜底：{human_error(e2)}")
+        return False
 
 
 def _find_selection_right_click_point(page):
-    """在主画布上识别绿色选区边框并计算安全内部右键坐标，绝不写死 (500, 500)。"""
+    """按 1px 步长沿横纵探测线识别绿色选区边框，绝不漏检 1px 细边框。"""
     canvases = []
     for c in page.query_selector_all("canvas"):
         try:
@@ -1087,21 +1103,33 @@ def _find_selection_right_click_point(page):
         min_y = im.height
         max_x = -1
         max_y = -1
-        for y in range(0, im.height, 2):
-            for x in range(0, im.width, 2):
-                r, g, b = pix[x, y]
-                if abs(r - 16) < 28 and abs(g - 153) < 34 and abs(b - 104) < 34:
-                    if x < min_x:
-                        min_x = x
-                    if x > max_x:
-                        max_x = x
-                    if y < min_y:
-                        min_y = y
-                    if y > max_y:
-                        max_y = y
-        if max_x - min_x >= 40 and max_y - min_y >= 14:
+
+        def _hit_green(px_x, px_y):
+            nonlocal min_x, min_y, max_x, max_y
+            r, g, b = pix[px_x, px_y]
+            if abs(r - 16) < 28 and abs(g - 153) < 34 and abs(b - 104) < 34:
+                if px_x < min_x:
+                    min_x = px_x
+                if px_x > max_x:
+                    max_x = px_x
+                if px_y < min_y:
+                    min_y = px_y
+                if px_y > max_y:
+                    max_y = px_y
+
+        for x in range(0, im.width, 16):
+            for y in range(im.height):
+                _hit_green(x, y)
+        for y in range(0, im.height, 16):
+            for x in range(im.width):
+                _hit_green(x, y)
+
+        if max_x - min_x >= 40:
             rx = box["x"] + min(max_x - 16, min_x + max(30, (max_x - min_x) // 4))
-            ry = box["y"] + min(max_y - 10, min_y + max(10, min(28, (max_y - min_y) // 2)))
+            if max_y - min_y >= 14:
+                ry = box["y"] + min(max_y - 10, min_y + max(14, min(32, (max_y - min_y) // 2)))
+            else:
+                ry = box["y"] + min(im.height - 16, min_y + 24)
             return rx, ry, True
     except Exception:
         pass
@@ -1152,8 +1180,51 @@ def _verify_clipboard_image_size():
     return True, None
 
 
+def _trim_image_right_blank(im):
+    """裁除图片右侧纯白多余列并保留 4px 自然边距，返回 (img_out, orig_w, new_w)。"""
+    rgb = im.convert("RGB")
+    w, h = rgb.size
+    mask = rgb.point(lambda v: 255 if v < 246 else 0)
+    bbox = mask.getbbox()
+    if bbox is None:
+        return im, w, w
+    right_x = bbox[2] - 1
+    if right_x < int(w * 0.25):
+        return im, w, w
+    if w - 1 - right_x > 12:
+        new_w = min(w, right_x + 5)
+        return rgb.crop((0, 0, new_w, h)), w, new_w
+    return im, w, w
+
+
+def _trim_clipboard_image_right_blank():
+    """检查剪贴板图片右侧是否存在多余纯白列，如有则无损裁切并写回剪贴板。"""
+    tmp_trim = app_dir() / "_sheetmate_trim_tmp.png"
+    try:
+        if save_clipboard_image_if_exists(tmp_trim) != "saved" or not tmp_trim.exists():
+            return False
+        with Image.open(tmp_trim) as im:
+            trimmed, orig_w, new_w = _trim_image_right_blank(im)
+            if new_w >= orig_w:
+                return False
+            trimmed.save(tmp_trim, "PNG", optimize=True)
+        if set_clipboard_image_from_file(tmp_trim):
+            log(f"  已自动裁除右侧多余白边：宽度 {orig_w} -> {new_w}px")
+            return True
+    except Exception as e:
+        log(f"  白边裁切跳过（保留原图）：{human_error(e)}")
+    finally:
+        for p_del in (tmp_trim, tmp_trim.with_name(tmp_trim.stem + "_send.png")):
+            try:
+                if p_del.exists():
+                    p_del.unlink()
+            except Exception:
+                pass
+    return False
+
+
 def capture_wps_region(page):
-    """按 Q 列（失败则 D 列兜底）确定末行，框选 C6:AJ 并高清复制为图片。"""
+    """按 Q 列（失败则 D 列兜底）确定末行，框选 C6:AK 并高清复制为图片。"""
     check_stop()
     log("  准备按 Q 列末行框选表格…")
     last_row = 8
@@ -1174,9 +1245,9 @@ def capture_wps_region(page):
         d_cand = _detect_last_row(page, "D8")
         if d_cand and d_cand > last_row and d_cand <= 300:
             last_row = d_cand
-    log(f"  Q 列最后有文字的是第 {last_row} 行，目标 C6:AJ{last_row}")
+    log(f"  Q 列最后有文字的是第 {last_row} 行，目标 C6:AK{last_row}")
 
-    _select_wps_range(page, last_row, use_mouse=True)
+    selected_ok = _select_wps_range(page, last_row, end_col="AK", use_mouse=True)
     try:
         _set_wps_zoom(page, 200)
     except Exception:
@@ -1195,12 +1266,19 @@ def capture_wps_region(page):
                 time.sleep(0.25)
             except Exception:
                 pass
-            _select_wps_range(page, last_row, use_mouse=False)
+            _select_wps_range(page, last_row, end_col="AK", use_mouse=False)
+            try:
+                _set_wps_zoom(page, 200)
+            except Exception:
+                pass
 
         rx, ry, hit_green = _find_selection_right_click_point(page)
-        if not hit_green and copy_attempt == 0:
-            # 缩放后若选区已滚出可视区或丢失，用键盘重新选区使 C6 回到左上可视区域
-            _select_wps_range(page, last_row, use_mouse=False)
+        if not hit_green and copy_attempt == 0 and not selected_ok:
+            _select_wps_range(page, last_row, end_col="AK", use_mouse=False)
+            try:
+                _set_wps_zoom(page, 200)
+            except Exception:
+                pass
             rx, ry, _ = _find_selection_right_click_point(page)
 
         page.mouse.click(rx, ry, button="right")
@@ -1215,6 +1293,7 @@ def capture_wps_region(page):
             if clipboard_has_image():
                 ok_size, sz = _verify_clipboard_image_size()
                 if ok_size:
+                    _trim_clipboard_image_right_blank()
                     log("  图片已复制到剪贴板")
                     return
                 log(f"  检测到图片尺寸异常（{sz}），准备重新框选复制…")

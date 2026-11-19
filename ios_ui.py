@@ -1779,7 +1779,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
               <div class="row-main">
                 <div class="row-title">复制汇总表图片</div>
-                <div class="row-sub">选中 C6:AJ 并高清复制到剪贴板</div>
+                <div class="row-sub">选中 C6:AK 并高清复制到剪贴板</div>
               </div>
               <label class="ios-switch"><input type="checkbox" id="enableCapture" /><span class="ios-slider"></span></label>
             </div>
