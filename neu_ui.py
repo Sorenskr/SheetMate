@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pyright: reportMissingImports=false, reportMissingModuleSource=false
 """
 暗号表助手 · 新拟态 UI 模块
 纯 tkinter + PIL 自绘：软阴影、凸起/按压、开关、步进器、分段、输入框、
@@ -7,6 +8,7 @@
 import ctypes
 import math
 import os
+import queue
 import tkinter as tk
 from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
@@ -853,12 +855,16 @@ def slide_in(widget, parent, x, y, distance=26, duration=260, **place_kw):
 
 # ==================== 桌面灵动岛毛玻璃进度浮窗 ====================
 class GlassProgress:
-    """置顶无边框 Dynamic Island 灵动岛风格浮窗，实时显示步骤文字与圆角胶囊进度条。"""
-    KEY = "black"
+    """置顶无边框 Dynamic Island 灵动岛风格浮窗：显示进度、暂停/继续/取消按键与异常排障恢复指引。"""
+    # 使用极暗近似黑而非纯 black(#000000)，避免深色文字/图标被 Windows 透明色键误穿透
+    KEY = "#010203"
 
-    def __init__(self, master, title="暗号表助手"):
+    def __init__(self, master, title="暗号表助手", on_pause=None, on_resume=None, on_cancel=None):
         self.master = master
         self.title_text = title
+        self._on_pause = on_pause
+        self._on_resume = on_resume
+        self._on_cancel = on_cancel
         self.win = None
         self.closed = False
         self.glass_ok = False
@@ -868,10 +874,39 @@ class GlassProgress:
         self._bar_color = "#0a84ff"
         self._close_timer = None
         self._drag_offset = None
-        self.OPACITY = 0.94
-        self.W, self.H = 420, 96
+        self._rt_state = {
+            "paused": False,
+            "waiting_recovery": False,
+            "prompt": {
+                "mode": "running",
+                "title": "",
+                "detail": "",
+                "hint": "按键提示：临时用电脑可点【暂停】，忙完点【继续】；点【取消】终止本轮",
+                "actions": [],
+            },
+        }
+        self._action_widgets = []
+        self.OPACITY = 0.96
+        self.W = 508
+        self.H_COMPACT = 154
+        self.H_PAUSED = 224
+        self.H_EXPANDED = 286
+        self.H = self.H_COMPACT
         sw = master.winfo_screenwidth()
         self.x, self.y = max(12, (sw - self.W) // 2), 18
+        self._ui_queue = queue.SimpleQueue()
+        try:
+            self.master.after(35, self._pump_ui)
+        except Exception:
+            pass
+
+    def set_callbacks(self, on_pause=None, on_resume=None, on_cancel=None):
+        if on_pause is not None:
+            self._on_pause = on_pause
+        if on_resume is not None:
+            self._on_resume = on_resume
+        if on_cancel is not None:
+            self._on_cancel = on_cancel
 
     def _ensure_win(self):
         # 延迟到第一次 show 时才真正创建窗口，避免初始窗口闪现/未隐藏
@@ -907,7 +942,7 @@ class GlassProgress:
             swca = user32.SetWindowCompositionAttribute
             swca.restype = ctypes.c_int
             swca.argtypes = [wintypes.HWND, ctypes.POINTER(WDATA)]
-            r, g, b, al = 18, 20, 26, 205
+            r, g, b, al = 18, 20, 28, 218
             grad = (al << 24) | (b << 16) | (g << 8) | r
             acc = ACCENT(4, 2, grad, 0)
             wd = WDATA(19, ctypes.cast(ctypes.pointer(acc),
@@ -920,26 +955,9 @@ class GlassProgress:
             self.glass_ok = True
         except Exception:
             self.glass_ok = False
-            self.win.configure(bg="#14161d")
+            self.win.configure(bg="#151822")
 
-    def _build(self):
-        w = self.win
-        self.dot_lab = tk.Label(w, text="●", bg=self.KEY, fg="#0a84ff",
-                                font=("Microsoft YaHei UI", 10))
-        self.dot_lab.place(x=20, y=15)
-        tk.Label(w, text=self.title_text, bg=self.KEY, fg="#9ca3af",
-                 font=("Microsoft YaHei UI", 10, "bold")).place(x=38, y=14)
-        self.pct_lab = tk.Label(w, text="0%", bg=self.KEY, fg="#f3f4f6",
-                                font=("Microsoft YaHei UI", 11, "bold"), anchor="e")
-        self.pct_lab.place(x=self.W - 76, y=13, width=54)
-        self.step_lab = tk.Label(w, text="准备开始…", bg=self.KEY, fg="#ffffff",
-                                 font=("Microsoft YaHei UI", 12, "bold"), anchor="w")
-        self.step_lab.place(x=20, y=39, width=self.W - 40)
-        self.cv = tk.Canvas(w, bg=self.KEY, highlightthickness=0, bd=0)
-        self.cv.place(x=20, y=72, width=self.W - 40, height=8)
-        self.bw = self.W - 40
-
-        # 无边框灵动岛浮窗整体可拖动
+    def _bind_drag(self, widget):
         def drag_start(e):
             self._drag_offset = (e.x_root - self.win.winfo_x(),
                                  e.y_root - self.win.winfo_y())
@@ -954,13 +972,222 @@ class GlassProgress:
         def drag_end(_e):
             self._drag_offset = None
 
-        for widget in (w, *w.winfo_children()):
-            widget.bind("<Button-1>", drag_start)
-            widget.bind("<B1-Motion>", drag_move)
-            widget.bind("<ButtonRelease-1>", drag_end)
-        for child in w.winfo_children():
-            if isinstance(child, tk.Label):
-                child.configure(cursor="fleur")
+        widget.bind("<Button-1>", drag_start)
+        widget.bind("<B1-Motion>", drag_move)
+        widget.bind("<ButtonRelease-1>", drag_end)
+
+    def _build(self):
+        w = self.win
+        self.dot_lab = tk.Label(w, text="●", bg=self.KEY, fg="#0a84ff",
+                                font=("Microsoft YaHei UI", 10))
+        self.dot_lab.place(x=20, y=13)
+        self.title_lab = tk.Label(w, text=f"{self.title_text} · 运行中", bg=self.KEY, fg="#a5b1c2",
+                                  font=("Microsoft YaHei UI", 10, "bold"), anchor="w")
+        self.title_lab.place(x=38, y=13, width=self.W - 125)
+        self.pct_lab = tk.Label(w, text="0%", bg=self.KEY, fg="#f3f4f6",
+                                font=("Microsoft YaHei UI", 11, "bold"), anchor="e")
+        self.pct_lab.place(x=self.W - 78, y=12, width=56)
+
+        self.step_lab = tk.Label(w, text="准备开始…", bg=self.KEY, fg="#ffffff",
+                                 font=("Microsoft YaHei UI", 11, "bold"), anchor="w")
+        self.step_lab.place(x=20, y=38, width=self.W - 40)
+
+        self.cv = tk.Canvas(w, bg=self.KEY, highlightthickness=0, bd=0)
+        self.cv.place(x=20, y=67, width=self.W - 40, height=8)
+        self.bw = self.W - 40
+
+        self.issue_title_lab = tk.Label(
+            w, text="", bg=self.KEY, fg="#ffb340",
+            font=("Microsoft YaHei UI", 10, "bold"), anchor="w",
+        )
+        self.detail_lab = tk.Label(
+            w, text="", bg=self.KEY, fg="#dce4f0",
+            font=("Microsoft YaHei UI", 9), anchor="nw", justify="left",
+            wraplength=self.W - 44,
+        )
+        self.hint_lab = tk.Label(
+            w, text="按键提示：临时用电脑可点【暂停】，忙完点【继续】；点【取消】终止本轮",
+            bg=self.KEY, fg="#8fb3e8",
+            font=("Microsoft YaHei UI", 9), anchor="w", justify="left",
+            wraplength=self.W - 44,
+        )
+        self.btn_frame = tk.Frame(w, bg=self.KEY)
+
+        # 仅在非按钮展示区绑定拖动，绝不干扰交互按钮点击
+        for widget in (w, self.dot_lab, self.title_lab, self.pct_lab, self.step_lab,
+                       self.issue_title_lab, self.detail_lab, self.hint_lab):
+            self._bind_drag(widget)
+            if widget is not w:
+                widget.configure(cursor="fleur")
+
+        self._layout_mode("running")
+
+    def _make_pill_btn(self, parent, label, bg_norm, bg_hover, fg_col, cmd):
+        btn = tk.Label(
+            parent, text=label, bg=bg_norm, fg=fg_col,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            padx=12, pady=5, cursor="hand2",
+        )
+        btn.bind("<Enter>", lambda _e: btn.configure(bg=bg_hover))
+        btn.bind("<Leave>", lambda _e: btn.configure(bg=bg_norm))
+        btn.bind("<Button-1>", lambda _e: cmd())
+        return btn
+
+    def _rebuild_buttons(self, mode, actions):
+        for child in self.btn_frame.winfo_children():
+            child.destroy()
+        self._action_widgets.clear()
+
+        specs = []
+        if mode in ("waiting_fix", "login_wps"):
+            for act in (actions or []):
+                act_id = act.get("id", "retry")
+                label = act.get("label", "继续")
+                style = act.get("style", "primary")
+                if style == "primary":
+                    b_n, b_h, f_c = "#0a84ff", "#2596ff", "#ffffff"
+                else:
+                    b_n, b_h, f_c = "#323a4c", "#404a60", "#eef3fa"
+                specs.append((label, b_n, b_h, f_c, lambda aid=act_id: self._trigger_resume(aid)))
+            specs.append(("取消本轮", "#d9382e", "#f0493e", "#ffffff", self._trigger_cancel))
+        elif mode == "paused":
+            specs.append(("继续运行", "#28b84d", "#34cf5c", "#ffffff", lambda: self._trigger_resume("continue")))
+            specs.append(("取消本轮", "#d9382e", "#f0493e", "#ffffff", self._trigger_cancel))
+        else:
+            specs.append(("暂停", "#e08e0b", "#f5a21d", "#ffffff", self._trigger_pause))
+            specs.append(("取消", "#d9382e", "#f0493e", "#ffffff", self._trigger_cancel))
+
+        avail_w = self.W - 40
+        cur_x = 0
+        cur_y = 0
+        row_h = 0
+        gap_x = 8
+        gap_y = 6
+        for label, b_n, b_h, f_c, cmd in specs:
+            b = self._make_pill_btn(self.btn_frame, label, b_n, b_h, f_c, cmd)
+            bw = max(56, b.winfo_reqwidth())
+            bh = max(28, b.winfo_reqheight())
+            if cur_x > 0 and cur_x + bw > avail_w:
+                cur_x = 0
+                cur_y += row_h + gap_y
+                row_h = 0
+            b.place(x=cur_x, y=cur_y, width=bw, height=bh)
+            cur_x += bw + gap_x
+            row_h = max(row_h, bh)
+            self._action_widgets.append(b)
+        return max(34, cur_y + row_h + 2)
+
+    def _trigger_pause(self):
+        if self._on_pause:
+            try:
+                self._on_pause()
+            except Exception:
+                pass
+
+    def _trigger_resume(self, action="continue"):
+        if self._on_resume:
+            try:
+                self._on_resume(action)
+            except Exception:
+                pass
+
+    def _trigger_cancel(self):
+        if self._on_cancel:
+            try:
+                self._on_cancel()
+            except Exception:
+                pass
+
+    def _layout_mode(self, mode, prompt=None):
+        if self.win is None or not hasattr(self, "hint_lab"):
+            return
+        prompt = prompt or {}
+        btn_h = self._rebuild_buttons(mode, prompt.get("actions") or [])
+        if mode in ("waiting_fix", "login_wps"):
+            title_s = self._clean_text(prompt.get("title") or "需要确认后继续")
+            detail_s = self._clean_text(prompt.get("detail") or "")
+            hint_s = self._clean_text(prompt.get("hint") or "处理完成后点下方恢复按钮继续，或点【取消】终止")
+            self._bar_color = "#0a84ff" if mode == "login_wps" else "#ff9f0a"
+            self.title_lab.config(
+                text=f"{self.title_text} · {'等待扫码' if mode == 'login_wps' else '等待排障'}",
+                fg="#ffb340" if mode == "waiting_fix" else "#5eb0ff",
+            )
+            self.issue_title_lab.config(text=title_s, fg="#ffb340" if mode == "waiting_fix" else "#5eb0ff")
+            self.detail_lab.config(text=detail_s)
+            self.hint_lab.config(text=hint_s, fg="#8cc4ff")
+
+            self.issue_title_lab.place(x=20, y=82, width=self.W - 40)
+            self.detail_lab.place(x=20, y=106, width=self.W - 40)
+            self.win.update_idletasks()
+            req_detail_h = max(44, self.detail_lab.winfo_reqheight() + 6)
+            hint_y = 108 + req_detail_h + 4
+            self.hint_lab.place(x=20, y=hint_y, width=self.W - 40)
+            self.win.update_idletasks()
+            req_hint_h = max(20, self.hint_lab.winfo_reqheight() + 4)
+            btn_y = hint_y + req_hint_h + 6
+            self.btn_frame.place(x=20, y=btn_y, width=self.W - 40, height=btn_h)
+            target_h = btn_y + btn_h + 14
+        elif mode == "paused":
+            self._bar_color = "#ff9f0a"
+            self.title_lab.config(text=f"{self.title_text} · 已暂停", fg="#ffb340")
+            self.issue_title_lab.place_forget()
+            detail_s = self._clean_text(
+                prompt.get("detail") or "自动键鼠操作已挂起，处理完其他事务后点【继续运行】接着跑。"
+            )
+            hint_s = self._clean_text(
+                prompt.get("hint") or "按键提示：点【继续运行】恢复当前步，点【取消本轮】终止任务。"
+            )
+            self.detail_lab.config(text=detail_s)
+            self.hint_lab.config(text=hint_s, fg="#ffd080")
+            self.detail_lab.place(x=20, y=84, width=self.W - 40)
+            self.win.update_idletasks()
+            req_detail_h = max(36, self.detail_lab.winfo_reqheight() + 6)
+            hint_y = 86 + req_detail_h + 4
+            self.hint_lab.place(x=20, y=hint_y, width=self.W - 40)
+            self.win.update_idletasks()
+            req_hint_h = max(20, self.hint_lab.winfo_reqheight() + 4)
+            btn_y = hint_y + req_hint_h + 6
+            self.btn_frame.place(x=20, y=btn_y, width=self.W - 40, height=btn_h)
+            target_h = btn_y + btn_h + 14
+        else:
+            self.title_lab.config(text=f"{self.title_text} · 运行中", fg="#a5b1c2")
+            self.issue_title_lab.place_forget()
+            self.detail_lab.place_forget()
+            hint_s = self._clean_text(
+                prompt.get("hint") or "按键提示：临时用电脑可点【暂停】，忙完点【继续】；点【取消】终止本轮"
+            )
+            self.hint_lab.config(text=hint_s, fg="#8fb3e8")
+            self.hint_lab.place(x=20, y=82, width=self.W - 40)
+            self.win.update_idletasks()
+            req_hint_h = max(20, self.hint_lab.winfo_reqheight() + 2)
+            btn_y = 82 + req_hint_h + 6
+            self.btn_frame.place(x=20, y=btn_y, width=self.W - 40, height=btn_h)
+            target_h = max(self.H_COMPACT, btn_y + btn_h + 14)
+
+        self.H = target_h
+        try:
+            sh = self.master.winfo_screenheight()
+            if self.y + self.H > sh - 16:
+                self.y = max(12, sh - self.H - 16)
+        except Exception:
+            pass
+        self.win.geometry(f"{self.W}x{self.H}+{self.x}+{self.y}")
+        self._draw_bar(self._cur)
+
+    def set_runtime_prompt(self, state_dict):
+        self._ui(lambda: self._apply_runtime_prompt(state_dict))
+
+    def _apply_runtime_prompt(self, state_dict):
+        if self.closed or self.win is None:
+            return
+        self._rt_state = dict(state_dict or {})
+        prompt = self._rt_state.get("prompt") or {}
+        mode = prompt.get("mode", "running")
+        if self._rt_state.get("paused") and mode != "waiting_fix":
+            mode = "paused"
+        if mode == "running" and self._bar_color == "#ff9f0a":
+            self._bar_color = "#0a84ff"
+        self._layout_mode(mode, prompt)
 
     def _draw_capsule(self, x0, y0, x1, y1, color):
         h = y1 - y0
@@ -986,10 +1213,28 @@ class GlassProgress:
         if hasattr(self, "pct_lab"):
             self.pct_lab.config(text=f"{int(round(frac * 100))}%")
 
-    # ---- 线程安全：所有 tk 操作调度到主线程 ----
+    # ---- 线程安全：使用 SimpleQueue 由主线程定时消费，杜绝跨线程调用 Tcl 崩溃或丢消息 ----
+    def _drain_ui(self):
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _pump_ui(self):
+        self._drain_ui()
+        try:
+            self.master.after(35, self._pump_ui)
+        except Exception:
+            pass
+
     def _ui(self, fn):
         try:
-            self.master.after(0, fn)
+            self._ui_queue.put(fn)
         except Exception:
             pass
 
@@ -1005,13 +1250,14 @@ class GlassProgress:
             except Exception:
                 pass
             self._close_timer = None
-        # 每次显示都重置为初始蓝色、进度归零
+        # 每次显示都重置为初始蓝色、进度归零、恢复紧凑运行态与按键
         self.closed = False
         self._bar_color = "#0a84ff"
         self._cur = 0.0
         self._target = 0.0
         if hasattr(self, "step_lab"):
             self.step_lab.config(text="准备开始…", fg="#ffffff")
+        self._layout_mode("running", {})
         self.win.deiconify()
         self.win.attributes("-alpha", 0)
         self._fade_in(0, 8)
@@ -1089,6 +1335,8 @@ class GlassProgress:
         text = self._clean_text(text) or "本轮已完成"
         self._bar_color = "#34c759"
         self._target = 1.0
+        self._layout_mode("running", {"hint": "本轮已完成，浮窗将自动收起"})
+        self.title_lab.config(text=f"{self.title_text} · 已完成", fg="#4cd964")
         if self.step_lab.cget("text") != text:
             self._text_anim(text)
         if self._bar_id is None and not self.closed:
@@ -1102,6 +1350,7 @@ class GlassProgress:
             return
         text = self._clean_text(text)
         self._bar_color = "#ff3b30"
+        self.title_lab.config(text=f"{self.title_text} · 已结束", fg="#ff6961")
         self._draw_bar(self._cur)
         if self.step_lab.cget("text") != text:
             self._text_anim(text)

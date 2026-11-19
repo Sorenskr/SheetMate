@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pyright: reportMissingImports=false, reportMissingModuleSource=false
 """生成 Apple Liquid Glass 质感多尺寸图标（icon.png + icon.ico）。
 
 特性：
@@ -8,14 +9,17 @@
 3) 叠加顶部与四周细腻液态玻璃内高光描边 + 轻柔悬浮投影，导出 512px icon.png 与全尺寸 icon.ico。
 """
 import argparse
+import io
 import math
+import struct
 from pathlib import Path
-from PIL import Image, ImageChops, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter  # type: ignore
 
 DEFAULT_SRC = Path(
     r"C:\Users\OMEN 11\.gemini\antigravity\brain\d1399b42-fa79-40c5-8a81-d64e95737dbe\app_icon_liquid_glass_1795055309553.jpg"
 )
-ICO_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+DEFAULT_WING = Path(__file__).resolve().parent / "dingtalk_wing.png"
+ICO_SIZES = [(16, 16), (20, 20), (24, 24), (32, 32), (40, 40), (48, 48), (64, 64), (128, 128), (256, 256)]
 
 
 def build_squircle_mask(size=1024, radius_frac=0.455, power=4.6):
@@ -75,20 +79,132 @@ def _fallback_vector_art(size=1024):
     return img
 
 
-def render_icons(src_path, out_dir):
+def _patch_old_plane_badge(art, cx=709, cy=297, radius=88):
+    """平滑修补底图右上角原纸飞机徽标圆域，确保无任何残留边缘影响新徽章合成。"""
+    blurred = art.crop((cx - radius - 24, cy - radius - 24, cx + radius + 24, cy + radius + 24)).filter(
+        ImageFilter.GaussianBlur(26)
+    )
+    patch = Image.new("RGBA", art.size, (0, 0, 0, 0))
+    patch.paste(blurred, (cx - radius - 24, cy - radius - 24))
+
+    mask = Image.new("L", art.size, 0)
+    md = ImageDraw.Draw(mask)
+    md.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=255)
+    mask = mask.filter(ImageFilter.GaussianBlur(12))
+    out = art.copy()
+    out.paste(patch, (0, 0), mask)
+    return out
+
+
+def _build_dingtalk_liquid_badge(wing_path, size=214):
+    """以 4× 超采样生成带液态玻璃高光、晶体描边与悬浮阴影的钉钉翼标超椭圆徽章。"""
+    pad = 24
+    hi_pad = pad * 4
+    hi_s = size * 4
+    hi_canvas_s = hi_s + hi_pad * 2
+
+    # 1) 天青至宝石蓝对角渐变底色 + 内部高光折射光晕
+    bg = Image.new("RGBA", (hi_s, hi_s), (0, 0, 0, 0))
+    px = bg.load()
+    for y in range(hi_s):
+        ty = y / (hi_s - 1)
+        for x in range(hi_s):
+            tx = x / (hi_s - 1)
+            t = 0.56 * ty + 0.44 * tx
+            r = int(34 * (1 - t) + 0 * t)
+            g = int(214 * (1 - t) + 84 * t)
+            b = int(255 * (1 - t) + 242 * t)
+            # 左上角内部水润青白折射光斑
+            dx = (x - hi_s * 0.28) / (hi_s * 0.65)
+            dy = (y - hi_s * 0.22) / (hi_s * 0.65)
+            glow = max(0.0, 1.0 - math.sqrt(dx * dx + dy * dy)) ** 1.8
+            r = min(255, int(r + glow * 45))
+            g = min(255, int(g + glow * 32))
+            px[x, y] = (r, g, b, 255)
+
+    # 2) 顶部弧面玻璃反光
+    sheen = Image.new("RGBA", (hi_s, hi_s), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(sheen)
+    sd.ellipse([-hi_s * 0.15, -hi_s * 0.35, hi_s * 1.15, hi_s * 0.48], fill=(255, 255, 255, 72))
+    sheen = sheen.filter(ImageFilter.GaussianBlur(28))
+    bg = Image.alpha_composite(bg, sheen)
+
+    sq_mask = build_squircle_mask(hi_s, radius_frac=0.455, power=4.5)
+
+    # 3) 超椭圆裁剪 + 双层玻璃内高光环带
+    badge_body = Image.new("RGBA", (hi_s, hi_s), (0, 0, 0, 0))
+    badge_body.paste(bg, (0, 0), sq_mask)
+
+    eroded = sq_mask.filter(ImageFilter.MinFilter(13))
+    rim_ring = ImageChops.subtract(sq_mask, eroded)
+    rim_grad = Image.new("L", (hi_s, hi_s), 0)
+    rgd = ImageDraw.Draw(rim_grad)
+    for y in range(hi_s):
+        av = int(225 * (1.0 - (y / (hi_s - 1)) * 0.62))
+        rgd.line([(0, y), (hi_s, y)], fill=av)
+    rim = Image.new("RGBA", (hi_s, hi_s), (255, 255, 255, 255))
+    rim.putalpha(ImageChops.multiply(rim_ring, rim_grad))
+    badge_body = Image.alpha_composite(badge_body, rim)
+
+    # 4) 嵌入居中钉钉纯白立体翼标
+    if wing_path and Path(wing_path).exists():
+        wing = Image.open(wing_path).convert("RGBA")
+        target_w = int(hi_s * 0.72)
+        wing = wing.resize((target_w, target_w), Image.Resampling.LANCZOS)
+        wx = (hi_s - target_w) // 2 + int(hi_s * 0.01)
+        wy = (hi_s - target_w) // 2 + int(hi_s * 0.01)
+
+        w_alpha = wing.getchannel("A")
+        w_shadow_layer = Image.new("RGBA", (hi_s, hi_s), (0, 38, 138, 0))
+        w_shadow_alpha = Image.new("L", (hi_s, hi_s), 0)
+        w_shadow_alpha.paste(ImageChops.multiply(w_alpha, Image.new("L", wing.size, 115)), (wx, wy + 12))
+        w_shadow_alpha = w_shadow_alpha.filter(ImageFilter.GaussianBlur(14))
+        w_shadow_fill = Image.new("RGBA", (hi_s, hi_s), (0, 38, 138, 255))
+        w_shadow_fill.putalpha(w_shadow_alpha)
+        badge_body = Image.alpha_composite(badge_body, w_shadow_fill)
+
+        wing_layer = Image.new("RGBA", (hi_s, hi_s), (0, 0, 0, 0))
+        wing_layer.paste(wing, (wx, wy), wing)
+        badge_body = Image.alpha_composite(badge_body, wing_layer)
+
+    # 5) 柔和深海蓝悬浮外投影
+    canvas = Image.new("RGBA", (hi_canvas_s, hi_canvas_s), (0, 0, 0, 0))
+    sh_alpha = Image.new("L", (hi_canvas_s, hi_canvas_s), 0)
+    sh_alpha.paste(ImageChops.multiply(sq_mask, Image.new("L", (hi_s, hi_s), 150)), (hi_pad, hi_pad + 18))
+    sh_alpha = sh_alpha.filter(ImageFilter.GaussianBlur(30))
+    sh_fill = Image.new("RGBA", (hi_canvas_s, hi_canvas_s), (4, 34, 116, 255))
+    sh_fill.putalpha(sh_alpha)
+    canvas = Image.alpha_composite(canvas, sh_fill)
+    canvas.paste(badge_body, (hi_pad, hi_pad), badge_body)
+
+    out_s = size + pad * 2
+    return canvas.resize((out_s, out_s), Image.Resampling.LANCZOS)
+
+
+def render_icons(src_path, out_dir, wing_path=None):
     out_dir = Path(out_dir)
+    wing_p = Path(wing_path) if wing_path else DEFAULT_WING
     S = 1024
 
     if src_path and Path(src_path).exists():
         art = Image.open(src_path).convert("RGBA")
-        # 居中裁为正方形并略微放大 4% 贴合圆角边距
         min_dim = min(art.width, art.height)
         left = (art.width - min_dim) // 2
         top = (art.height - min_dim) // 2
         art = art.crop((left, top, left + min_dim, top + min_dim))
         art = art.resize((S, S), Image.Resampling.LANCZOS)
+        # 抹除原右上角小飞机，增强整体玻璃色彩清透度与对比度
+        art = _patch_old_plane_badge(art, cx=709, cy=297, radius=88)
+        art = ImageEnhance.Color(art).enhance(1.09)
+        art = ImageEnhance.Contrast(art).enhance(1.04)
     else:
         art = _fallback_vector_art(S)
+
+    # 合成右上角 Apple Liquid Glass 立体钉钉翼标徽章
+    badge = _build_dingtalk_liquid_badge(wing_p, size=214)
+    bx = 704 - badge.width // 2
+    by = 294 - badge.height // 2
+    art.paste(badge, (bx, by), badge)
 
     # 1) 生成 Apple Squircle 遮罩
     mask = build_squircle_mask(S, radius_frac=0.455, power=4.6)
@@ -96,7 +212,7 @@ def render_icons(src_path, out_dir):
     # 2) 外侧极轻环境悬浮投影（保持清晰 4.5% 安全边距内）
     shadow_alpha = ImageChops.multiply(
         mask,
-        Image.new("L", (S, S), 90),
+        Image.new("L", (S, S), 96),
     )
     shadow = Image.new("RGBA", (S, S), (8, 22, 54, 0))
     shadow_layer = Image.new("RGBA", (S, S), (8, 22, 54, 255))
@@ -104,17 +220,22 @@ def render_icons(src_path, out_dir):
     shadow.paste(shadow_layer, (0, 14), shadow_alpha)
     shadow = shadow.filter(ImageFilter.GaussianBlur(18))
 
-    # 3) 裁剪主体 + 添加细腻玻璃内边缘高光（1.5px 内缩环带）
+    # 3) 裁剪主体 + 添加细腻双层液态玻璃内高光与顶部微泛光
     body = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     body.paste(art, (0, 0), mask)
 
+    top_sheen = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    tsd = ImageDraw.Draw(top_sheen)
+    tsd.ellipse([S * 0.08, -S * 0.25, S * 0.92, S * 0.36], fill=(255, 255, 255, 22))
+    top_sheen = top_sheen.filter(ImageFilter.GaussianBlur(24))
+    body.paste(Image.alpha_composite(body, top_sheen), (0, 0), mask)
+
     eroded = mask.filter(ImageFilter.MinFilter(5))
     rim_ring = ImageChops.subtract(mask, eroded)
-    # 顶部高光更强、底部极柔
     rim_grad = Image.new("L", (S, S), 0)
     rgd = ImageDraw.Draw(rim_grad)
     for y in range(S):
-        alpha_v = int(125 * (1.0 - (y / (S - 1)) * 0.72))
+        alpha_v = int(152 * (1.0 - (y / (S - 1)) * 0.70))
         rgd.line([(0, y), (S, y)], fill=alpha_v)
     rim_alpha = ImageChops.multiply(rim_ring, rim_grad)
     rim = Image.new("RGBA", (S, S), (255, 255, 255, 255))
@@ -122,14 +243,72 @@ def render_icons(src_path, out_dir):
     body = Image.alpha_composite(body, rim)
 
     master = Image.alpha_composite(shadow, body)
+    # 针对 16/20/24/32 小尺寸列表视图，裁去外阴影透明空白区，让超椭圆主体饱满填满视野
+    tight_pad = int(S * (0.5 - 0.455))
+    body_tight = body.crop((tight_pad, tight_pad, S - tight_pad, S - tight_pad))
 
-    # 4) 导出高清 icon.png (512×512) 与全尺寸 icon.ico
+    # 4) 导出高清 icon.png (512×512) 与全尺寸标准 Win32 DIB+PNG 混合 icon.ico
     png_path = out_dir / "icon.png"
     ico_path = out_dir / "icon.ico"
     master.resize((512, 512), Image.Resampling.LANCZOS).save(png_path, "PNG", optimize=True)
-    master.save(ico_path, format="ICO", sizes=ICO_SIZES)
+    _write_win32_ico(ico_path, master, body_tight, ICO_SIZES)
     print(f"ICON_SAVED_OK: {png_path} & {ico_path}")
     return master
+
+
+def _encode_ico_dib(im):
+    """将 RGBA Image 编码为标准 Win32 32-bit BGRA BITMAPINFOHEADER + XOR + AND 数据块。"""
+    w, h = im.size
+    rgba = im.convert("RGBA")
+    rows_bgra = []
+    # Win32 DIB 像素自底向上存储
+    for y in range(h - 1, -1, -1):
+        for x in range(w):
+            r, g, b, a = rgba.getpixel((x, y))
+            rows_bgra.append(bytes((b, g, r, a)))
+    xor_data = b"".join(rows_bgra)
+    and_stride = ((w + 31) // 32) * 4
+    and_data = b"\x00" * (and_stride * h)
+    bmi = struct.pack(
+        "<IIIHHIIIIII",
+        40,             # biSize
+        w,              # biWidth
+        h * 2,          # biHeight (XOR + AND)
+        1,              # biPlanes
+        32,             # biBitCount
+        0,              # biCompression = BI_RGB
+        len(xor_data),  # biSizeImage
+        0, 0, 0, 0,
+    )
+    return bmi + xor_data + and_data
+
+
+def _write_win32_ico(ico_path, master_img, tight_img, sizes):
+    """生成 <256px 为原生 32-bit DIB、256px 为高清 PNG 的标准 Windows 图标文件。"""
+    entries = []
+    payloads = []
+    for w, h in sizes:
+        src = tight_img if w <= 32 else master_img
+        frame = src.resize((w, h), Image.Resampling.LANCZOS)
+        if w >= 256:
+            buf = io.BytesIO()
+            frame.save(buf, format="PNG", optimize=True)
+            data = buf.getvalue()
+        else:
+            data = _encode_ico_dib(frame)
+        entries.append((w, h, len(data)))
+        payloads.append(data)
+
+    offset = 6 + 16 * len(entries)
+    out = bytearray(struct.pack("<HHH", 0, 1, len(entries)))
+    for (w, h, size), _data in zip(entries, payloads):
+        bw = 0 if w >= 256 else w
+        bh = 0 if h >= 256 else h
+        out.extend(struct.pack("<BBBBHHII", bw, bh, 0, 0, 1, 32, size, offset))
+        offset += size
+    for data in payloads:
+        out.extend(data)
+    Path(ico_path).write_bytes(bytes(out))
 
 
 def make_showcase(master, dest_path):

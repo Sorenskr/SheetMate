@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pyright: reportMissingImports=false, reportMissingModuleSource=false
 """SheetMate v2.0.0 Apple iOS 18 原生风格控制中心界面与调度后端。"""
 
 import json
@@ -84,6 +85,7 @@ class _SheetMateController:
         self.schedule_running = False
         self.stop_flag = False
         self.need_login_prompt = False
+        self.runtime_state = app.get_runtime_state() if hasattr(app, "get_runtime_state") else {}
 
         self.status_level = "idle"
         self.step_text = "空闲中，等待开始"
@@ -101,6 +103,14 @@ class _SheetMateController:
         app.set_step_callback(self._on_step)
         app.set_last_run_callback(self._on_last_run)
         app.set_login_prompt(self._on_login_prompt_show, self._on_login_prompt_close)
+        if hasattr(app, "set_runtime_callback"):
+            app.set_runtime_callback(self._on_runtime_state)
+        if hasattr(self.glass, "set_callbacks"):
+            self.glass.set_callbacks(
+                on_pause=self.pause_current_task,
+                on_resume=self.resume_current_task,
+                on_cancel=self.stop_current_task,
+            )
 
         threading.Thread(target=self._check_update_worker, daemon=True).start()
 
@@ -146,14 +156,16 @@ class _SheetMateController:
             prog = STEP_PROGRESS.get(raw) or STEP_PROGRESS.get(clean_text)
             if prog is not None:
                 self.progress = prog
-                if not self.glass.closed:
-                    self.glass.update_step(clean_text, prog)
+            if not self.glass.closed:
+                self.glass.update_step(clean_text, prog if prog is not None else self.progress)
             if raw.startswith("✅"):
                 self.status_level = "ok"
             elif raw.startswith("❌"):
                 self.status_level = "err"
             elif raw.startswith("⏹"):
                 self.status_level = "stopped"
+            elif (self.runtime_state or {}).get("paused") or (self.runtime_state or {}).get("waiting_recovery") or raw.startswith("暂停"):
+                self.status_level = "paused"
             elif self.job_running or self.capture_running:
                 self.status_level = "running"
 
@@ -169,6 +181,21 @@ class _SheetMateController:
     def _on_login_prompt_close(self):
         with self._lock:
             self.need_login_prompt = False
+
+    def _on_runtime_state(self, rt):
+        with self._lock:
+            self.runtime_state = rt if isinstance(rt, dict) else {}
+            prompt = self.runtime_state.get("prompt") or {}
+            mode = prompt.get("mode", "running")
+            if self.runtime_state.get("paused") or mode == "waiting_fix":
+                self.status_level = "paused"
+                if self.runtime_state.get("paused") and mode == "paused":
+                    self.step_text = "任务已暂停（点击继续可接着执行）"
+            elif self.job_running or self.capture_running:
+                if self.status_level == "paused":
+                    self.status_level = "running"
+        if hasattr(self.glass, "set_runtime_prompt") and not self.glass.closed:
+            self.glass.set_runtime_prompt(self.runtime_state)
 
     def get_config(self):
         with self._lock:
@@ -200,11 +227,16 @@ class _SheetMateController:
         with self._lock:
             self.last_heartbeat = time.time()
             delta = [item for item in self.logs if item["id"] > since]
+            rt = self.runtime_state or {}
+            prompt = rt.get("prompt") or {}
             return {
                 "version": self.app.APP_VERSION,
                 "job_running": self.job_running,
                 "capture_running": self.capture_running,
                 "busy": self.job_running or self.capture_running,
+                "paused": bool(rt.get("paused")),
+                "waiting_recovery": bool(rt.get("waiting_recovery")),
+                "recovery_prompt": prompt,
                 "schedule_running": self.schedule_running,
                 "need_login_prompt": self.need_login_prompt,
                 "status_level": self.status_level,
@@ -294,6 +326,8 @@ class _SheetMateController:
             with self._lock:
                 self.job_running = False
                 self.need_login_prompt = False
+                if hasattr(self.app, "get_runtime_state"):
+                    self.runtime_state = self.app.get_runtime_state()
             if owns_lock:
                 try:
                     self._task_lock.release()
@@ -336,17 +370,35 @@ class _SheetMateController:
             with self._lock:
                 self.capture_running = False
                 self.need_login_prompt = False
+                if hasattr(self.app, "get_runtime_state"):
+                    self.runtime_state = self.app.get_runtime_state()
             try:
                 self._task_lock.release()
             except Exception:
                 pass
+
+    def pause_current_task(self):
+        with self._lock:
+            if not (self.job_running or self.capture_running):
+                return False, "当前没有正在运行的任务"
+        if hasattr(self.app, "request_pause"):
+            return self.app.request_pause()
+        return False, "当前版本不支持暂停"
+
+    def resume_current_task(self, action="continue"):
+        with self._lock:
+            if not (self.job_running or self.capture_running):
+                return False, "当前没有等待恢复的任务"
+        if hasattr(self.app, "request_resume"):
+            return self.app.request_resume(action)
+        return False, "当前版本不支持恢复"
 
     def stop_current_task(self):
         self.app.request_stop()
         with self._lock:
             if self.schedule_running:
                 self.stop_flag = True
-        return True, "已发送停止指令"
+        return True, "已发送取消指令"
 
     def toggle_schedule(self, enable=None):
         with self._lock:
@@ -657,6 +709,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .island-dot.err { background: #FF453A; box-shadow: 0 0 0 3px rgba(255, 69, 58, 0.25); }
   .island-dot.stopped { background: #8E8E93; box-shadow: none; }
+  .island-dot.paused {
+    background: #FF9F0A;
+    box-shadow: 0 0 0 3px rgba(255, 159, 10, 0.28);
+  }
   .island-dot.sched {
     background: #30D158;
     animation: dot-breathe 1.8s ease-in-out infinite;
@@ -675,6 +731,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .island.busy .ios-spinner { display: block; }
   .island.busy .island-dot { display: none; }
+  .island.paused .ios-spinner,
+  .island.recovery .ios-spinner { display: none; }
+  .island.paused .island-dot,
+  .island.recovery .island-dot { display: block; }
   .ios-spinner div {
     position: absolute;
     left: 46%;
@@ -706,23 +766,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     font-variant-numeric: tabular-nums;
     flex-shrink: 0;
   }
-  .island-stop {
+  .island-ctrls {
     display: none;
-    border: none;
-    background: #FF453A;
-    color: #FFFFFF;
-    font-size: 11.5px;
-    font-weight: 600;
-    padding: 4px 10px;
-    border-radius: 999px;
-    cursor: pointer;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
     flex-shrink: 0;
   }
-  .island.busy .island-stop { display: inline-flex; }
+  .island.busy .island-ctrls { display: inline-flex; }
   .island.busy .island-pill-tag { display: none; }
-  .island-stop:active { transform: scale(0.92); }
+  .island-ctrl-btn {
+    border: none;
+    color: #FFFFFF;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 9px;
+    border-radius: 999px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    transition: transform 0.12s var(--spring), opacity 0.15s;
+  }
+  .island-ctrl-btn:active { transform: scale(0.92); }
+  .island-pause { background: #FF9F0A; }
+  .island-resume { background: #30D158; }
+  .island-stop { background: #FF453A; }
 
   .island-prog {
     display: none;
@@ -752,6 +821,83 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     min-width: 30px;
     text-align: right;
     font-variant-numeric: tabular-nums;
+  }
+
+  .island-hint {
+    display: none;
+    margin-top: 7px;
+    font-size: 11px;
+    line-height: 1.35;
+    color: rgba(255, 255, 255, 0.72);
+  }
+  .island.busy .island-hint { display: block; }
+
+  .island-recovery {
+    display: none;
+    margin-top: 8px;
+    padding: 9px 11px;
+    border-radius: 14px;
+    background: rgba(255, 159, 10, 0.18);
+    border: 0.5px solid rgba(255, 159, 10, 0.38);
+  }
+  .island-recovery.show { display: block; }
+  .island-recovery.login-mode {
+    background: rgba(10, 132, 255, 0.22);
+    border-color: rgba(10, 132, 255, 0.42);
+  }
+  .rec-title {
+    font-size: 12.5px;
+    font-weight: 700;
+    color: #FFD180;
+    margin-bottom: 4px;
+  }
+  .island-recovery.login-mode .rec-title { color: #8AC8FF; }
+  .rec-detail {
+    font-size: 11.5px;
+    line-height: 1.45;
+    color: rgba(255, 255, 255, 0.90);
+    white-space: pre-line;
+  }
+  .rec-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .rec-btn {
+    border: none;
+    border-radius: 999px;
+    font-family: inherit;
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 5px 11px;
+    cursor: pointer;
+    color: #FFFFFF;
+    transition: transform 0.12s var(--spring);
+  }
+  .rec-btn:active { transform: scale(0.94); }
+  .rec-btn.primary { background: #0A84FF; }
+  .rec-btn.secondary { background: rgba(255, 255, 255, 0.18); }
+
+  .guide-body {
+    display: none;
+    padding: 4px 14px 12px;
+  }
+  .guide-body.open { display: block; }
+  .guide-item {
+    padding: 8px 0;
+    border-top: 0.5px solid var(--sep);
+  }
+  .guide-item-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 2px;
+  }
+  .guide-item-desc {
+    font-size: 12px;
+    color: var(--sub);
+    line-height: 1.45;
   }
 
   .island-alert {
@@ -1875,14 +2021,30 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               <div class="island-text" id="stepText">空闲中，等待开始</div>
             </div>
             <div class="island-pill-tag" id="islandTag">待命</div>
-            <button class="island-stop" id="stopBtn" title="停止任务">
-              <svg viewBox="0 0 16 16" fill="currentColor" style="width:10px;height:10px;"><rect x="3" y="3" width="10" height="10" rx="2"/></svg>
-              <span>停止</span>
-            </button>
+            <div class="island-ctrls">
+              <button class="island-ctrl-btn island-pause" id="pauseBtn" type="button" title="暂停当前运行">
+                <svg viewBox="0 0 16 16" fill="currentColor" style="width:9px;height:9px;"><rect x="3" y="3" width="3.5" height="10" rx="1"/><rect x="9.5" y="3" width="3.5" height="10" rx="1"/></svg>
+                <span>暂停</span>
+              </button>
+              <button class="island-ctrl-btn island-resume" id="resumeBtn" type="button" title="继续当前运行" style="display:none;">
+                <svg viewBox="0 0 16 16" fill="currentColor" style="width:9px;height:9px;"><path d="M4 2.8v10.4l9-5.2-9-5.2z"/></svg>
+                <span>继续</span>
+              </button>
+              <button class="island-ctrl-btn island-stop" id="stopBtn" type="button" title="取消本轮任务">
+                <svg viewBox="0 0 16 16" fill="currentColor" style="width:9px;height:9px;"><rect x="3" y="3" width="10" height="10" rx="2"/></svg>
+                <span>取消</span>
+              </button>
+            </div>
           </div>
           <div class="island-prog">
             <div class="island-track"><div class="island-fill" id="progressFill"></div></div>
             <div class="island-pct" id="progressPct">0%</div>
+          </div>
+          <div class="island-hint" id="islandHint">按键提示：临时用电脑可点【暂停】，忙完点【继续】；点【取消】终止本轮</div>
+          <div class="island-recovery" id="islandRecovery">
+            <div class="rec-title" id="recTitle"></div>
+            <div class="rec-detail" id="recDetail"></div>
+            <div class="rec-actions" id="recActions"></div>
           </div>
           <div class="island-alert" id="islandAlert"></div>
         </div>
@@ -1944,7 +2106,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="ios-group">
             <div class="ios-row clickable" data-jump="dingtalk">
               <div class="sf-badge sf-indigo">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6.0 1.9Q12.5 6.8 18.2 11.1C19.3 12.0 19.1 13.8 17.6 14.7L14.9 16.2L17.4 16.2L9.3 22.1L11.9 17.6L9.9 17.6L11.5 15.1C8.4 15.0 6.2 13.5 5.9 11.3C7.7 12.4 9.7 12.9 11.7 12.9C7.5 12.0 5.0 9.8 4.8 6.8C7.0 8.5 9.6 9.9 12.4 10.6C8.0 8.8 5.5 5.6 6.0 1.9Z"/></svg>
               </div>
               <div class="row-main">
                 <div class="row-title">目标钉钉会话</div>
@@ -1995,6 +2157,46 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               <div class="row-right">
                 <span class="row-val" id="lastRun">—</span>
                 <svg class="chevron-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-wrap">
+          <div class="section-head"><span>异常自诊与按键操作指南</span><span>断网 / VPN / 登录 / 钉钉</span></div>
+          <div class="ios-group">
+            <div class="ios-row clickable" id="guideToggleRow">
+              <div class="sf-badge sf-blue">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">运行遇阻怎么处理与续跑</div>
+                <div class="row-sub" id="guideSummarySub">点击展开常见异常解决方案</div>
+              </div>
+              <div class="row-right">
+                <svg class="chevron-svg" id="guideChevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="transition:transform .25s;"><path d="M9 18l6-6-6-6"/></svg>
+              </div>
+            </div>
+            <div class="guide-body" id="guideBody">
+              <div class="guide-item">
+                <div class="guide-item-title">1. 临时需要用电脑（鼠标键盘不被抢）</div>
+                <div class="guide-item-desc">运行中随时点悬浮窗或顶部灵动岛的【暂停】，已抓数据和进度全部保留；忙完点【继续】接着往下跑，点【取消】结束本轮。</div>
+              </div>
+              <div class="guide-item">
+                <div class="guide-item-title">2. 未连网（断网）与“已连网但未开 VPN”</div>
+                <div class="guide-item-desc">抓数受阻时程序会自动探测国内网站与 Luya 后台：若断网会提示先连 Wi-Fi/网线后点【已连网·重试当前步】；若能上网但后台不通，会明确提示打开 VPN 后点【已开VPN·重试当前步】，已下好的表格不用重抓。</div>
+              </div>
+              <div class="guide-item">
+                <div class="guide-item-title">3. Luya 后台或 WPS 需要扫码登录</div>
+                <div class="guide-item-desc">弹窗会自动暂停等您在浏览器里完成登录/扫码；登好后可自动放行，也可点【我已扫码·继续】立即进入下一步。</div>
+              </div>
+              <div class="guide-item">
+                <div class="guide-item-title">4. 钉钉未启动或停在扫码登录页</div>
+                <div class="guide-item-desc">已经截好的表格图片会安全暂存不会丢失！打开钉钉并扫码进入聊天主界面后，点【已登录钉钉·继续发送】，直接续发刚才截好的图。</div>
+              </div>
+              <div class="guide-item">
+                <div class="guide-item-title">5. 钉钉未搜到目标群聊 / 粘贴受阻</div>
+                <div class="guide-item-desc">图片依然不会丢失！直接在钉钉手动点开目标群聊窗口，再点弹窗的【已手动开群·直接粘贴】，立即跳过搜索完成清草稿、贴图贴字与静音设置。</div>
               </div>
             </div>
           </div>
@@ -2297,7 +2499,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <span>控制台</span>
       </button>
       <button class="tab-btn" data-tab="dingtalk">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="M6.0 1.9Q12.5 6.8 18.2 11.1C19.3 12.0 19.1 13.8 17.6 14.7L14.9 16.2L17.4 16.2L9.3 22.1L11.9 17.6L9.9 17.6L11.5 15.1C8.4 15.0 6.2 13.5 5.9 11.3C7.7 12.4 9.7 12.9 11.7 12.9C7.5 12.0 5.0 9.8 4.8 6.8C7.0 8.5 9.6 9.9 12.4 10.6C8.0 8.8 5.5 5.6 6.0 1.9Z"/></svg>
         <span>钉钉投递</span>
       </button>
       <button class="tab-btn" data-tab="schedule">
@@ -2412,6 +2614,7 @@ let updateUrl = "";
 let pickerState = null;
 let editingPointHm = "";
 let editingPointMode = "default";
+let lastRecSignature = "";
 
 function cleanText(s) {
   return String(s || "").replace(/[\u2600-\u27BF\uFE0F\u200D]|[\uD83C-\uDBFF][\uDC00-\uDFFF]/g, "").trim();
@@ -3155,20 +3358,66 @@ async function pollState() {
 
     const island = $("island");
     const busy = Boolean(st.busy);
-    const hasAlert = Boolean(st.need_login_prompt || st.error_text);
+    const paused = Boolean(st.paused);
+    const rec = st.recovery_prompt || {};
+    const recMode = rec.mode || "running";
+    const inRecovery = recMode === "waiting_fix" || recMode === "login_wps";
+    const hasAlert = Boolean((!inRecovery && st.need_login_prompt) || st.error_text);
+
     island.classList.toggle("busy", busy);
+    island.classList.toggle("paused", busy && paused);
+    island.classList.toggle("recovery", busy && inRecovery);
     island.classList.toggle("expanded", busy || hasAlert);
 
     const dot = $("islandDot");
     dot.className = "island-dot"
       + (st.status_level === "err" ? " err"
         : st.status_level === "stopped" ? " stopped"
+        : (paused || inRecovery) ? " paused"
         : st.schedule_running ? " sched" : "");
 
     $("stepText").textContent = cleanText(st.step_text) || "空闲中";
     const pct = Math.round((st.progress || 0) * 100);
     $("progressFill").style.width = `${pct}%`;
     $("progressPct").textContent = `${pct}%`;
+
+    if (busy) {
+      $("pauseBtn").style.display = (paused || inRecovery) ? "none" : "inline-flex";
+      $("resumeBtn").style.display = paused && !inRecovery ? "inline-flex" : "none";
+      $("islandHint").textContent = cleanText(rec.hint)
+        || (paused
+          ? "已暂停：处理好其他事情后点【继续】，点【取消】终止本轮"
+          : "按键提示：临时用电脑可点【暂停】，忙完点【继续】；点【取消】终止本轮");
+    }
+
+    const recBox = $("islandRecovery");
+    if (busy && (inRecovery || paused) && (rec.title || rec.detail)) {
+      recBox.className = "island-recovery show" + (recMode === "login_wps" ? " login-mode" : "");
+      $("recTitle").textContent = cleanText(rec.title) || "需要处理后继续";
+      $("recDetail").textContent = cleanText(rec.detail) || "";
+      const acts = Array.isArray(rec.actions) ? rec.actions : [];
+      const sig = JSON.stringify(acts);
+      if (sig !== lastRecSignature) {
+        lastRecSignature = sig;
+        const wrap = $("recActions");
+        wrap.innerHTML = "";
+        for (const act of acts) {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = `rec-btn ${act.style === "primary" ? "primary" : "secondary"}`;
+          b.textContent = cleanText(act.label) || "继续";
+          b.onclick = async () => {
+            const res = await api("/api/resume", "POST", { action: act.id || "continue" });
+            showToast(res.message || "已恢复执行");
+            pollState();
+          };
+          wrap.appendChild(b);
+        }
+      }
+    } else {
+      recBox.className = "island-recovery";
+      lastRecSignature = "";
+    }
 
     const cd = st.schedule_running ? formatCountdown(st.next_run_ts, st.server_now) : "";
     if (st.schedule_running && cd) {
@@ -3182,7 +3431,7 @@ async function pollState() {
     }
 
     const alertEl = $("islandAlert");
-    if (st.need_login_prompt) {
+    if (!inRecovery && st.need_login_prompt) {
       alertEl.className = "island-alert login";
       alertEl.textContent = "请在弹出的浏览器中扫码登录 WPS，完成后将自动继续";
     } else if (st.error_text) {
@@ -3411,10 +3660,26 @@ function bindEvents() {
     showToast(r.message);
     pollState();
   };
+  $("pauseBtn").onclick = async () => {
+    const r = await api("/api/pause", "POST");
+    showToast(r.message);
+    pollState();
+  };
+  $("resumeBtn").onclick = async () => {
+    const r = await api("/api/resume", "POST", { action: "continue" });
+    showToast(r.message);
+    pollState();
+  };
   $("stopBtn").onclick = async () => {
     const r = await api("/api/stop", "POST");
     showToast(r.message);
     pollState();
+  };
+  $("guideToggleRow").onclick = () => {
+    const body = $("guideBody");
+    const open = body.classList.toggle("open");
+    $("guideChevron").style.transform = open ? "rotate(90deg)" : "rotate(0deg)";
+    $("guideSummarySub").textContent = open ? "点击收起说明" : "点击展开常见异常解决方案";
   };
 
   $("autoScrollBtn").onclick = () => {
@@ -3602,6 +3867,18 @@ def _make_handler(ctrl, token):
                 enable = body.get("enable") if isinstance(body, dict) and "enable" in body else None
                 ok, msg, running = ctrl.toggle_schedule(enable)
                 self._send_json({"ok": ok, "message": msg, "schedule_running": running})
+                return
+
+            if parsed.path == "/api/pause":
+                ok, msg = ctrl.pause_current_task()
+                self._send_json({"ok": ok, "message": msg})
+                return
+
+            if parsed.path == "/api/resume":
+                body = self._read_json()
+                act = body.get("action") if isinstance(body, dict) else "continue"
+                ok, msg = ctrl.resume_current_task(act or "continue")
+                self._send_json({"ok": ok, "message": msg})
                 return
 
             if parsed.path == "/api/stop":

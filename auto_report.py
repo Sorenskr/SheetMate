@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pyright: reportMissingImports=false, reportMissingModuleSource=false
 """
 暗号表助手 SheetMate v1.3.0
 - 白天/晚上时段、每天/工作日运行
@@ -17,6 +18,10 @@ import time
 import subprocess
 import re
 import io
+import socket
+import threading
+import urllib.request
+import urllib.error
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
@@ -210,34 +215,455 @@ APP_VERSION = "2.0.0"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
 # version.json 格式：{"version":"2.0.0","url":"新版exe的下载直链"}
 UPDATE_CHECK_URL = "https://raw.githubusercontent.com/Sorenskr/SheetMate/main/version.json"
-# 手动停止标志：运行中任何等待点检测到就中断本轮
+
+_DEFAULT_RUNNING_HINT = "按键提示：临时用电脑可点【暂停】，忙完点【继续】；点【取消】终止本轮"
+_runtime_lock = threading.RLock()
 _stop_requested = False
+_pause_requested = False
+_waiting_recovery = False
+_recovery_choice = None
+_runtime_callback = None
+_runtime_prompt = {
+    "mode": "running",
+    "title": "",
+    "detail": "",
+    "hint": _DEFAULT_RUNNING_HINT,
+    "actions": [],
+}
+
+
+def set_runtime_callback(fn):
+    global _runtime_callback
+    with _runtime_lock:
+        _runtime_callback = fn
+
+
+def _default_running_prompt():
+    return {
+        "mode": "running",
+        "title": "",
+        "detail": "",
+        "hint": _DEFAULT_RUNNING_HINT,
+        "actions": [],
+    }
+
+
+def get_runtime_state():
+    """返回线程安全的运行时暂停、恢复与操作指引状态快照。"""
+    with _runtime_lock:
+        p = _runtime_prompt or _default_running_prompt()
+        return {
+            "paused": bool(_pause_requested),
+            "stop_requested": bool(_stop_requested),
+            "waiting_recovery": bool(_waiting_recovery),
+            "prompt": {
+                "mode": p.get("mode", "running"),
+                "title": p.get("title", ""),
+                "detail": p.get("detail", ""),
+                "hint": p.get("hint", _DEFAULT_RUNNING_HINT),
+                "actions": [dict(a) for a in (p.get("actions") or [])],
+            },
+        }
+
+
+def _notify_runtime_state():
+    with _runtime_lock:
+        cb = _runtime_callback
+    if cb:
+        try:
+            cb(get_runtime_state())
+        except Exception:
+            pass
 
 
 def request_stop():
-    global _stop_requested
-    _stop_requested = True
+    """请求立即取消/停止当前任务（可立即打断暂停与等待排障状态）。"""
+    global _stop_requested, _pause_requested, _recovery_choice
+    with _runtime_lock:
+        _stop_requested = True
+        _pause_requested = False
+        if _waiting_recovery:
+            _recovery_choice = "cancel"
+    _notify_runtime_state()
+
+
+def request_pause():
+    """请求暂停当前执行，保持浏览器、已下载表格与已截图片完好。"""
+    global _pause_requested, _runtime_prompt
+    with _runtime_lock:
+        if _stop_requested:
+            return False, "任务正在取消中"
+        if _waiting_recovery:
+            return False, "当前已在等待排障，请按提示处理后点击恢复按钮"
+        if _pause_requested:
+            return True, "当前已处于暂停状态"
+        _pause_requested = True
+        _runtime_prompt = {
+            "mode": "paused",
+            "title": "任务已暂停",
+            "detail": "自动键鼠与浏览器操作已安全挂起，您可先处理其他工作；\n已下载或已截取的内容均会保留，无需重头开始。",
+            "hint": "按键提示：处理完后点【继续】接着跑当前步骤；点【取消】结束本轮。",
+            "actions": [
+                {"id": "continue", "label": "继续运行", "style": "primary"},
+            ],
+        }
+    _notify_runtime_state()
+    log("⏸ 已暂停执行（进度已保留，点【继续】可接着运行）")
+    return True, "已暂停，可点击继续恢复"
+
+
+def request_resume(action="continue"):
+    """恢复暂停的任务，或在等待故障处理时传入用户的恢复选项。"""
+    global _pause_requested, _recovery_choice, _runtime_prompt
+    act = str(action or "continue").strip() or "continue"
+    if act == "cancel":
+        request_stop()
+        return True, "已发送取消指令"
+    msg = "已发送继续指令"
+    need_log = False
+    with _runtime_lock:
+        if _waiting_recovery:
+            _recovery_choice = act
+            msg = "已收到恢复操作，正在继续当前流程…"
+        elif _pause_requested:
+            _pause_requested = False
+            _runtime_prompt = _default_running_prompt()
+            msg = "已恢复运行，将继续执行下一步"
+            need_log = True
+        elif _runtime_prompt.get("mode") == "login_wps":
+            _recovery_choice = "check_now"
+            msg = "正在立即检测 WPS 登录状态…"
+    _notify_runtime_state()
+    if need_log:
+        log("▶ 已点击【继续】，恢复执行…")
+    return True, msg
 
 
 def reset_stop():
-    global _stop_requested
-    _stop_requested = False
+    global _stop_requested, _pause_requested, _waiting_recovery, _recovery_choice, _runtime_prompt
+    with _runtime_lock:
+        _stop_requested = False
+        _pause_requested = False
+        _waiting_recovery = False
+        _recovery_choice = None
+        _runtime_prompt = _default_running_prompt()
+    _notify_runtime_state()
 
 
 def check_stop():
-    if _stop_requested:
-        raise RuntimeError("用户手动停止了任务")
+    """在任何可安全中断点检查取消信号与暂停信号（暂停期间自动挂起等待）。"""
+    was_paused = False
+    while True:
+        with _runtime_lock:
+            if _stop_requested:
+                raise RuntimeError("用户手动停止了任务")
+            paused = _pause_requested
+        if not paused:
+            if was_paused:
+                _notify_runtime_state()
+            return
+        was_paused = True
+        time.sleep(0.15)
 
 
 def sleep_check(seconds):
-    """可随时响应停止信号的分段休眠。"""
-    end = time.time() + max(0.0, float(seconds))
+    """可随时响应暂停/继续/取消的分段休眠（暂停期间不扣减等待时长）。"""
+    remaining = max(0.0, float(seconds))
     while True:
         check_stop()
-        rem = end - time.time()
-        if rem <= 0:
+        if remaining <= 0:
             break
-        time.sleep(min(0.25, rem))
+        step = min(0.25, remaining)
+        t0 = time.monotonic()
+        time.sleep(step)
+        with _runtime_lock:
+            if not _pause_requested:
+                remaining -= (time.monotonic() - t0)
+
+
+def probe_network(timeout=2.4):
+    """快速探测国内基础网络与 Luya 后台连通性，区分断网与未开启 VPN/代理异常。"""
+    def _http_ok(url):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "SheetMate"})
+            with urllib.request.urlopen(req, timeout=timeout):
+                return True
+        except urllib.error.HTTPError:
+            # 只要收到 HTTP 响应（如 401/403/404/302），说明网络与节点是通的
+            return True
+        except Exception:
+            return False
+
+    def _tcp_ok(host, port=443):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except Exception:
+            return False
+
+    internet_ok = _http_ok("https://www.baidu.com") or _http_ok("https://www.kdocs.cn")
+    if not internet_ok:
+        internet_ok = _tcp_ok("223.5.5.5", 443) or _tcp_ok("119.29.29.29", 443)
+    luya_ok = _http_ok("https://bb.luyaapp.live") if internet_ok else False
+    wps_ok = _http_ok("https://www.kdocs.cn") if internet_ok else False
+    return {
+        "internet_ok": bool(internet_ok),
+        "luya_ok": bool(luya_ok),
+        "wps_ok": bool(wps_ok),
+    }
+
+
+def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
+    """根据当前阶段、报错内容与网络探测结果，返回清晰的排障说明与可恢复按钮列表。"""
+    extra = extra or {}
+    err_s = str(exc or "").strip()
+    low = err_s.lower()
+    net_err_keys = (
+        "err_internet_disconnected",
+        "err_name_not_resolved",
+        "err_proxy_connection_failed",
+        "err_tunnel_connection_failed",
+        "err_timed_out",
+        "err_connection_timed_out",
+        "err_connection_reset",
+        "err_connection_closed",
+        "err_connection_refused",
+        "net::err",
+        "timeout",
+    )
+    is_net_err = any(k in low for k in net_err_keys)
+
+    net = None
+    if stage in ("luya_open", "luya_login", "luya_download", "wps_open", "wps_paste", "wps_capture"):
+        try:
+            net = probe_fn()
+        except Exception:
+            net = {"internet_ok": True, "luya_ok": True, "wps_ok": True}
+
+    # 1. 本机彻底断网
+    if ("err_internet_disconnected" in low or "err_name_not_resolved" in low
+            or (net is not None and not net.get("internet_ok", True))):
+        return {
+            "title": "电脑未连接网络，无法继续抓取",
+            "detail": (
+                "1. 请检查 Wi-Fi 或网线是否正常连网，先在浏览器确认能正常打开网页；\n"
+                "2. 连上网后点击【已连网·重试当前步】，前面已完成的部分无需重跑。"
+            ),
+            "hint": "按键提示：连好网络点【已连网·重试当前步】，或点【取消】终止本轮。",
+            "actions": [
+                {"id": "retry", "label": "已连网·重试当前步", "style": "primary"},
+            ],
+        }
+
+    # 2. 已连网但未开 VPN / 代理未连通 Luya 后台
+    if stage in ("luya_open", "luya_login", "luya_download") and net is not None:
+        proxy_or_timeout = any(k in low for k in (
+            "err_proxy", "err_tunnel", "err_timed_out", "err_connection_timed_out",
+            "err_connection_reset", "err_connection_refused", "timeout", "net::err",
+        ))
+        if (not net.get("luya_ok", True)) or (is_net_err and proxy_or_timeout):
+            return {
+                "title": "已连网络，但未开启 VPN 或无法连接后台",
+                "detail": (
+                    "电脑外网正常，但访问 Luya 数据后台（bb.luyaapp.live）超时或被拦截。\n"
+                    "1. 请先打开 VPN 软件并确保节点连接成功（确认系统代理可用）；\n"
+                    "2. 开启 VPN 后点击【已开VPN·重试当前步】，直接接着当前步抓取！"
+                ),
+                "hint": "按键提示：打开 VPN 并连上节点后点【已开VPN·重试当前步】继续。",
+                "actions": [
+                    {"id": "retry", "label": "已开VPN·重试当前步", "style": "primary"},
+                ],
+            }
+
+    # 3. 后台登录未通过 / 登录失效
+    if stage == "luya_login" or extra.get("luya_need_login"):
+        return {
+            "title": "Luya 后台需要手动确认登录",
+            "detail": (
+                "1. 请查看已弹出的浏览器窗口，如停留在登录页或验证码页，请手动完成登录；\n"
+                "2. 登录成功进入后台后点击【我已登录·继续】，或点【重试自动登录】。"
+            ),
+            "hint": "按键提示：手动登录完成后点【我已登录·继续】，直接去下载数据。",
+            "actions": [
+                {"id": "continue", "label": "我已登录·继续", "style": "primary"},
+                {"id": "retry", "label": "重试自动登录", "style": "secondary"},
+            ],
+        }
+
+    # 4. Luya 数据打开或下载失败
+    if stage == "luya_open":
+        return {
+            "title": "打开 Luya 数据后台页面失败",
+            "detail": (
+                f"原因：{human_error(err_s)}\n"
+                "1. 请检查网络与 VPN 是否开启且节点稳定；\n"
+                "2. 确认后点击【重试打开后台】即可继续。"
+            ),
+            "hint": "按键提示：确认网络/VPN 正常后点【重试打开后台】继续。",
+            "actions": [
+                {"id": "retry", "label": "重试打开后台", "style": "primary"},
+            ],
+        }
+
+    if stage == "luya_download":
+        tbl_name = extra.get("name") or "数据表"
+        return {
+            "title": f"【{tbl_name}】下载未能成功",
+            "detail": (
+                f"前面已下好的表会保留，仅【{tbl_name}】未下下来。\n"
+                "1. 请检查 VPN/网络是否稳定，可在浏览器中看下页面是否已刷出表格；\n"
+                "2. 确认后点击【重试下载当前表】，无需重新下载前面已完成的表。"
+            ),
+            "hint": f"按键提示：检查 VPN 后点【重试下载当前表】单独重抓【{tbl_name}】。",
+            "actions": [
+                {"id": "retry", "label": "重试下载当前表", "style": "primary"},
+            ],
+        }
+
+    # 5. WPS 打开 / 写入失败
+    if stage == "wps_open":
+        return {
+            "title": "打开或登录 WPS 在线表格失败",
+            "detail": (
+                f"原因：{human_error(err_s)}\n"
+                "1. 请查看浏览器中的 WPS 页面，确保网络正常并已完成扫码登录；\n"
+                "2. 表格可编辑后点击【重试打开/检测WPS】，已下载的三份数据无需重抓。"
+            ),
+            "hint": "按键提示：在浏览器确认 WPS 表格打开并登录后点【重试打开/检测WPS】。",
+            "actions": [
+                {"id": "retry", "label": "重试打开/检测WPS", "style": "primary"},
+            ],
+        }
+
+    if stage == "wps_paste":
+        tbl_name = extra.get("name") or "工作表"
+        return {
+            "title": f"写入 WPS【{tbl_name}】工作表失败",
+            "detail": (
+                f"原因：{human_error(err_s)}\n"
+                f"1. 请查看浏览器中【{tbl_name}】标签页是否可见、无弹窗遮挡；\n"
+                f"2. 处理好后点【重试写入当前表】，或点【跳过此表·下一步】继续后续流程。"
+            ),
+            "hint": "按键提示：检查工作表后点【重试写入当前表】继续写入，点【取消】终止本轮。",
+            "actions": [
+                {"id": "retry", "label": "重试写入当前表", "style": "primary"},
+                {"id": "skip", "label": "跳过此表·下一步", "style": "secondary"},
+            ],
+        }
+
+    # 6. WPS 汇总表截图失败
+    if stage == "wps_capture":
+        return {
+            "title": "WPS 数据汇总表截图未成功",
+            "detail": (
+                f"浏览器仍保持打开且数据已写入（原因：{human_error(err_s)}）。\n"
+                "方案A：点开浏览器的【数据汇总】页关掉遮挡弹窗后，点【重试自动截图】；\n"
+                "方案B：您也可以自己在表里框选 C6:AK 右键「复制为图片」，再点【我已手动复制·发钉钉】。"
+            ),
+            "hint": "按键提示：修好页面点【重试自动截图】，或手动复制图片后点【我已手动复制·发钉钉】。",
+            "actions": [
+                {"id": "retry", "label": "重试自动截图", "style": "primary"},
+                {"id": "manual_copied", "label": "我已手动复制·发钉钉", "style": "secondary"},
+                {"id": "skip", "label": "跳过截图发钉钉", "style": "secondary"},
+            ],
+        }
+
+    # 7. 钉钉未启动 / 停留在扫码登录页
+    if stage == "dingtalk_login":
+        return {
+            "title": "钉钉未启动或尚未扫码登录",
+            "detail": (
+                "刚刚截好的表格图片已安全保存，不会丢失！\n"
+                "1. 请先在电脑上打开钉钉并扫码登录，看到聊天消息主界面；\n"
+                "2. 登录成功后点击【已登录钉钉·继续发送】，图片将直接贴到群里（无需重抓表格）。"
+            ),
+            "hint": "按键提示：钉钉扫码登录成功后点【已登录钉钉·继续发送】直接继续。",
+            "actions": [
+                {"id": "retry", "label": "已登录钉钉·继续发送", "style": "primary"},
+            ],
+        }
+
+    # 8. 钉钉未搜索到目标群聊
+    if stage == "dingtalk_search":
+        target = extra.get("search_name") or "目标群聊"
+        return {
+            "title": f"钉钉未能自动搜到群聊「{target}」",
+            "detail": (
+                "表格图片已安全保存，不会丢失！您可以任选一种方式继续：\n"
+                "方案A（推荐）：直接在钉钉里手动点开目标群聊窗口，然后点【已手动开群·直接粘贴】，将自动清空草稿、贴图贴字并设为静音；\n"
+                "方案B：确认群聊名称正确或切回钉钉主窗后，点【重新搜索群聊】。"
+            ),
+            "hint": "按键提示：手动点开群后点【已手动开群·直接粘贴】，或点【重新搜索群聊】。",
+            "actions": [
+                {"id": "skip_search", "label": "已手动开群·直接粘贴", "style": "primary"},
+                {"id": "retry", "label": "重新搜索群聊", "style": "secondary"},
+            ],
+        }
+
+    # 9. 钉钉粘贴或输入框焦点受阻
+    if stage == "dingtalk_paste":
+        return {
+            "title": "钉钉粘贴图片或文字时受阻",
+            "detail": (
+                f"表格图片仍已保留（原因：{human_error(err_s)}）。\n"
+                "1. 请在钉钉点开要发送的目标群聊聊天窗口，关闭遮挡小窗；\n"
+                "2. 确认后点【直接粘贴重试】即可把图和文字贴进去，或点【重新搜索群聊】。"
+            ),
+            "hint": "按键提示：点开群聊天窗口后点击【直接粘贴重试】继续发送。",
+            "actions": [
+                {"id": "retry_paste", "label": "直接粘贴重试", "style": "primary"},
+                {"id": "retry", "label": "重新搜索群聊", "style": "secondary"},
+            ],
+        }
+
+    return {
+        "title": "当前步骤遇到异常",
+        "detail": f"原因：{human_error(err_s)}\n请检查相关页面状态后点击【重试当前步】继续。",
+        "hint": "按键提示：处理完成后点【重试当前步】继续，或点【取消】终止本轮。",
+        "actions": [
+            {"id": "retry", "label": "重试当前步", "style": "primary"},
+        ],
+    }
+
+
+def wait_for_recovery(title, detail, hint="", actions=None, timeout_sec=900):
+    """遇到可恢复阻塞时挂起当前步骤并弹窗引导用户解决，返回用户选择的恢复动作 ID。"""
+    global _waiting_recovery, _recovery_choice, _runtime_prompt
+    check_stop()
+    act_list = [dict(a) for a in (actions or [{"id": "retry", "label": "重试当前步", "style": "primary"}])]
+    with _runtime_lock:
+        _waiting_recovery = True
+        _recovery_choice = None
+        _runtime_prompt = {
+            "mode": "waiting_fix",
+            "title": str(title or "需要处理"),
+            "detail": str(detail or ""),
+            "hint": str(hint or "处理完成后点击恢复按钮继续，或点击【取消】结束本轮。"),
+            "actions": act_list,
+        }
+    set_step(f"暂停待处理：{title}")
+    log(f"⚠️ {title} — {str(detail or '').replace(chr(10), ' ')}")
+    _notify_runtime_state()
+    deadline = time.monotonic() + max(10.0, float(timeout_sec))
+    try:
+        while time.monotonic() < deadline:
+            with _runtime_lock:
+                if _stop_requested:
+                    raise RuntimeError("用户手动停止了任务")
+                choice = _recovery_choice
+            if choice is not None:
+                if choice == "cancel":
+                    raise RuntimeError("用户手动停止了任务")
+                log(f"▶ 正在执行恢复操作：{choice}")
+                return choice
+            time.sleep(0.18)
+        raise RuntimeError(f"等待处理超时（超过 {int(timeout_sec // 60)} 分钟未响应）：{title}")
+    finally:
+        with _runtime_lock:
+            _waiting_recovery = False
+            _recovery_choice = None
+            _runtime_prompt = _default_running_prompt()
+        _notify_runtime_state()
 
 
 def fetch_remote_version():
@@ -1109,19 +1535,41 @@ def click_in_all_frames(page, button_text, max_wait=20):
 
 def wait_wps_login(page, max_wait=1200):
     """等待 WPS 登录成功：未登录时点「立即登录/确认登录」，出现扫码页则暂停等用户扫码。"""
+    global _runtime_prompt, _recovery_choice
     if check_wps_logged_in(page):
         return True
     log("  需要登录 WPS，正在找登录入口...")
     click_in_all_frames(page, "立即登录", max_wait=15)
-    time.sleep(3)
+    sleep_check(3)
     click_in_all_frames(page, "确认登录", max_wait=10)
     log("  ⏳ 请在浏览器里扫码登录，登录成功后会自动继续（最多等 20 分钟）")
     show_login_prompt()
-    deadline = time.time() + max_wait
+    with _runtime_lock:
+        _recovery_choice = None
+        _runtime_prompt = {
+            "mode": "login_wps",
+            "title": "WPS 需要扫码登录",
+            "detail": (
+                "1. 请在弹出的浏览器窗口中用 WPS / 微信扫码登录；\n"
+                "2. 扫码成功后程序会自动继续（也可点击【我已扫码·继续】立即检测）。"
+            ),
+            "hint": "按键提示：扫码后点【我已扫码·继续】加快检测，点【取消】终止本轮。",
+            "actions": [
+                {"id": "check_now", "label": "我已扫码·继续", "style": "primary"},
+            ],
+        }
+    _notify_runtime_state()
+    deadline = time.monotonic() + max_wait
     try:
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             check_stop()
-            time.sleep(2)
+            for _ in range(10):
+                check_stop()
+                with _runtime_lock:
+                    if _recovery_choice == "check_now":
+                        _recovery_choice = None
+                        break
+                time.sleep(0.2)
             if check_wps_logged_in(page):
                 log("  ✅ WPS 登录成功")
                 return True
@@ -1129,6 +1577,11 @@ def wait_wps_login(page, max_wait=1200):
         return False
     finally:
         close_login_prompt()
+        with _runtime_lock:
+            if _runtime_prompt.get("mode") == "login_wps":
+                _runtime_prompt = _default_running_prompt()
+            _recovery_choice = None
+        _notify_runtime_state()
 
 
 def _col_letter_to_idx(letter):
@@ -1633,7 +2086,42 @@ def _is_search_popup_open():
     return False
 
 
-def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None):
+def _is_dingtalk_login_window(win):
+    """检测找到的钉钉窗口是否仍处于未登录扫码/密码登录页。"""
+    if win is None:
+        return True
+    try:
+        rr = win.BoundingRectangle
+        if (rr.right - rr.left) < 640 or (rr.bottom - rr.top) < 440:
+            return True
+    except Exception:
+        pass
+    try:
+        hit_login = False
+
+        def _scan_login(ctrl, depth=0):
+            nonlocal hit_login
+            if hit_login or depth > 6:
+                return
+            for ch in ctrl.GetChildren():
+                try:
+                    nm = (ch.Name or "").strip()
+                    if any(k in nm for k in ("扫码登录", "密码登录", "验证码登录", "钉钉账号登录", "安全登录")):
+                        hit_login = True
+                        return
+                except Exception:
+                    pass
+                _scan_login(ch, depth + 1)
+
+        _scan_login(win, 0)
+        if hit_login:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interactive=True):
     """把 WPS 复制的表格图片发到指定钉钉会话，再发一条“时间(+分时段后缀)”文字。"""
     check_stop()
     search_name = (cfg.get("dt_search") or "文件小助手").strip()
@@ -1643,7 +2131,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None):
     search_candidates, search_tokens = _extract_search_keywords(search_name)
 
     try:
-        import uiautomation as ua
+        import uiautomation as ua  # type: ignore[import-not-found]
     except Exception as e:
         raise RuntimeError("钉钉发送组件未安装") from e
 
@@ -1685,40 +2173,14 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None):
                 time.sleep(0.5)
             return None
 
-        def _window_rect():
-            w = _fresh_ding()
-            if w is None:
-                return None
-            try:
-                return w.BoundingRectangle
-            except Exception:
-                return None
-
-        # 0) 搜索前先把 WPS 图片存成文件（关键：搜索全程禁止在剪贴板放图片）
+        # 0) 搜索前先把 WPS 图片存成文件（失败重试期间保留 tmp_img 绝不丢失）
         state0 = save_clipboard_image_if_exists(tmp_img)
         if state0 == "noimage":
             raise RuntimeError("剪贴板里没有图片，已停止钉钉发送")
         if state0 != "saved":
             raise RuntimeError("表格图片暂存失败，已停止钉钉发送")
         clear_clipboard_windows()
-        log("  已暂存表格图片，开始搜索会话")
-
-        # 1) 唤起钉钉（托盘时启动 exe），轮询等待窗口
-        ding = _find()
-        if ding is None:
-            for exe in exe_candidates:
-                if os.path.exists(exe):
-                    subprocess.Popen(exe)
-                    log("  钉钉窗口在托盘，已唤起，请稍候…")
-                    break
-            for _ in range(30):
-                check_stop()
-                time.sleep(1)
-                ding = _find()
-                if ding:
-                    break
-        if ding is None:
-            raise RuntimeError("没找到钉钉窗口，请确认钉钉已登录后再试")
+        log("  已暂存表格图片（中断重连不会丢失），开始准备钉钉会话")
 
         # 2) 强力置前（AttachThreadInput 解除前台锁定）并最大化
         import ctypes
@@ -2288,7 +2750,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None):
             if bad2:
                 raise RuntimeError(f"检测到焦点仍在钉钉搜索框（{reason2}），已安全拦截粘贴")
 
-        # 3) 全局搜索直达目标会话（Ctrl+Shift+F 打开即聚焦，直接粘贴完整目标名称并按 Enter 进入）
+        # 3) 全局搜索 + 发送主循环（支持钉钉未登录、未搜到群、焦点受阻时原地暂停恢复）
         direct_candidates = [search_name] + [c for c in search_candidates if c and c != search_name]
 
         def _wait_search_closed(loops=10, step=0.25):
@@ -2301,171 +2763,224 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None):
                         return True
             return False
 
-        chat_ready = False
-        for _attempt in range(3):
+        skip_search = False
+        while True:
             check_stop()
-            _force_front()
-            time.sleep(0.45)
-            if _link_box() is not None:
-                _close_link_box()
-            _open_global_search()
+            # 1) 唤起钉钉并确认已扫码登录进入主窗
+            ding = _find()
+            if ding is None:
+                for exe in exe_candidates:
+                    if os.path.exists(exe):
+                        try:
+                            subprocess.Popen(exe)
+                            log("  钉钉窗口在托盘或未启动，已尝试唤起，请稍候…")
+                        except Exception:
+                            pass
+                        break
+                for _ in range(18):
+                    sleep_check(1)
+                    ding = _find()
+                    if ding:
+                        break
 
-            opened = False
-            for _ in range(14):
-                check_stop()
-                if _is_search_popup_open():
-                    opened = True
-                    break
-                time.sleep(0.25)
-            popup_ctl, doc = (None, None) if opened else _search_doc()
-            if not opened and doc is None:
-                log("  搜索窗口没打开，正在重试…")
+            if ding is None or _is_dingtalk_login_window(ding):
+                if not recover_interactive:
+                    raise RuntimeError("没找到已登录的钉钉主窗口，请确认钉钉已打开并扫码登录后再试")
+                issue = diagnose_issue("dingtalk_login")
+                wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                skip_search = False
                 continue
-            time.sleep(0.3)
 
-            for kw_idx, kw in enumerate(direct_candidates):
-                check_stop()
-                if kw_idx > 0:
-                    if not _is_search_popup_open():
-                        _open_global_search()
-                        for _ in range(14):
-                            check_stop()
-                            if _is_search_popup_open():
-                                break
-                            time.sleep(0.25)
+            if not skip_search:
+                chat_ready = False
+                for _attempt in range(3):
+                    check_stop()
+                    _force_front()
+                    sleep_check(0.45)
+                    if _link_box() is not None:
+                        _close_link_box()
+                    _open_global_search()
+
+                    opened = False
+                    for _ in range(14):
+                        check_stop()
+                        if _is_search_popup_open():
+                            opened = True
+                            break
                         time.sleep(0.25)
-                    popup_ctl, doc = _search_doc()
-                    if doc is not None:
-                        _focus_search_input(popup_ctl, doc)
-                        time.sleep(0.15)
+                    popup_ctl, doc = (None, None) if opened else _search_doc()
+                    if not opened and doc is None:
+                        log("  搜索窗口没打开，正在重试…")
+                        continue
+                    sleep_check(0.3)
 
-                ua.SendKeys("{Ctrl}a", waitTime=0.08)
-                ua.SendKeys("{Back}", waitTime=0.08)
-                if not _paste_text(kw, verify=True):
-                    log(f"  关键词「{kw}」写入剪贴板未就绪，跳过重试…")
-                    continue
-                time.sleep(0.85)
+                    for kw_idx, kw in enumerate(direct_candidates):
+                        check_stop()
+                        if kw_idx > 0:
+                            if not _is_search_popup_open():
+                                _open_global_search()
+                                for _ in range(14):
+                                    check_stop()
+                                    if _is_search_popup_open():
+                                        break
+                                    time.sleep(0.25)
+                                sleep_check(0.25)
+                            popup_ctl, doc = _search_doc()
+                            if doc is not None:
+                                _focus_search_input(popup_ctl, doc)
+                                time.sleep(0.15)
 
-                # 极端情况下若搜索历史仍未消失，重新聚焦搜索框再贴一遍兜底
-                popup_ctl, doc = _search_doc()
-                if doc is not None and _has_search_history(doc):
-                    log(f"  检测到搜索框尚未接收内容，重新聚焦并粘贴「{kw}」…")
-                    _focus_search_input(popup_ctl, doc)
-                    time.sleep(0.15)
-                    ua.SendKeys("{Ctrl}a", waitTime=0.08)
-                    ua.SendKeys("{Back}", waitTime=0.08)
-                    if _paste_text(kw, verify=True):
-                        time.sleep(0.85)
+                        ua.SendKeys("{Ctrl}a", waitTime=0.08)
+                        ua.SendKeys("{Back}", waitTime=0.08)
+                        if not _paste_text(kw, verify=True):
+                            log(f"  关键词「{kw}」写入剪贴板未就绪，跳过重试…")
+                            continue
+                        sleep_check(0.85)
 
-                # 直接按 Enter 打开首选/高亮会话
-                ua.SendKeys("{Enter}", waitTime=0.3)
-                if _wait_search_closed(loops=10, step=0.25):
-                    chat_ready = True
-                    break
+                        # 极端情况下若搜索历史仍未消失，重新聚焦搜索框再贴一遍兜底
+                        popup_ctl, doc = _search_doc()
+                        if doc is not None and _has_search_history(doc):
+                            log(f"  检测到搜索框尚未接收内容，重新聚焦并粘贴「{kw}」…")
+                            _focus_search_input(popup_ctl, doc)
+                            time.sleep(0.15)
+                            ua.SendKeys("{Ctrl}a", waitTime=0.08)
+                            ua.SendKeys("{Back}", waitTime=0.08)
+                            if _paste_text(kw, verify=True):
+                                sleep_check(0.85)
 
-                # 若回车后弹窗未退，且列表已有搜索结果，尝试精准点击命中行兜底
-                popup_ctl, doc = _search_doc()
-                if doc is not None and not _has_search_history(doc):
-                    matched = _feature_item(doc)
-                    if matched is not None:
-                        _item_ctl, item_rect = matched
-                        cx = int((item_rect.left + item_rect.right) / 2)
-                        cy = int((item_rect.top + item_rect.bottom) / 2)
-                        ua.Click(cx, cy, waitTime=0.3)
+                        # 直接按 Enter 打开首选/高亮会话
+                        ua.SendKeys("{Enter}", waitTime=0.3)
                         if _wait_search_closed(loops=10, step=0.25):
                             chat_ready = True
                             break
-                log(f"  关键词「{kw}」未直接进入会话，尝试下一候选词…")
 
-            if chat_ready:
-                break
-            log("  本轮未进入目标会话，关闭搜索框后重试…")
-            ua.SendKeys("{Esc}", waitTime=0.25)
-            time.sleep(0.5)
+                        # 若回车后弹窗未退，且列表已有搜索结果，尝试精准点击命中行兜底
+                        popup_ctl, doc = _search_doc()
+                        if doc is not None and not _has_search_history(doc):
+                            matched = _feature_item(doc)
+                            if matched is not None:
+                                _item_ctl, item_rect = matched
+                                cx = int((item_rect.left + item_rect.right) / 2)
+                                cy = int((item_rect.top + item_rect.bottom) / 2)
+                                ua.Click(cx, cy, waitTime=0.3)
+                                if _wait_search_closed(loops=10, step=0.25):
+                                    chat_ready = True
+                                    break
+                        log(f"  关键词「{kw}」未直接进入会话，尝试下一候选词…")
 
-        if not chat_ready:
-            raise RuntimeError("没能定位到钉钉会话，已停止发送")
-        clear_clipboard_windows()
-        log("  已打开目标会话，准备粘贴图片")
+                    if chat_ready:
+                        break
+                    log("  本轮未进入目标会话，关闭搜索框后重试…")
+                    ua.SendKeys("{Esc}", waitTime=0.25)
+                    sleep_check(0.5)
 
-        # 4) 聚焦底部聊天输入框并先清空残留内容，再把图片写入剪贴板并粘贴
-        ding_now = _fresh_ding()
-        if ding_now is None:
-            raise RuntimeError("找不到钉钉窗口，已停止粘贴")
-        r = ding_now.BoundingRectangle
-        _focus_chat_input(ding_now, r)
-        time.sleep(0.35)
-        _ensure_not_in_search_box(r)
+                if not chat_ready:
+                    if not recover_interactive:
+                        raise RuntimeError("没能定位到钉钉会话，已停止发送")
+                    issue = diagnose_issue("dingtalk_search", extra={"search_name": search_name})
+                    choice = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                    if choice == "skip_search":
+                        skip_search = True
+                    else:
+                        skip_search = False
+                        continue
+            else:
+                log("  用户已手动打开目标群聊，跳过自动搜索，直接定位发送框…")
 
-        if cfg.get("dt_clear_before_send", True):
-            ua.SendKeys("{Ctrl}a", waitTime=0.15)
-            ua.SendKeys("{Back}", waitTime=0.15)
-            ua.SendKeys("{Delete}", waitTime=0.15)
-            ua.SendKeys("{Ctrl}a", waitTime=0.1)
-            ua.SendKeys("{Back}", waitTime=0.2)
-            log("  已清空发送框内原有内容")
+            try:
+                _force_front()
+                sleep_check(0.35)
+                clear_clipboard_windows()
+                log("  已打开目标会话，准备粘贴图片")
 
-        if not set_clipboard_image_from_file(tmp_img):
-            raise RuntimeError("图片恢复失败，已停止粘贴")
+                # 4) 聚焦底部聊天输入框并先清空残留内容，再把图片写入剪贴板并粘贴
+                ding_now = _fresh_ding()
+                if ding_now is None:
+                    raise RuntimeError("找不到钉钉窗口，已停止粘贴")
+                r = ding_now.BoundingRectangle
+                _focus_chat_input(ding_now, r)
+                sleep_check(0.35)
+                _ensure_not_in_search_box(r)
 
-        # 5) 粘贴图片前硬核查焦点，绝不把图片贴入顶部搜索框
-        _ensure_not_in_search_box(r)
-        ua.SendKeys("{Ctrl}v", waitTime=0.5)
+                if cfg.get("dt_clear_before_send", True):
+                    ua.SendKeys("{Ctrl}a", waitTime=0.15)
+                    ua.SendKeys("{Back}", waitTime=0.15)
+                    ua.SendKeys("{Delete}", waitTime=0.15)
+                    ua.SendKeys("{Ctrl}a", waitTime=0.1)
+                    ua.SendKeys("{Back}", waitTime=0.2)
+                    log("  已清空发送框内原有内容")
 
-        # 6) 弹窗兜底：检查“选择粘贴的形式”，出现就点「转为图片」
-        converted = False
-        for _ in range(12):
-            time.sleep(0.25)
-            tops = _enum_top_windows(
-                target_classes=("ddesign::ComplexModal",), target_titles=None)
-            if tops:
-                modal = ua.ControlFromHandle(tops[0][0])
-                if modal is not None:
-                    btn = modal.ButtonControl(searchDepth=12, Name="转为图片")
-                    if btn.Exists(2):
-                        btn.Click()
-                        converted = True
-                        time.sleep(0.6)
-                break
-        if converted:
-            log("  已自动点「转为图片」")
-        else:
-            log("  图片已直接粘贴（无需转换）")
+                if not set_clipboard_image_from_file(tmp_img):
+                    raise RuntimeError("图片恢复失败，已停止粘贴")
 
-        # 7) 粘贴文字前再次确认焦点在底部编辑区，最后再按设置决定静音与是否发出
-        ding_now2 = _fresh_ding()
-        if ding_now2 is None:
-            raise RuntimeError("钉钉窗口异常，消息尚未发送，请检查后手动发送")
-        r2 = ding_now2.BoundingRectangle
-        _focus_chat_input(ding_now2, r2)
-        time.sleep(0.25)
-        ua.SendKeys("{End}", waitTime=0.15)
-        _ensure_not_in_search_box(r2)
-        if not _paste_text(text_msg, verify=True):
-            raise RuntimeError("钉钉文字未就绪，已停止自动发送，请检查后手动按 Enter")
-        time.sleep(0.5)
+                # 5) 粘贴图片前硬核查焦点，绝不把图片贴入顶部搜索框
+                _ensure_not_in_search_box(r)
+                ua.SendKeys("{Ctrl}v", waitTime=0.5)
 
-        if cfg.get("dt_silent_send", True):
-            ding_now3 = _fresh_ding()
-            if ding_now3 is not None:
-                _enable_dingtalk_silent_send(ding_now3, ding_now3.BoundingRectangle)
-                time.sleep(0.35)
+                # 6) 弹窗兜底：检查“选择粘贴的形式”，出现就点「转为图片」
+                converted = False
+                for _ in range(12):
+                    time.sleep(0.25)
+                    tops = _enum_top_windows(
+                        target_classes=("ddesign::ComplexModal",), target_titles=None)
+                    if tops:
+                        modal = ua.ControlFromHandle(tops[0][0])
+                        if modal is not None:
+                            btn = modal.ButtonControl(searchDepth=12, Name="转为图片")
+                            if btn.Exists(2):
+                                btn.Click()
+                                converted = True
+                                time.sleep(0.6)
+                        break
+                if converted:
+                    log("  已自动点「转为图片」")
+                else:
+                    log("  图片已直接粘贴（无需转换）")
 
-        if cfg.get("dt_auto_send", False):
-            ding_now4 = _fresh_ding()
-            if ding_now4 is not None:
-                r4 = ding_now4.BoundingRectangle
-                _focus_chat_input(ding_now4, r4)
-                time.sleep(0.2)
-                _ensure_not_in_search_box(r4)
-            ua.SendKeys("{Enter}", waitTime=0.4)
-            silent_word = "静音" if cfg.get("dt_silent_send", True) else ""
-            log(f"  已{silent_word}发送图片和文字：{text_msg}")
-        else:
-            silent_tip = "并设为「静音发送」" if cfg.get("dt_silent_send", True) else ""
-            clear_tip = "已清空旧草稿、" if cfg.get("dt_clear_before_send", True) else ""
-            log(f"  ✅ {clear_tip}贴好图片与「{text_msg}」{silent_tip}，按设置暂不发送，请检查后手动发送")
-        return True
+                # 7) 粘贴文字前再次确认焦点在底部编辑区，最后再按设置决定静音与是否发出
+                ding_now2 = _fresh_ding()
+                if ding_now2 is None:
+                    raise RuntimeError("钉钉窗口异常，消息尚未发送，请检查后手动发送")
+                r2 = ding_now2.BoundingRectangle
+                _focus_chat_input(ding_now2, r2)
+                sleep_check(0.25)
+                ua.SendKeys("{End}", waitTime=0.15)
+                _ensure_not_in_search_box(r2)
+                if not _paste_text(text_msg, verify=True):
+                    raise RuntimeError("钉钉文字未就绪，已停止自动发送，请检查后手动按 Enter")
+                sleep_check(0.5)
+
+                if cfg.get("dt_silent_send", True):
+                    ding_now3 = _fresh_ding()
+                    if ding_now3 is not None:
+                        _enable_dingtalk_silent_send(ding_now3, ding_now3.BoundingRectangle)
+                        sleep_check(0.35)
+
+                if cfg.get("dt_auto_send", False):
+                    ding_now4 = _fresh_ding()
+                    if ding_now4 is not None:
+                        r4 = ding_now4.BoundingRectangle
+                        _focus_chat_input(ding_now4, r4)
+                        sleep_check(0.2)
+                        _ensure_not_in_search_box(r4)
+                    ua.SendKeys("{Enter}", waitTime=0.4)
+                    silent_word = "静音" if cfg.get("dt_silent_send", True) else ""
+                    log(f"  已{silent_word}发送图片和文字：{text_msg}")
+                else:
+                    silent_tip = "并设为「静音发送」" if cfg.get("dt_silent_send", True) else ""
+                    clear_tip = "已清空旧草稿、" if cfg.get("dt_clear_before_send", True) else ""
+                    log(f"  ✅ {clear_tip}贴好图片与「{text_msg}」{silent_tip}，按设置暂不发送，请检查后手动发送")
+                return True
+            except Exception as e_paste:
+                if "手动停止" in str(e_paste) or not recover_interactive:
+                    raise
+                issue = diagnose_issue("dingtalk_paste", e_paste, extra={"search_name": search_name})
+                choice = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                if choice == "retry_paste":
+                    skip_search = True
+                else:
+                    skip_search = False
+                continue
     except Exception as e:
         log(f"  钉钉操作失败：{human_error(e)}")
         raise
@@ -2480,7 +2995,85 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None):
             pass
 
 
-def run_once(round_num, cfg=None, trigger_lt=None, trigger_hm=None):
+def _open_and_login_wps(context, page, wps_url, recover_interactive=True):
+    """打开 WPS 在线表并完成登录检测（失败时保持浏览器打开并暂停等待恢复）。"""
+    while True:
+        check_stop()
+        try:
+            cleanup_wps_tabs(context, wps_url=wps_url)
+            goto_with_retry(page, wps_url)
+            page.wait_for_selector("input.edit-box", timeout=20000)
+            sleep_check(1)
+            if check_wps_logged_in(page):
+                log("  表格已登录，直接继续")
+            else:
+                if not wait_wps_login(page, max_wait=1200):
+                    raise RuntimeError("WPS 登录超时：请在浏览器里扫码登录后继续")
+            return
+        except Exception as e_wps:
+            if "手动停止" in str(e_wps) or not recover_interactive:
+                raise
+            issue = diagnose_issue("wps_open", e_wps)
+            wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+
+
+def _capture_summary_with_recovery(page, temp_dir=None, enable_capture=True, recover_interactive=True,
+                                   failures=None, log_prefix="5/5"):
+    """切到「数据汇总」表并框选复制为图片，保持浏览器打开直至成功、手动复制兜底或跳过。"""
+    while True:
+        check_stop()
+        try:
+            set_step("正在切换到数据汇总表…")
+            log(f"{log_prefix} 切到数据汇总表...")
+            if not switch_wps_sheet(page, "数据汇总"):
+                raise RuntimeError("切换到数据汇总表失败，请检查底部标签栏")
+            set_step("正在等待汇总表刷新…")
+            log("  等待 5 秒，让数据汇总表完成刷新…")
+            sleep_check(5.0)
+
+            if temp_dir is not None:
+                screenshot_path = temp_dir / "数据汇总.png"
+                page.screenshot(path=str(screenshot_path))
+                log("✅ 数据汇总表已准备好")
+
+            if enable_capture:
+                check_stop()
+                set_step("正在复制表格图片…")
+                capture_wps_region(page)
+            return False
+        except Exception as e_cap:
+            if "手动停止" in str(e_cap):
+                raise
+            if not recover_interactive:
+                if failures is not None:
+                    tip = human_error(e_cap)
+                    failures.append("复制表格图片失败：" + tip)
+                    log(f"  复制图片没成功：{tip}")
+                    log_error(e_cap, "复制表格图片失败")
+                    return True
+                raise
+            issue = diagnose_issue("wps_capture", e_cap)
+            choice = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+            while choice == "manual_copied":
+                if clipboard_has_image():
+                    log("  ✅ 检测到剪贴板已含手动复制的表格图片，准备发钉钉")
+                    return False
+                choice = wait_for_recovery(
+                    "暂未在剪贴板检测到表格图片",
+                    "请先在浏览器的【数据汇总】里选中区域 -> 右键「复制为图片」（等 1 秒确认复制成功），再点【我已复制好·继续】。",
+                    "按键提示：复制好图片后点【我已复制好·继续】，或点【重试自动截图】。",
+                    actions=[
+                        {"id": "manual_copied", "label": "我已复制好·继续", "style": "primary"},
+                        {"id": "retry", "label": "重试自动截图", "style": "secondary"},
+                        {"id": "skip", "label": "跳过截图发钉钉", "style": "secondary"},
+                    ],
+                )
+            if choice == "skip":
+                log("  ⚠️ 用户选择跳过截图与钉钉发送")
+                return True
+
+
+def run_once(round_num, cfg=None, trigger_lt=None, trigger_hm=None, recover_interactive=True):
     reset_stop()
     start_time = time.time()
     trigger_lt = trigger_lt or time.localtime(start_time)
@@ -2500,6 +3093,7 @@ def run_once(round_num, cfg=None, trigger_lt=None, trigger_hm=None):
     temp_dir.mkdir(exist_ok=True)
     BROWSER_USER_DATA.mkdir(parents=True, exist_ok=True)
 
+    capture_failed = False
     with sync_playwright() as p:
         check_stop()
         set_step("正在打开浏览器…")
@@ -2511,82 +3105,130 @@ def run_once(round_num, cfg=None, trigger_lt=None, trigger_hm=None):
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(30000)
 
-            check_stop()
-            set_step("正在登录后台…")
-            log("1/5 打开后台并登录...")
-            goto_with_retry(page, "https://bb.luyaapp.live")
-            sleep_check(2)
-
-            need_login = False
-            try:
-                page.wait_for_selector("input[type='password']", timeout=3000)
-                need_login = True
-            except Exception:
-                pass
-
-            if need_login:
+            # Stage 1: 打开并登录后台（断网/未开VPN/登录失败均停在原地等待修复）
+            while True:
                 check_stop()
-                log("  检测到登录页，自动填写账号密码...")
+                set_step("正在登录后台…")
+                log("1/5 打开后台并登录...")
                 try:
-                    pwd_sel = "input[type='password']"
-                    page.wait_for_selector(pwd_sel, timeout=5000)
-                    user_filled = False
+                    goto_with_retry(page, "https://bb.luyaapp.live")
+                    sleep_check(2)
+
+                    need_login = False
                     try:
-                        page.fill(f"{pwd_sel} >> xpath=preceding-sibling::input[1]", luya_user, timeout=2000)
-                        user_filled = True
+                        page.wait_for_selector("input[type='password']", timeout=3000)
+                        need_login = True
                     except Exception:
                         pass
-                    if not user_filled:
-                        for sel in ["input[type='email']", "input[type='text']:visible",
-                                    "input[name='email']", "input[placeholder*='邮箱']",
-                                    "input[placeholder*='账号']"]:
+
+                    if need_login:
+                        check_stop()
+                        log("  检测到登录页，自动填写账号密码...")
+                        pwd_sel = "input[type='password']"
+                        page.wait_for_selector(pwd_sel, timeout=5000)
+                        user_filled = False
+                        try:
+                            page.fill(f"{pwd_sel} >> xpath=preceding-sibling::input[1]", luya_user, timeout=2000)
+                            user_filled = True
+                        except Exception:
+                            pass
+                        if not user_filled:
+                            for sel in ["input[type='email']", "input[type='text']:visible",
+                                        "input[name='email']", "input[placeholder*='邮箱']",
+                                        "input[placeholder*='账号']"]:
+                                try:
+                                    page.fill(sel, luya_user, timeout=1000)
+                                    user_filled = True
+                                    break
+                                except Exception:
+                                    continue
+                        if not user_filled:
+                            inputs = page.query_selector_all("input:visible")
+                            for inp in inputs:
+                                inp_type = inp.get_attribute("type") or "text"
+                                if inp_type != "password":
+                                    inp.fill(luya_user)
+                                    user_filled = True
+                                    break
+                        page.fill(pwd_sel, luya_pass, timeout=2000)
+                        btn_clicked = False
+                        for sel in ["button[type='submit']", "button:has-text('登录')", "input[type='submit']"]:
                             try:
-                                page.fill(sel, luya_user, timeout=1000)
-                                user_filled = True
+                                page.click(sel, timeout=1500)
+                                btn_clicked = True
                                 break
                             except Exception:
                                 continue
-                    if not user_filled:
-                        inputs = page.query_selector_all("input:visible")
-                        for inp in inputs:
-                            inp_type = inp.get_attribute("type") or "text"
-                            if inp_type != "password":
-                                inp.fill(luya_user)
-                                user_filled = True
-                                break
-                    page.fill(pwd_sel, luya_pass, timeout=2000)
-                    btn_clicked = False
-                    for sel in ["button[type='submit']", "button:has-text('登录')", "input[type='submit']"]:
+                        if not btn_clicked:
+                            page.keyboard.press("Enter")
+                        sleep_check(3)
+                        still_login = False
                         try:
-                            page.click(sel, timeout=1500)
-                            btn_clicked = True
-                            break
+                            if page.query_selector("input[type='password']:visible") is not None:
+                                still_login = True
                         except Exception:
+                            pass
+                        if still_login and recover_interactive:
+                            issue = diagnose_issue("luya_login", extra={"luya_need_login": True})
+                            choice = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                            if choice == "continue":
+                                log("  用户确认后台已登录，继续下一步")
+                                break
                             continue
-                    if not btn_clicked:
-                        page.keyboard.press("Enter")
-                    sleep_check(3)
-                    log("  登录完成")
-                except Exception as e:
-                    log(f"  自动登录没成功：{human_error(e)}")
-            else:
-                log("  已经登录过，跳过")
+                        log("  登录完成")
+                    else:
+                        log("  已经登录过，跳过")
+                    break
+                except Exception as e_stage1:
+                    if "手动停止" in str(e_stage1) or not recover_interactive:
+                        raise
+                    cur_url = ""
+                    try:
+                        cur_url = page.url or ""
+                    except Exception:
+                        pass
+                    st_tag = "luya_login" if "login" in cur_url.lower() else "luya_open"
+                    issue = diagnose_issue(st_tag, e_stage1)
+                    choice = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                    if choice == "continue":
+                        break
 
+            # Stage 2: 按单张表逐份下载（某张表失败只重抓这一张，已下好的表完全保留）
             check_stop()
             set_step("正在下载三份数据…")
             log("2/5 下载三份数据...")
             xlsx_files = []
             for name, url in DATA_URLS:
-                check_stop()
-                dl_file = download_xlsx(page, name, url, temp_dir)
-                if dl_file:
-                    xlsx_files.append((name, dl_file))
-                sleep_check(0.3)
+                while True:
+                    check_stop()
+                    try:
+                        dl_file = download_xlsx(page, name, url, temp_dir)
+                        if dl_file:
+                            xlsx_files.append((name, dl_file))
+                            sleep_check(0.3)
+                            break
+                        need_rel = False
+                        try:
+                            if (page.query_selector("input[type='password']:visible") is not None
+                                    or "login" in (page.url or "").lower()):
+                                need_rel = True
+                        except Exception:
+                            pass
+                        if not recover_interactive:
+                            raise RuntimeError(f"数据表【{name}】下载失败")
+                        issue = diagnose_issue(
+                            "luya_login" if need_rel else "luya_download",
+                            RuntimeError(f"未能从页面下载【{name}】的表格数据"),
+                            extra={"name": name, "luya_need_login": need_rel},
+                        )
+                        wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                    except Exception as e_dl:
+                        if "手动停止" in str(e_dl) or not recover_interactive:
+                            raise
+                        issue = diagnose_issue("luya_download", e_dl, extra={"name": name})
+                        wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
 
-            missing = [name for name, _ in DATA_URLS if name not in {n for n, _ in xlsx_files}]
-            if missing:
-                raise RuntimeError("这些数据没有下载成功：" + "、".join(missing))
-
+            # Stage 3: 整理格式
             check_stop()
             set_step("正在整理数据格式…")
             log("3/5 整理数据格式...")
@@ -2597,57 +3239,39 @@ def run_once(round_num, cfg=None, trigger_lt=None, trigger_hm=None):
                 xlsx_to_tsv(xlsx_path, tsv_path)
                 tsv_files.append((name, tsv_path))
 
+            # Stage 4: 打开 WPS 登录并逐表写入
             check_stop()
             set_step("正在写入在线表格…")
             log("4/5 写入在线表格...")
-            cleanup_wps_tabs(context, wps_url=wps_url)
-            goto_with_retry(page, wps_url)
-            page.wait_for_selector("input.edit-box", timeout=20000)
-            sleep_check(1)
-
-            if check_wps_logged_in(page):
-                log("  表格已登录，直接写入")
-            else:
-                if not wait_wps_login(page, max_wait=1200):
-                    raise RuntimeError("WPS 登录超时：请在浏览器里扫码登录后再跑一次")
-
+            _open_and_login_wps(context, page, wps_url, recover_interactive=recover_interactive)
             sleep_check(1)
             log("  表格加载完成")
 
             for name, tsv_path in tsv_files:
-                check_stop()
-                paste_to_wps(page, name, tsv_path)
-                sleep_check(0.5)
-
-            check_stop()
-            set_step("正在切换到数据汇总表…")
-            log("5/5 切到数据汇总表...")
-            if not switch_wps_sheet(page, "数据汇总"):
-                raise Exception("切换到数据汇总表失败，请检查底部标签栏")
-            set_step("正在等待汇总表刷新…")
-            log("  等待 5 秒，让数据汇总表完成刷新…")
-            sleep_check(5.0)
-
-            screenshot_path = temp_dir / "数据汇总.png"
-            page.screenshot(path=str(screenshot_path))
-            log("✅ 数据汇总表已准备好")
-
-            # 按配置：在汇总表选区复制为图片（图片进剪贴板）
-            capture_failed = False
-            if cfg.get("enable_capture"):
-                try:
+                while True:
                     check_stop()
-                    set_step("正在复制表格图片…")
-                    capture_wps_region(page)
-                except Exception as e:
-                    if "手动停止" in str(e):
-                        raise
-                    capture_failed = True
-                    tip = human_error(e)
-                    failures.append("复制表格图片失败：" + tip)
-                    log(f"  复制图片没成功：{tip}")
-                    log_error(e, "复制表格图片失败")
+                    try:
+                        paste_to_wps(page, name, tsv_path)
+                        sleep_check(0.5)
+                        break
+                    except Exception as e_paste_wps:
+                        if "手动停止" in str(e_paste_wps) or not recover_interactive:
+                            raise
+                        issue = diagnose_issue("wps_paste", e_paste_wps, extra={"name": name})
+                        choice = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                        if choice == "skip":
+                            log(f"  ⚠️ 用户选择跳过【{name}】写入，继续下一步")
+                            break
 
+            # Stage 5: 切汇总表并截图（失败时保留浏览器可重试或手动复制兜底）
+            capture_failed = _capture_summary_with_recovery(
+                page,
+                temp_dir=temp_dir,
+                enable_capture=bool(cfg.get("enable_capture")),
+                recover_interactive=recover_interactive,
+                failures=failures,
+                log_prefix="5/5",
+            )
             cleanup_wps_tabs(context, wps_url=wps_url)
         finally:
             set_step("正在关闭后台浏览器…")
@@ -2657,12 +3281,17 @@ def run_once(round_num, cfg=None, trigger_lt=None, trigger_hm=None):
             except Exception:
                 pass
 
-    # 复制失败时禁止发送旧剪贴板内容。
+    # Stage 6: 发钉钉（截图失败或跳过时不发）
     if cfg.get("enable_dingtalk") and not capture_failed:
         try:
             check_stop()
             set_step("正在发送到钉钉…")
-            send_dingtalk_image(cfg, trigger_lt=trigger_lt, trigger_hm=trigger_hm)
+            send_dingtalk_image(
+                cfg,
+                trigger_lt=trigger_lt,
+                trigger_hm=trigger_hm,
+                recover_interactive=recover_interactive,
+            )
         except Exception as e:
             if "手动停止" in str(e):
                 raise
@@ -2709,8 +3338,8 @@ def run_once(round_num, cfg=None, trigger_lt=None, trigger_hm=None):
     return end_time
 
 
-def run_capture_only(round_num="截图", cfg=None):
-    """独立截图发送：不下载、不写入，只处理 WPS 汇总表和钉钉。"""
+def run_capture_only(round_num="截图", cfg=None, recover_interactive=True):
+    """独立截图发送：不下载、不写入，只处理 WPS 汇总表和钉钉（支持分步恢复）。"""
     reset_stop()
     start_time = time.time()
     trigger_lt = time.localtime(start_time)
@@ -2721,42 +3350,35 @@ def run_capture_only(round_num="截图", cfg=None):
     log(f"📸 开始独立截图发送，时间 {time.strftime('%Y-%m-%d %H:%M:%S')}")
     BROWSER_USER_DATA.mkdir(parents=True, exist_ok=True)
 
+    capture_failed = False
     with sync_playwright() as p:
         check_stop()
         set_step("正在打开WPS汇总表…")
         log("1/3 正在打开 WPS 数据汇总表…")
         context = _launch_context(p)
         try:
-            cleanup_wps_tabs(context, wps_url=wps_url)
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(30000)
-            goto_with_retry(page, wps_url)
-            page.wait_for_selector("input.edit-box", timeout=20000)
-            if check_wps_logged_in(page):
-                log("  表格已登录，直接打开汇总表")
-            elif not wait_wps_login(page, max_wait=1200):
-                raise RuntimeError("WPS 登录超时，请扫码后再试")
-
-            check_stop()
-            if not switch_wps_sheet(page, "数据汇总"):
-                raise RuntimeError("没找到【数据汇总】工作表")
-            set_step("正在等待汇总表刷新…")
-            log("  等待 5 秒，让数据汇总表完成刷新…")
-            sleep_check(5.0)
-            check_stop()
-            log("2/3 正在框选汇总表并复制为图片…")
-            set_step("正在复制表格图片…")
-            capture_wps_region(page)
+            _open_and_login_wps(context, page, wps_url, recover_interactive=recover_interactive)
+            capture_failed = _capture_summary_with_recovery(
+                page,
+                temp_dir=None,
+                enable_capture=True,
+                recover_interactive=recover_interactive,
+                failures=None,
+                log_prefix="2/3",
+            )
         finally:
             try:
                 context.close()
             except Exception:
                 pass
 
-    check_stop()
-    log("3/3 正在粘贴到钉钉并发送…")
-    set_step("正在发送到钉钉…")
-    send_dingtalk_image(cfg, trigger_lt=trigger_lt)
+    if not capture_failed:
+        check_stop()
+        log("3/3 正在粘贴到钉钉并发送…")
+        set_step("正在发送到钉钉…")
+        send_dingtalk_image(cfg, trigger_lt=trigger_lt, recover_interactive=recover_interactive)
     notify_last_run()
     end_time = time.time()
     set_step("✅ 本轮跑完")
@@ -3420,15 +4042,16 @@ def _show_settings_window_legacy():
             root.after(0, lambda: (
                 step_anim.set("✅ 截图发送完成", color=GREEN),
                 err_lab.configure(text="")))
-        except CancelledError:
-            root.after(0, lambda: (
-                step_anim.set("⏹ 已停止", color=TH["text_sub"]),
-                err_lab.configure(text="")))
         except Exception as e:
-            log(f"❌ 独立截图失败: {e}")
-            root.after(0, lambda: (
-                step_anim.set("❌ 截图发送失败", color=RED),
-                err_lab.configure(text=str(e))))
+            if "手动停止" in str(e):
+                root.after(0, lambda: (
+                    step_anim.set("⏹ 已停止", color=TH["text_sub"]),
+                    err_lab.configure(text="")))
+            else:
+                log(f"❌ 独立截图失败: {e}")
+                root.after(0, lambda msg=str(e): (
+                    step_anim.set("❌ 截图发送失败", color=RED),
+                    err_lab.configure(text=msg)))
         finally:
             def _finish_ui():
                 run_spinner.place_forget()

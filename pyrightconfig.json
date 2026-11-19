@@ -1,3 +1,9 @@
 {
-  "pythonVersion": "3.13"
+  "pythonVersion": "3.13",
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": [
+    ".",
+    ".venv/Lib/site-packages"
+  ]
 }
