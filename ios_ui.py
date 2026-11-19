@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -491,7 +492,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0%25' stop-color='%23007AFF'/%3E%3Cstop offset='100%25' stop-color='%235856D6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='15' fill='url(%23g)'/%3E%3Crect x='14' y='34' width='9' height='16' rx='3' fill='white'/%3E%3Crect x='27.5' y='24' width='9' height='26' rx='3' fill='white'/%3E%3Crect x='41' y='14' width='9' height='36' rx='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="icon" type="image/png" href="/icon.png" />
+<link rel="shortcut icon" href="/favicon.ico" />
 <style>
   :root {
     --bg: #F2F2F7;
@@ -782,8 +784,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .large-title-wrap {
     display: flex;
-    align-items: baseline;
-    gap: 8px;
+    align-items: center;
+    gap: 9px;
+  }
+  .nav-app-icon {
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    flex-shrink: 0;
+    display: block;
+    box-shadow: 0 3px 10px rgba(0, 102, 255, 0.22);
   }
   .large-title {
     margin: 0;
@@ -1880,6 +1890,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <div class="nav-bar">
         <div class="large-title-wrap">
+          <img src="/icon.png" class="nav-app-icon" alt="" />
           <h1 class="large-title">暗号表助手</h1>
           <span class="ver-pill" id="verBadge">v2.0.0</span>
         </div>
@@ -3472,6 +3483,23 @@ function bindEvents() {
 """
 
 
+def _find_static_asset(filename):
+    """兼容源码运行与 PyInstaller 单文件解压目录，查找打包静态图标资源。"""
+    candidates = [Path(__file__).resolve().parent / filename]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.insert(0, Path(meipass) / filename)
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / filename)
+    for p in candidates:
+        try:
+            if p.exists():
+                return p
+        except Exception:
+            pass
+    return None
+
+
 def _make_handler(ctrl, token):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -3504,6 +3532,23 @@ def _make_handler(ctrl, token):
 
         def do_GET(self):
             parsed = urlparse(self.path)
+            if parsed.path in ("/favicon.ico", "/icon.png"):
+                fname = "icon.ico" if parsed.path == "/favicon.ico" else "icon.png"
+                ctype = "image/x-icon" if fname == "icon.ico" else "image/png"
+                asset = _find_static_asset(fname)
+                if asset is not None:
+                    raw = asset.read_bytes()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Cache-Control", "public, max-age=3600")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.end_headers()
+                return
+
             if not self._check_auth(parsed):
                 self._send_json({"ok": False, "message": "Forbidden"}, HTTPStatus.FORBIDDEN)
                 return
@@ -3603,6 +3648,12 @@ def show_settings_window(app):
 
     tk_root = tk.Tk()
     tk_root.withdraw()
+    try:
+        ico_path = _find_static_asset("icon.ico")
+        if ico_path is not None:
+            tk_root.iconbitmap(str(ico_path))
+    except Exception:
+        pass
     glass = neu.GlassProgress(tk_root, title="暗号表助手")
 
     server, ctrl, url, _token = start_ui_server(app, glass, tk_root)

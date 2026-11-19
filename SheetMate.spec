@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [('icon.png', '.'), ('icon.ico', '.')]
 binaries = []
 hiddenimports = ['openpyxl', 'PIL', 'typing_extensions', 'uiautomation',
                  'comtypes', 'neu_ui', 'sheetmate_ui', 'ios_ui']
