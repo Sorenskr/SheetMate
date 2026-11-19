@@ -173,17 +173,20 @@ class _SheetMateController:
         with self._lock:
             return json.loads(json.dumps(self.cfg))
 
+    def get_timetable(self):
+        with self._lock:
+            return self.app.build_daily_timetable(self.cfg)
+
     def save_config(self, new_cfg):
         with self._lock:
-            merged = self.app._deep_merge(self.app.DEFAULT_CONFIG, new_cfg)
-            self.app.save_config(merged)
+            normed = self.app.normalize_config(new_cfg)
+            self.app.save_config(normed)
             self.cfg = self.app.load_config()
             return json.loads(json.dumps(self.cfg))
 
     def reset_config(self):
-        import copy
         with self._lock:
-            default = copy.deepcopy(self.app.DEFAULT_CONFIG)
+            default = self.app.normalize_config({})
             self.app.save_config(default)
             self.cfg = self.app.load_config()
             return json.loads(json.dumps(self.cfg))
@@ -244,17 +247,21 @@ class _SheetMateController:
         threading.Thread(target=self._capture_only_worker, daemon=True).start()
         return True, "已开始仅截图发送"
 
-    def _run_once_worker(self, round_name, owns_lock=True):
+    def _run_once_worker(self, round_name, owns_lock=True, run_cfg_override=None, trigger_lt=None, trigger_hm=None):
         self.glass.show()
         self.glass.update_step(f"正在运行第 {round_name} 轮…", 0.02)
         try:
-            run_cfg = self.get_config()
-            if isinstance(round_name, int) and not self.app.capture_allowed_now(run_cfg):
-                run_cfg["enable_capture"] = False
-                run_cfg["enable_dingtalk"] = False
-                self.app.log("  当前不在截图发送时段，本轮只下载并更新表格")
-                self._on_step("不在发群时段，仅更新表格")
-            self.app.run_once(round_name, run_cfg)
+            if run_cfg_override is not None:
+                run_cfg = run_cfg_override
+            else:
+                run_cfg = self.get_config()
+                if isinstance(round_name, int) and not self.app.capture_allowed_now(run_cfg):
+                    run_cfg["enable_capture"] = False
+                    run_cfg["enable_dingtalk"] = False
+            if isinstance(round_name, int) and not run_cfg.get("enable_capture") and not run_cfg.get("enable_dingtalk"):
+                self.app.log("  当前时间点按排期设置为仅更新表格（不截图发钉钉）")
+                self._on_step("按排期仅更新表格")
+            self.app.run_once(round_name, run_cfg, trigger_lt=trigger_lt, trigger_hm=trigger_hm)
             done_text = "手动任务已完成" if not isinstance(round_name, int) else f"第 {round_name} 轮已完成"
             with self._lock:
                 self.status_level = "ok"
@@ -356,10 +363,14 @@ class _SheetMateController:
                 return False, "请等当前任务结束后再开启自动值守", False
 
             cfg = self.get_config()
+            if cfg.get("day_mode") == "custom" and not (cfg.get("custom_days") or []):
+                return False, "请至少勾选一天运行星期", False
             day_gap = cfg["day"]["ih"] * 60 + cfg["day"]["im"]
             night_gap = cfg["night"]["ih"] * 60 + cfg["night"]["im"]
             if day_gap < 1 or (cfg.get("night_enabled", True) and night_gap < 1):
                 return False, "白天或夜间的执行间隔不能为 0 分钟", False
+            if not self.app.build_daily_timetable(cfg):
+                return False, "当前未生成任何执行时间点，请检查时段配置", False
 
             self.schedule_running = True
             self.stop_flag = False
@@ -367,99 +378,98 @@ class _SheetMateController:
         threading.Thread(target=self._schedule_loop, daemon=True).start()
         return True, "已开启自动值守", True
 
-    def _compute_next_slot_start(self, cfg, now_ts):
-        slots = [f"{cfg['day']['sh']:02d}:{cfg['day']['sm']:02d}"]
-        if cfg.get("night_enabled", True):
-            slots.append(f"{cfg['night']['sh']:02d}:{cfg['night']['sm']:02d}")
-        slot_ends = {slots[0]: f"{cfg['day']['eh']:02d}:{cfg['day']['em']:02d}"}
-        if len(slots) > 1:
-            slot_ends[slots[1]] = f"{cfg['night']['eh']:02d}:{cfg['night']['em']:02d}"
-
-        day_mode = cfg.get("day_mode", "daily")
-        base_min = int(now_ts // 60) * 60
-        for offset_min in range(1, 4 * 24 * 60):
-            ts = base_min + offset_min * 60
-            lt = time.localtime(ts)
-            if day_mode == "workday" and lt.tm_wday >= 5:
+    def _compute_next_point(self, cfg, now_ts, fired_keys):
+        """基于全天排期表与运行日期规则，找出当前应立即触发或下一个即将触发的时间点。"""
+        from datetime import datetime, time as dtime, timedelta
+        timetable = self.app.build_daily_timetable(cfg)
+        if not timetable:
+            return None
+        base_date = datetime.fromtimestamp(now_ts).date()
+        for day_off in range(0, 8):
+            target_date = base_date + timedelta(days=day_off)
+            day_lt = time.localtime(datetime.combine(target_date, dtime(12, 0)).timestamp())
+            if not self.app.is_run_day_allowed(cfg, day_lt):
                 continue
-            for st in slots:
-                if self.app.in_slot(lt, st, slot_ends[st]):
-                    return ts
-        return 0.0
+            day_str = target_date.strftime("%Y-%m-%d")
+            for pt in timetable:
+                ph, pm = self.app.parse_hm(pt["time"])
+                pt_ts = datetime.combine(target_date, dtime(ph, pm)).timestamp()
+                date_key = f"{day_str} {pt['time']}"
+                if date_key in fired_keys:
+                    continue
+                if day_off == 0 and 0 <= (now_ts - pt_ts) <= 90:
+                    return pt_ts, date_key, pt, True, day_off
+                if pt_ts > now_ts:
+                    return pt_ts, date_key, pt, False, day_off
+        return None
 
     def _schedule_loop(self):
+        WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
         round_num = 1
-        last_run_start = 0.0
+        fired_keys = set()
         while not self.stop_flag:
             cfg = self.get_config()
             now_ts = time.time()
-            now = time.localtime(now_ts)
+            now_lt = time.localtime(now_ts)
+            today_prefix = time.strftime("%Y-%m-%d", now_lt)
+            fired_keys = {k for k in fired_keys if k.startswith(today_prefix)}
 
-            if cfg.get("day_mode", "daily") == "workday" and now.tm_wday >= 5:
-                nxt = self._compute_next_slot_start(cfg, now_ts)
+            found = self._compute_next_point(cfg, now_ts, fired_keys)
+            if found is None:
                 with self._lock:
                     if not self.job_running and not self.capture_running:
                         self.status_level = "idle"
-                        self.step_text = "非工作日，自动值守休眠中"
-                    self.next_run_ts = nxt
-                    self.next_run_str = time.strftime("%m-%d %H:%M", time.localtime(nxt)) if nxt else "—"
-                for _ in range(10):
+                        self.step_text = "未选择任何有效运行日期或时段"
+                    self.next_run_ts = 0.0
+                    self.next_run_str = "—"
+                for _ in range(5):
                     if self.stop_flag:
                         break
                     time.sleep(1)
                 continue
 
-            day_start = f"{cfg['day']['sh']:02d}:{cfg['day']['sm']:02d}"
-            day_end = f"{cfg['day']['eh']:02d}:{cfg['day']['em']:02d}"
-            night_start = f"{cfg['night']['sh']:02d}:{cfg['night']['sm']:02d}"
-            night_end = f"{cfg['night']['eh']:02d}:{cfg['night']['em']:02d}"
-
-            slot = None
-            if self.app.in_slot(now, day_start, day_end):
-                slot = "day"
-            elif cfg.get("night_enabled", True) and self.app.in_slot(now, night_start, night_end):
-                slot = "night"
-
-            if slot is None:
-                nxt = self._compute_next_slot_start(cfg, now_ts)
-                with self._lock:
-                    if not self.job_running and not self.capture_running:
-                        self.status_level = "idle"
-                        self.step_text = "不在运行时段，静默待命中"
-                    self.next_run_ts = nxt
-                    self.next_run_str = time.strftime("%H:%M", time.localtime(nxt)) if nxt else "—"
-                for _ in range(10):
-                    if self.stop_flag:
-                        break
-                    time.sleep(1)
-                continue
-
-            gap_min = (cfg["day"]["ih"] * 60 + cfg["day"]["im"]) if slot == "day" else (cfg["night"]["ih"] * 60 + cfg["night"]["im"])
-            interval_sec = max(60, gap_min * 60)
-            since = now_ts - last_run_start
-
-            if (last_run_start == 0.0 or since >= interval_sec) and not self.job_running and not self.capture_running:
+            pt_ts, date_key, pt, ready, day_off = found
+            if ready and not self.job_running and not self.capture_running:
                 if self._task_lock.acquire(blocking=False):
-                    last_run_start = time.time()
+                    fired_keys.add(date_key)
+                    run_cfg = self.get_config()
+                    run_cfg["enable_capture"] = bool(pt.get("do_capture", True))
+                    run_cfg["enable_dingtalk"] = bool(pt.get("do_dingtalk", False))
+
+                    nxt_after = self._compute_next_point(cfg, now_ts, fired_keys)
                     with self._lock:
                         self.job_running = True
                         self.status_level = "running"
                         self.progress = 0.02
                         self.error_text = ""
-                        self.next_run_ts = last_run_start + interval_sec
-                        self.next_run_str = time.strftime("%H:%M", time.localtime(self.next_run_ts))
-                    self._run_once_worker(round_num, owns_lock=True)
+                        if nxt_after:
+                            n_ts, _, n_pt, _, n_off = nxt_after
+                            n_lt = time.localtime(n_ts)
+                            self.next_run_ts = n_ts
+                            self.next_run_str = n_pt["time"] if n_off == 0 else f"{WEEKDAYS[n_lt.tm_wday]} {n_pt['time']}"
+                    self._run_once_worker(
+                        round_num,
+                        owns_lock=True,
+                        run_cfg_override=run_cfg,
+                        trigger_lt=time.localtime(pt_ts),
+                        trigger_hm=pt["time"],
+                    )
                     round_num += 1
                     continue
 
-            next_ts = (last_run_start + interval_sec) if last_run_start else now_ts
+            pt_lt = time.localtime(pt_ts)
+            day_ok = self.app.is_run_day_allowed(cfg, now_lt)
             with self._lock:
                 if not self.job_running and not self.capture_running:
-                    slot_label = "白天" if slot == "day" else "夜间"
                     self.status_level = "idle"
-                    self.step_text = f"自动值守中（{slot_label}时段）"
-                self.next_run_ts = next_ts
-                self.next_run_str = time.strftime("%H:%M", time.localtime(next_ts))
+                    if not day_ok:
+                        self.step_text = "今日不在运行周期，静默休眠中"
+                    elif day_off == 0:
+                        self.step_text = f"自动值守中（下一轮 {pt['time']}）"
+                    else:
+                        self.step_text = f"今日排期已结束（下轮 {WEEKDAYS[pt_lt.tm_wday]} {pt['time']}）"
+                self.next_run_ts = pt_ts
+                self.next_run_str = pt["time"] if day_off == 0 else f"{WEEKDAYS[pt_lt.tm_wday]} {pt['time']}"
 
             for _ in range(5):
                 if self.stop_flag:
@@ -1253,7 +1263,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     transition: max-height 0.32s var(--spring);
   }
   .accordion-body.open {
-    max-height: 460px;
+    max-height: 960px;
   }
 
   /* 日志控制台 */
@@ -1583,6 +1593,248 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     pointer-events: none;
   }
   .toast.show { transform: translate(-50%, 0); opacity: 1; }
+
+  /* 多段分段控制 + 周一~周日圆形多选 */
+  .segmented-4 {
+    grid-template-columns: repeat(4, 1fr);
+    width: 100%;
+    min-width: 0;
+  }
+  .segmented-4 .seg-thumb {
+    width: calc((100% - 4px) / 4);
+  }
+  .segmented-3 {
+    grid-template-columns: repeat(3, 1fr);
+    width: 100%;
+    min-width: 0;
+  }
+  .segmented-3 .seg-thumb {
+    width: calc((100% - 4px) / 3);
+  }
+  .segmented-4 .seg-btn,
+  .segmented-3 .seg-btn {
+    padding: 6px 4px;
+    font-size: 12px;
+  }
+
+  .weekday-wrap {
+    padding: 2px 14px 13px;
+    display: none;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .weekday-wrap.show { display: flex; }
+  .weekday-grid {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    justify-items: center;
+    gap: 6px;
+  }
+  .wday-btn {
+    width: 38px;
+    height: 38px;
+    border: none;
+    border-radius: 50%;
+    background: var(--fill);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.14s var(--spring), background 0.18s, color 0.18s;
+  }
+  .wday-btn:active { transform: scale(0.9); }
+  .wday-btn.active {
+    background: var(--blue);
+    color: #FFFFFF;
+    box-shadow: 0 3px 10px rgba(0, 122, 255, 0.28);
+  }
+  .wday-hint {
+    font-size: 11.5px;
+    color: var(--sub);
+  }
+  .wday-hint.err { color: var(--red); }
+
+  /* 头部操作小按钮 + 动态时段规则行 */
+  .head-action-btn {
+    border: none;
+    background: transparent;
+    color: var(--blue);
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0;
+  }
+  .ios-switch.sm {
+    width: 42px;
+    height: 26px;
+  }
+  .ios-switch.sm .ios-slider::before {
+    width: 22px;
+    height: 22px;
+  }
+  .ios-switch.sm input:checked + .ios-slider::before {
+    transform: translateX(16px);
+  }
+  .rule-card-row {
+    position: relative;
+    padding: 11px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .rule-card-row + .rule-card-row::before,
+  .rule-card-row + .ios-row::before,
+  .ios-row + .rule-card-row::before {
+    content: "";
+    position: absolute;
+    left: 14px;
+    right: 0;
+    top: 0;
+    height: 0.5px;
+    background: var(--sep);
+  }
+  .rule-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .rule-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .rule-input-box {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--fill-2);
+    border-radius: 10px;
+    padding: 7px 10px;
+  }
+  .rule-input-box input {
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13.5px;
+    width: 100%;
+    user-select: text;
+  }
+  .empty-rule-tip {
+    padding: 14px;
+    font-size: 12.5px;
+    color: var(--sub);
+    text-align: center;
+  }
+  .add-row-btn {
+    position: relative;
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: var(--blue);
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 12px 14px;
+    cursor: pointer;
+    text-align: center;
+  }
+  .add-row-btn::before {
+    content: "";
+    position: absolute;
+    left: 14px;
+    right: 0;
+    top: 0;
+    height: 0.5px;
+    background: var(--sep);
+  }
+
+  /* 每日执行排期全览表 */
+  .tt-row {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 14px;
+    cursor: pointer;
+    transition: background 0.14s;
+  }
+  .tt-row:active { background: var(--card-press); }
+  .tt-row + .tt-row::before {
+    content: "";
+    position: absolute;
+    left: 14px;
+    right: 0;
+    top: 0;
+    height: 0.5px;
+    background: var(--sep);
+  }
+  .tt-time-col {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 60px;
+    flex-shrink: 0;
+  }
+  .tt-hm {
+    font-size: 15px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+  .tt-period {
+    font-size: 10.5px;
+    color: var(--sub);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .tt-next-tag {
+    font-size: 9.5px;
+    font-weight: 700;
+    color: #FFFFFF;
+    background: var(--blue);
+    padding: 0 5px;
+    border-radius: 999px;
+  }
+  .tt-badges {
+    flex: 1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px;
+  }
+  .tt-pill {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2.5px 7px;
+    border-radius: 7px;
+    white-space: nowrap;
+  }
+  .tt-pill.cap-on { background: rgba(52, 199, 89, 0.14); color: #1E9E43; }
+  .tt-pill.dt-on { background: rgba(0, 122, 255, 0.12); color: var(--blue); }
+  .tt-pill.suf-on { background: rgba(88, 86, 214, 0.13); color: var(--indigo); }
+  .tt-pill.off { background: var(--fill-2); color: var(--sub); }
+  [data-theme="dark"] .tt-pill.cap-on { color: #30D158; }
+  [data-theme="dark"] .tt-pill.suf-on { color: #8E8CF8; }
+
+  .sheet-body-pad {
+    padding: 14px 16px 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .sheet-field-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--sub);
+    margin-bottom: 6px;
+  }
 </style>
 </head>
 <body>
@@ -1698,8 +1950,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.73 21a2 2 0 01-3.46 0"/><path d="M18.63 13A17.89 17.89 0 0118 8"/><path d="M6.26 6.26A5.86 5.86 0 006 8c0 7-3 9-3 9h14"/><path d="M18 8a6 6 0 00-9.33-5"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
               </div>
               <div class="row-main">
-                <div class="row-title">发送策略</div>
-                <div class="row-sub">草稿清理 · 静音 · 确认方式</div>
+                <div class="row-title">发送与后缀策略</div>
+                <div class="row-sub" id="sumPolicySub">静音 · 分时段后缀</div>
               </div>
               <div class="row-right">
                 <span class="row-val" id="sumPolicy">静音 · 暂不发</span>
@@ -1712,7 +1964,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="3"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
               </div>
               <div class="row-main">
-                <div class="row-title">定时计划</div>
+                <div class="row-title">每日排期计划</div>
                 <div class="row-sub" id="sumScheduleSub">每天运行</div>
               </div>
               <div class="row-right">
@@ -1741,7 +1993,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <!-- Tab 2: 钉钉投递 -->
       <section class="tab-pane" id="pane-dingtalk">
         <div class="section-wrap">
-          <div class="section-head"><span>目标与附言</span></div>
+          <div class="section-head"><span>目标会话</span></div>
           <div class="ios-group">
             <div class="ios-row">
               <div class="sf-badge sf-teal">
@@ -1755,19 +2007,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </button>
               </div>
             </div>
+          </div>
+          <div class="section-footer" id="kwPreview">打开钉钉后按 Ctrl+Shift+F 粘贴目标名称并按 Enter 直达</div>
+        </div>
 
+        <div class="section-wrap">
+          <div class="section-head">
+            <span>分时段消息后缀</span>
+            <button class="head-action-btn" id="addSuffixRuleBtn" type="button">+ 添加时段</button>
+          </div>
+          <div class="ios-group">
+            <div id="suffixRulesList"></div>
             <div class="ios-row">
               <div class="sf-badge sf-indigo">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 01-2.83 0L2 12V2h10l8.59 8.59a2 2 0 010 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
               </div>
-              <div class="row-title" style="flex-shrink:0;">时间后缀</div>
+              <div class="row-title" style="flex-shrink:0;">默认后缀</div>
               <div class="field-inline">
-                <input type="text" id="dtSuffix" placeholder="例如：暗号数据" />
+                <input type="text" id="dtSuffix" placeholder="留空则其余时段不加后缀" />
+                <button class="clear-circle" id="clearSuffixBtn" title="清空默认后缀">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/></svg>
+                </button>
               </div>
             </div>
           </div>
-          <div class="section-footer" id="kwPreview">打开钉钉后按 Ctrl+Shift+F 粘贴目标名称并按 Enter 直达</div>
-          <div class="section-footer" id="msgPreview" style="padding-top:3px;">消息附言预览：—</div>
+          <div class="section-footer" id="msgPreview">当前时刻预览：—</div>
         </div>
 
         <div class="section-wrap">
@@ -1779,7 +2043,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
               <div class="row-main">
                 <div class="row-title">复制汇总表图片</div>
-                <div class="row-sub">选中 C6:AK 并高清复制到剪贴板</div>
+                <div class="row-sub">选中 C6:AK 并自动净切白边</div>
               </div>
               <label class="ios-switch"><input type="checkbox" id="enableCapture" /><span class="ios-slider"></span></label>
             </div>
@@ -1827,6 +2091,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
               <label class="ios-switch"><input type="checkbox" id="dtAutoSend" /><span class="ios-slider"></span></label>
             </div>
+
+            <div class="ios-row">
+              <div class="sf-badge sf-gray">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">跑完后自动打开在线表</div>
+                <div class="row-sub">默认关闭：防止自动值守频繁弹出网页</div>
+              </div>
+              <label class="ios-switch"><input type="checkbox" id="openWpsAfterRun" /><span class="ios-slider"></span></label>
+            </div>
           </div>
         </div>
       </section>
@@ -1834,20 +2109,38 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <!-- Tab 3: 定时计划 -->
       <section class="tab-pane" id="pane-schedule">
         <div class="section-wrap">
-          <div class="section-head"><span>自动值守时段</span><span>点击时间胶囊调整</span></div>
+          <div class="section-head"><span>自动值守日期与时段</span><span>点击胶囊调整</span></div>
           <div class="ios-group">
-            <div class="ios-row">
-              <div class="sf-badge sf-blue">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="3"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+            <div class="slot-block">
+              <div class="slot-head">
+                <div class="slot-title-wrap">
+                  <div class="sf-badge sf-blue">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="3"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                  </div>
+                  <span class="row-title">运行周期</span>
+                </div>
+                <span class="row-sub" id="dayModeSummary">每天运行</span>
               </div>
-              <div class="row-main">
-                <div class="row-title">运行日期</div>
-              </div>
-              <div class="segmented" id="dayModeSeg">
+              <div class="segmented segmented-4" id="dayModeSeg">
                 <div class="seg-thumb" id="dayModeThumb"></div>
-                <button class="seg-btn" data-val="daily">每天运行</button>
-                <button class="seg-btn" data-val="workday">仅工作日</button>
+                <button class="seg-btn" data-val="daily">每天</button>
+                <button class="seg-btn" data-val="workday">工作日</button>
+                <button class="seg-btn" data-val="weekend">非工作日</button>
+                <button class="seg-btn" data-val="custom">自定义</button>
               </div>
+            </div>
+
+            <div class="weekday-wrap" id="customDaysWrap">
+              <div class="weekday-grid" id="customDaysGrid">
+                <button type="button" class="wday-btn" data-day="0">一</button>
+                <button type="button" class="wday-btn" data-day="1">二</button>
+                <button type="button" class="wday-btn" data-day="2">三</button>
+                <button type="button" class="wday-btn" data-day="3">四</button>
+                <button type="button" class="wday-btn" data-day="4">五</button>
+                <button type="button" class="wday-btn" data-day="5">六</button>
+                <button type="button" class="wday-btn" data-day="6">日</button>
+              </div>
+              <div class="wday-hint" id="customDaysHint">请选择运行星期</div>
             </div>
 
             <div class="slot-block">
@@ -1891,7 +2184,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
           </div>
           <div class="section-footer warn" id="overlapTip" style="display:none;">
-            白天与晚上时段存在重叠，系统会按统一节拍运行，交界处不会重复连跑。
+            白天与晚上时段存在重叠，系统已合并去重生成准点排期，不会重复连跑。
           </div>
         </div>
 
@@ -1910,44 +2203,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div class="accordion-body" id="cpAccordion">
-              <div class="ios-row">
-                <div class="row-main"><div class="row-title">适用日期</div></div>
-                <div class="segmented" id="cpProfileSeg">
-                  <div class="seg-thumb" id="cpProfileThumb"></div>
-                  <button class="seg-btn" data-val="workday">工作日</button>
-                  <button class="seg-btn" data-val="weekend">非工作日</button>
-                </div>
-              </div>
-
-              <div class="slot-block">
-                <div class="slot-head">
-                  <span class="row-title">允许时段 1</span>
-                  <label class="ios-switch"><input type="checkbox" id="cpSlot1" /><span class="ios-slider"></span></label>
-                </div>
-                <div class="slot-controls" id="cpSlot1Body" style="padding-left:0;">
-                  <div class="pill-pair">
-                    <button class="ios-pill-btn" id="cpStart1Btn">09:00</button>
-                    <span class="pill-sep">至</span>
-                    <button class="ios-pill-btn" id="cpEnd1Btn">18:00</button>
-                  </div>
-                </div>
-              </div>
-
-              <div class="slot-block">
-                <div class="slot-head">
-                  <span class="row-title">允许时段 2</span>
-                  <label class="ios-switch"><input type="checkbox" id="cpSlot2" /><span class="ios-slider"></span></label>
-                </div>
-                <div class="slot-controls" id="cpSlot2Body" style="padding-left:0;">
-                  <div class="pill-pair">
-                    <button class="ios-pill-btn" id="cpStart2Btn">18:00</button>
-                    <span class="pill-sep">至</span>
-                    <button class="ios-pill-btn" id="cpEnd2Btn">22:00</button>
-                  </div>
-                </div>
-              </div>
+              <div id="cpWindowsList"></div>
+              <button type="button" class="add-row-btn" id="addCpWinBtn">+ 添加允许截图发群时段</button>
             </div>
           </div>
+        </div>
+
+        <div class="section-wrap">
+          <div class="section-head">
+            <span>每日执行排期全览</span>
+            <span id="ttSummaryText">共 0 轮</span>
+          </div>
+          <div class="ios-group" id="timetableList"></div>
+          <div class="section-footer">点击任意时间行可单独覆盖该点是否截图、发钉钉或专属后缀</div>
         </div>
       </section>
 
@@ -2056,6 +2324,46 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- 单点时间策略微调底部弹窗 -->
+  <div class="sheet-mask" id="pointMask">
+    <div class="ios-sheet">
+      <div class="sheet-handle"></div>
+      <div class="sheet-header">
+        <button class="sheet-btn" id="pointCancel" type="button">取消</button>
+        <div class="sheet-title" id="pointSheetTitle">调整 12:00 策略</div>
+        <button class="sheet-btn done" id="pointDone" type="button">完成</button>
+      </div>
+      <div class="sheet-body-pad">
+        <div>
+          <div class="sheet-field-label">执行动作</div>
+          <div class="segmented segmented-3" id="pointModeSeg">
+            <div class="seg-thumb" id="pointModeThumb"></div>
+            <button class="seg-btn" type="button" data-val="default">跟随规则</button>
+            <button class="seg-btn" type="button" data-val="send">截图并发群</button>
+            <button class="seg-btn" type="button" data-val="table_only">仅更表不发</button>
+          </div>
+        </div>
+
+        <div class="ios-group" style="box-shadow:none;">
+          <div class="ios-row" style="min-height:44px;">
+            <div class="row-main">
+              <div class="row-title">单独指定该点后缀</div>
+              <div class="row-sub">开启后可覆盖全局/时段规则；留空即强制不加</div>
+            </div>
+            <label class="ios-switch sm"><input type="checkbox" id="pointCustomSufOn" /><span class="ios-slider"></span></label>
+          </div>
+          <div class="ios-row no-icon-sep" id="pointCustomSufWrap" style="display:none;min-height:44px;">
+            <div class="rule-input-box" style="width:100%;">
+              <input type="text" id="pointCustomSufInput" placeholder="输入该点后缀，留空代表强制不加后缀" />
+            </div>
+          </div>
+        </div>
+
+        <button class="danger-card-btn" id="pointResetBtn" type="button" style="box-shadow:none;">清除该点单独覆盖</button>
+      </div>
+    </div>
+  </div>
+
   <!-- iOS 毛玻璃模态弹窗 -->
   <div class="modal-mask" id="modalMask">
     <div class="ios-alert">
@@ -2078,14 +2386,21 @@ const SVG_MOON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" str
 const SVG_SUN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>`;
 const SVG_EYE = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
 const SVG_EYE_OFF = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`;
+const SVG_CLOSE = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/></svg>`;
+const SVG_CHEVRON = `<svg class="chevron-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>`;
+
+const WEEK_SHORT = ["一", "二", "三", "四", "五", "六", "日"];
+const WEEK_FULL = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 
 let cfg = {};
-let cpProfile = "workday";
+let latestTimetable = [];
 let autoScroll = true;
 let lastLogSeq = 0;
 let saveTimer = null;
 let updateUrl = "";
 let pickerState = null;
+let editingPointHm = "";
+let editingPointMode = "default";
 
 function cleanText(s) {
   return String(s || "").replace(/[\u2600-\u27BF\uFE0F\u200D]|[\uD83C-\uDBFF][\uDC00-\uDFFF]/g, "").trim();
@@ -2099,6 +2414,15 @@ function hmStr(h, m) {
   return `${pad2(h)}:${pad2(m)}`;
 }
 
+function parseHmStr(s, defH = 9, defM = 0) {
+  const parts = String(s || "").split(":");
+  if (parts.length !== 2) return [defH, defM];
+  return [
+    Math.max(0, Math.min(23, parseInt(parts[0], 10) || 0)),
+    Math.max(0, Math.min(59, parseInt(parts[1], 10) || 0)),
+  ];
+}
+
 function formatGapText(ih, im) {
   const h = Number(ih) || 0;
   const m = Number(im) || 0;
@@ -2108,8 +2432,16 @@ function formatGapText(ih, im) {
 }
 
 function slotMinutes(s) {
-  const parts = String(s || "0:0").split(":");
-  return (parseInt(parts[0], 10) || 0) * 60 + (parseInt(parts[1], 10) || 0);
+  const [h, m] = parseHmStr(s, 0, 0);
+  return h * 60 + m;
+}
+
+function inTimeWindowLocal(curMin, startStr, endStr, inclusiveEnd = true) {
+  const s = slotMinutes(startStr);
+  const e = slotMinutes(endStr);
+  if (s === e) return curMin === s;
+  if (s < e) return inclusiveEnd ? (curMin >= s && curMin <= e) : (curMin >= s && curMin < e);
+  return inclusiveEnd ? (curMin >= s || curMin <= e) : (curMin >= s || curMin < e);
 }
 
 function slotsOverlap(s1, e1, s2, e2) {
@@ -2120,6 +2452,46 @@ function slotsOverlap(s1, e1, s2, e2) {
     }
   }
   return false;
+}
+
+function isRunDayAllowedLocal(c) {
+  const mode = (c && c.day_mode) || "daily";
+  const wday = (new Date().getDay() + 6) % 7;
+  if (mode === "workday") return wday < 5;
+  if (mode === "weekend") return wday >= 5;
+  if (mode === "custom") {
+    const days = Array.isArray(c.custom_days) ? c.custom_days : [0, 1, 2, 3, 4];
+    return days.includes(wday);
+  }
+  return true;
+}
+
+function buildDayModeLabel(c) {
+  const mode = (c && c.day_mode) || "daily";
+  if (mode === "workday") return "工作日（周一至周五）";
+  if (mode === "weekend") return "非工作日（周六至周日）";
+  if (mode === "custom") {
+    const days = Array.isArray(c.custom_days) ? c.custom_days : [];
+    if (!days.length) return "未选任何星期";
+    return "自定义（周" + days.map((d) => WEEK_SHORT[d] || "").join("、") + "）";
+  }
+  return "每天运行";
+}
+
+function resolveSuffixLocal(hm) {
+  const ov = cfg.point_overrides && cfg.point_overrides[hm];
+  if (ov && ov.suffix !== undefined && ov.suffix !== null) {
+    return { suf: String(ov.suffix).trim(), src: "单点覆盖" };
+  }
+  const curMin = slotMinutes(hm);
+  const rules = Array.isArray(cfg.suffix_rules) ? cfg.suffix_rules : [];
+  for (const r of rules) {
+    if (r && r.enabled !== false && inTimeWindowLocal(curMin, r.start || "00:00", r.end || "00:00", true)) {
+      return { suf: String(r.suffix || "").trim(), src: `时段 ${r.start}-${r.end}` };
+    }
+  }
+  const defSuf = ($("dtSuffix").value || "").trim();
+  return { suf: defSuf, src: defSuf ? "默认后缀" : "默认不加" };
 }
 
 function showToast(msg) {
@@ -2288,21 +2660,349 @@ function applySegmented(segId, thumbId, value) {
   $(thumbId).style.transform = `translateX(${idx * 100}%)`;
 }
 
+function renderCustomDays() {
+  const isCustom = (cfg.day_mode || "daily") === "custom";
+  $("customDaysWrap").classList.toggle("show", isCustom);
+  $("dayModeSummary").textContent = buildDayModeLabel(cfg);
+  const days = Array.isArray(cfg.custom_days) ? cfg.custom_days : [];
+  for (const btn of $("customDaysGrid").querySelectorAll(".wday-btn")) {
+    const d = Number(btn.dataset.day);
+    btn.classList.toggle("active", days.includes(d));
+  }
+  const hint = $("customDaysHint");
+  if (!days.length) {
+    hint.textContent = "请至少选择一天运行星期，否则定时计划无法启动";
+    hint.className = "wday-hint err";
+  } else {
+    hint.textContent = "已选运行日：" + days.map((d) => WEEK_FULL[d]).join("、");
+    hint.className = "wday-hint";
+  }
+}
+
+function renderSuffixRules() {
+  const wrap = $("suffixRulesList");
+  wrap.innerHTML = "";
+  const rules = Array.isArray(cfg.suffix_rules) ? cfg.suffix_rules : [];
+  if (!rules.length) {
+    const tip = document.createElement("div");
+    tip.className = "empty-rule-tip";
+    tip.textContent = "暂无分时段规则，点右上角「+ 添加时段」可为特定时段单独加后缀";
+    wrap.appendChild(tip);
+    return;
+  }
+
+  rules.forEach((rule, idx) => {
+    const row = document.createElement("div");
+    row.className = "rule-card-row";
+
+    const top = document.createElement("div");
+    top.className = "rule-top";
+
+    const pair = document.createElement("div");
+    pair.className = "pill-pair";
+
+    const stBtn = document.createElement("button");
+    stBtn.type = "button";
+    stBtn.className = "ios-pill-btn";
+    stBtn.textContent = rule.start || "11:30";
+    stBtn.onclick = () => {
+      const [h, m] = parseHmStr(rule.start, 11, 30);
+      openPicker({
+        title: "后缀生效开始时间", mode: "time", h, m,
+        onConfirm: (nh, nm) => {
+          cfg.suffix_rules[idx].start = hmStr(nh, nm);
+          stBtn.textContent = cfg.suffix_rules[idx].start;
+          scheduleSave(true);
+        }
+      });
+    };
+
+    const sep = document.createElement("span");
+    sep.className = "pill-sep";
+    sep.textContent = "至";
+
+    const edBtn = document.createElement("button");
+    edBtn.type = "button";
+    edBtn.className = "ios-pill-btn";
+    edBtn.textContent = rule.end || "12:30";
+    edBtn.onclick = () => {
+      const [h, m] = parseHmStr(rule.end, 12, 30);
+      openPicker({
+        title: "后缀生效结束时间", mode: "time", h, m,
+        onConfirm: (nh, nm) => {
+          cfg.suffix_rules[idx].end = hmStr(nh, nm);
+          edBtn.textContent = cfg.suffix_rules[idx].end;
+          scheduleSave(true);
+        }
+      });
+    };
+
+    pair.appendChild(stBtn);
+    pair.appendChild(sep);
+    pair.appendChild(edBtn);
+
+    const actions = document.createElement("div");
+    actions.className = "rule-actions";
+
+    const sw = document.createElement("label");
+    sw.className = "ios-switch sm";
+    const chk = document.createElement("input");
+    chk.type = "checkbox";
+    chk.checked = rule.enabled !== false;
+    chk.onchange = () => {
+      cfg.suffix_rules[idx].enabled = chk.checked;
+      scheduleSave(true);
+    };
+    const sl = document.createElement("span");
+    sl.className = "ios-slider";
+    sw.appendChild(chk);
+    sw.appendChild(sl);
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "clear-circle";
+    del.title = "删除该时段规则";
+    del.innerHTML = SVG_CLOSE;
+    del.onclick = () => {
+      cfg.suffix_rules.splice(idx, 1);
+      renderSuffixRules();
+      scheduleSave(true);
+    };
+
+    actions.appendChild(sw);
+    actions.appendChild(del);
+    top.appendChild(pair);
+    top.appendChild(actions);
+
+    const inpBox = document.createElement("div");
+    inpBox.className = "rule-input-box";
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.placeholder = "该时段发送的后缀（如：午间数据），留空代表强制不加";
+    inp.value = rule.suffix || "";
+    inp.oninput = () => {
+      cfg.suffix_rules[idx].suffix = inp.value.trim();
+      scheduleSave(false);
+    };
+    inpBox.appendChild(inp);
+
+    row.appendChild(top);
+    row.appendChild(inpBox);
+    wrap.appendChild(row);
+  });
+}
+
+function renderCaptureWindows() {
+  const wrap = $("cpWindowsList");
+  wrap.innerHTML = "";
+  const wins = (cfg.capture_plan && Array.isArray(cfg.capture_plan.windows))
+    ? cfg.capture_plan.windows : [];
+  if (!wins.length) {
+    const tip = document.createElement("div");
+    tip.className = "empty-rule-tip";
+    tip.textContent = "暂未设置允许窗口，自动值守将仅更新表格不发钉钉";
+    wrap.appendChild(tip);
+    return;
+  }
+
+  wins.forEach((win, idx) => {
+    const row = document.createElement("div");
+    row.className = "rule-card-row";
+
+    const top = document.createElement("div");
+    top.className = "rule-top";
+
+    const pair = document.createElement("div");
+    pair.className = "pill-pair";
+
+    const stBtn = document.createElement("button");
+    stBtn.type = "button";
+    stBtn.className = "ios-pill-btn";
+    stBtn.textContent = win.start || "09:00";
+    stBtn.onclick = () => {
+      const [h, m] = parseHmStr(win.start, 9, 0);
+      openPicker({
+        title: "允许发群开始时间", mode: "time", h, m,
+        onConfirm: (nh, nm) => {
+          cfg.capture_plan.windows[idx].start = hmStr(nh, nm);
+          stBtn.textContent = cfg.capture_plan.windows[idx].start;
+          scheduleSave(true);
+        }
+      });
+    };
+
+    const sep = document.createElement("span");
+    sep.className = "pill-sep";
+    sep.textContent = "至";
+
+    const edBtn = document.createElement("button");
+    edBtn.type = "button";
+    edBtn.className = "ios-pill-btn";
+    edBtn.textContent = win.end || "18:00";
+    edBtn.onclick = () => {
+      const [h, m] = parseHmStr(win.end, 18, 0);
+      openPicker({
+        title: "允许发群结束时间", mode: "time", h, m,
+        onConfirm: (nh, nm) => {
+          cfg.capture_plan.windows[idx].end = hmStr(nh, nm);
+          edBtn.textContent = cfg.capture_plan.windows[idx].end;
+          scheduleSave(true);
+        }
+      });
+    };
+
+    pair.appendChild(stBtn);
+    pair.appendChild(sep);
+    pair.appendChild(edBtn);
+
+    const actions = document.createElement("div");
+    actions.className = "rule-actions";
+
+    const sw = document.createElement("label");
+    sw.className = "ios-switch sm";
+    const chk = document.createElement("input");
+    chk.type = "checkbox";
+    chk.checked = win.enabled !== false;
+    chk.onchange = () => {
+      cfg.capture_plan.windows[idx].enabled = chk.checked;
+      scheduleSave(true);
+    };
+    const sl = document.createElement("span");
+    sl.className = "ios-slider";
+    sw.appendChild(chk);
+    sw.appendChild(sl);
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "clear-circle";
+    del.title = "删除该窗口";
+    del.innerHTML = SVG_CLOSE;
+    del.onclick = () => {
+      cfg.capture_plan.windows.splice(idx, 1);
+      renderCaptureWindows();
+      scheduleSave(true);
+    };
+
+    actions.appendChild(sw);
+    actions.appendChild(del);
+    top.appendChild(pair);
+    top.appendChild(actions);
+    row.appendChild(top);
+    wrap.appendChild(row);
+  });
+}
+
+function renderTimetable(tt) {
+  if (Array.isArray(tt)) latestTimetable = tt;
+  const list = $("timetableList");
+  list.innerHTML = "";
+
+  const dayOk = isRunDayAllowedLocal(cfg);
+  $("ttSummaryText").textContent = `共 ${latestTimetable.length} 轮${dayOk ? " · 今日运行" : " · 今日休眠"}`;
+
+  if (!latestTimetable.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-rule-tip";
+    empty.textContent = "当前时段配置未生成可执行时间点";
+    list.appendChild(empty);
+    return;
+  }
+
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  let nextMarked = false;
+
+  for (const item of latestTimetable) {
+    const row = document.createElement("div");
+    row.className = "tt-row";
+
+    const timeCol = document.createElement("div");
+    timeCol.className = "tt-time-col";
+    const hmEl = document.createElement("div");
+    hmEl.className = "tt-hm";
+    hmEl.textContent = item.time;
+    const perEl = document.createElement("div");
+    perEl.className = "tt-period";
+    const perTxt = document.createElement("span");
+    perTxt.textContent = item.period || "白天";
+    perEl.appendChild(perTxt);
+    if (dayOk && !nextMarked && item.min > nowMin) {
+      nextMarked = true;
+      const tag = document.createElement("span");
+      tag.className = "tt-next-tag";
+      tag.textContent = "下次";
+      perEl.appendChild(tag);
+    }
+    timeCol.appendChild(hmEl);
+    timeCol.appendChild(perEl);
+
+    const badges = document.createElement("div");
+    badges.className = "tt-badges";
+
+    const capPill = document.createElement("span");
+    capPill.className = `tt-pill ${item.do_capture ? "cap-on" : "off"}`;
+    capPill.textContent = item.do_capture ? "截图" : "不截图";
+
+    const dtPill = document.createElement("span");
+    dtPill.className = `tt-pill ${item.do_dingtalk ? "dt-on" : "off"}`;
+    dtPill.textContent = item.do_dingtalk ? "发钉钉" : "不发群";
+
+    const sufPill = document.createElement("span");
+    sufPill.className = `tt-pill ${item.suffix ? "suf-on" : "off"}`;
+    sufPill.textContent = item.suffix ? item.suffix : "无后缀";
+
+    badges.appendChild(capPill);
+    badges.appendChild(dtPill);
+    badges.appendChild(sufPill);
+
+    const chevWrap = document.createElement("div");
+    chevWrap.style.display = "flex";
+    chevWrap.style.alignItems = "center";
+    chevWrap.innerHTML = SVG_CHEVRON;
+
+    row.appendChild(timeCol);
+    row.appendChild(badges);
+    row.appendChild(chevWrap);
+    row.onclick = () => openPointModal(item);
+    list.appendChild(row);
+  }
+}
+
+function openPointModal(item) {
+  editingPointHm = item.time;
+  $("pointSheetTitle").textContent = `调整 ${item.time} 执行策略`;
+  const ov = (cfg.point_overrides && cfg.point_overrides[item.time]) || {};
+  editingPointMode = ov.mode || "default";
+  applySegmented("pointModeSeg", "pointModeThumb", editingPointMode);
+
+  const hasCustom = ov.suffix !== undefined && ov.suffix !== null;
+  $("pointCustomSufOn").checked = hasCustom;
+  $("pointCustomSufWrap").style.display = hasCustom ? "flex" : "none";
+  $("pointCustomSufInput").value = hasCustom ? String(ov.suffix) : (item.suffix || "");
+  $("pointMask").classList.add("show");
+}
+
 function updateSummaries() {
   const targetName = ($("dtSearch").value || "").trim() || "文件小助手";
   $("sumTarget").textContent = targetName;
   $("kwPreview").textContent = `将在钉钉按 Ctrl+Shift+F 直接粘贴「${targetName}」并按 Enter 进入会话`;
 
-  const suffix = ($("dtSuffix").value || "").trim() || "数据";
   const now = new Date();
-  const stamp = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())} ${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
-  $("msgPreview").textContent = `消息附言预览：${stamp} ${suffix}`;
+  const curHm = hmStr(now.getHours(), now.getMinutes());
+  const stamp = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())} ${curHm}`;
+  const res = resolveSuffixLocal(curHm);
+  const fullPreview = stamp + (res.suf ? ` ${res.suf}` : "");
+  $("msgPreview").textContent = `此刻（${curHm}）消息预览：「${fullPreview}」（${res.src}）`;
 
   const policyParts = [];
   policyParts.push($("dtClearBeforeSend").checked ? "先清空" : "保留草稿");
   policyParts.push($("dtSilentSend").checked ? "静音" : "常规");
-  policyParts.push($("dtAutoSend").checked ? "自动发送" : "暂不发送");
+  policyParts.push($("dtAutoSend").checked ? "自动发送" : "暂不发");
   $("sumPolicy").textContent = policyParts.join(" · ");
+
+  const enabledRules = (cfg.suffix_rules || []).filter((r) => r && r.enabled !== false).length;
+  const defSuf = ($("dtSuffix").value || "").trim();
+  $("sumPolicySub").textContent = `${enabledRules} 条分时段规则 · 默认${defSuf ? "「" + defSuf + "」" : "不加后缀"}`;
 
   const ds = hmStr(cfg.day.sh, cfg.day.sm);
   const de = hmStr(cfg.day.eh, cfg.day.em);
@@ -2321,36 +3021,19 @@ function updateSummaries() {
   $("nightGapBtn").textContent = formatGapText(cfg.night.ih, cfg.night.im);
 
   $("overlapTip").style.display = (nOn && slotsOverlap(ds, de, ns, ne)) ? "block" : "none";
-  $("sumScheduleSub").textContent = `${cfg.day_mode === "workday" ? "仅工作日" : "每天运行"} · 白天 ${ds}-${de}${nOn ? " / 夜间" : ""}`;
-}
-
-function renderCaptureProfile() {
-  if (!cfg.capture_plan) cfg.capture_plan = { enabled: false, workday: {}, weekend: {} };
-  if (!cfg.capture_plan[cpProfile]) {
-    cfg.capture_plan[cpProfile] = {
-      slot1: true, start1: "09:00", end1: "18:00",
-      slot2: false, start2: "18:00", end2: "22:00",
-    };
-  }
-  const cp = cfg.capture_plan[cpProfile];
-  $("cpSlot1").checked = Boolean(cp.slot1);
-  $("cpStart1Btn").textContent = cp.start1 || "09:00";
-  $("cpEnd1Btn").textContent = cp.end1 || "18:00";
-  $("cpSlot1Body").classList.toggle("disabled", !$("cpSlot1").checked);
-
-  $("cpSlot2").checked = Boolean(cp.slot2);
-  $("cpStart2Btn").textContent = cp.start2 || "18:00";
-  $("cpEnd2Btn").textContent = cp.end2 || "22:00";
-  $("cpSlot2Body").classList.toggle("disabled", !$("cpSlot2").checked);
-
-  applySegmented("cpProfileSeg", "cpProfileThumb", cpProfile);
+  $("dayModeSummary").textContent = buildDayModeLabel(cfg);
+  $("sumScheduleSub").textContent = `${buildDayModeLabel(cfg)} · 全天 ${latestTimetable.length} 轮`;
 }
 
 function renderConfig() {
-  if (!cfg.day) cfg.day = { sh: 9, sm: 0, eh: 18, em: 0, ih: 0, im: 30 };
-  if (!cfg.night) cfg.night = { sh: 18, sm: 0, eh: 23, em: 0, ih: 0, im: 30 };
+  if (!cfg.day) cfg.day = { sh: 9, sm: 0, eh: 18, em: 0, ih: 2, im: 0 };
+  if (!cfg.night) cfg.night = { sh: 18, sm: 0, eh: 23, em: 0, ih: 2, im: 0 };
+  if (!Array.isArray(cfg.custom_days)) cfg.custom_days = [0, 1, 2, 3, 4];
+  if (!Array.isArray(cfg.suffix_rules)) cfg.suffix_rules = [];
+  if (!cfg.point_overrides) cfg.point_overrides = {};
 
   applySegmented("dayModeSeg", "dayModeThumb", cfg.day_mode || "daily");
+  renderCustomDays();
   $("nightEnabled").checked = cfg.night_enabled !== false;
 
   $("enableCapture").checked = cfg.enable_capture !== false;
@@ -2358,13 +3041,15 @@ function renderConfig() {
   $("dtClearBeforeSend").checked = cfg.dt_clear_before_send !== false;
   $("dtSilentSend").checked = cfg.dt_silent_send !== false;
   $("dtAutoSend").checked = cfg.dt_auto_send === true;
+  $("openWpsAfterRun").checked = cfg.open_wps_after_run === true;
   $("dtSearch").value = cfg.dt_search || "";
   $("dtSuffix").value = cfg.dt_suffix || "";
+  renderSuffixRules();
 
   const cpOn = Boolean(cfg.capture_plan && cfg.capture_plan.enabled);
   $("cpEnabled").checked = cpOn;
   $("cpAccordion").classList.toggle("open", cpOn);
-  renderCaptureProfile();
+  renderCaptureWindows();
 
   $("wpsUrl").value = cfg.wps_url || "";
   $("luyaUser").value = cfg.luya_user || "";
@@ -2380,17 +3065,15 @@ function collectConfigFromDOM() {
   cfg.dt_clear_before_send = $("dtClearBeforeSend").checked;
   cfg.dt_silent_send = $("dtSilentSend").checked;
   cfg.dt_auto_send = $("dtAutoSend").checked;
+  cfg.open_wps_after_run = $("openWpsAfterRun").checked;
   cfg.dt_search = $("dtSearch").value.trim() || "文件小助手";
-  cfg.dt_suffix = $("dtSuffix").value.trim() || "数据";
+  cfg.dt_suffix = $("dtSuffix").value.trim();
   cfg.wps_url = $("wpsUrl").value.trim();
   cfg.luya_user = $("luyaUser").value.trim();
   cfg.luya_pass = $("luyaPass").value;
 
-  if (!cfg.capture_plan) cfg.capture_plan = { enabled: false, workday: {}, weekend: {} };
+  if (!cfg.capture_plan) cfg.capture_plan = { enabled: false, windows: [] };
   cfg.capture_plan.enabled = $("cpEnabled").checked;
-  if (!cfg.capture_plan[cpProfile]) cfg.capture_plan[cpProfile] = {};
-  cfg.capture_plan[cpProfile].slot1 = $("cpSlot1").checked;
-  cfg.capture_plan[cpProfile].slot2 = $("cpSlot2").checked;
   return cfg;
 }
 
@@ -2399,7 +3082,12 @@ function scheduleSave(immediate = false) {
   clearTimeout(saveTimer);
   const runSave = async () => {
     const data = collectConfigFromDOM();
-    await api("/api/config", "POST", data);
+    const res = await api("/api/config", "POST", data);
+    if (res && Array.isArray(res.timetable)) {
+      latestTimetable = res.timetable;
+      renderTimetable(res.timetable);
+      updateSummaries();
+    }
     if (immediate) showToast("设置已保存");
   };
   if (immediate) {
@@ -2549,27 +3237,43 @@ function bindEvents() {
     btn.onclick = () => {
       cfg.day_mode = btn.dataset.val;
       applySegmented("dayModeSeg", "dayModeThumb", cfg.day_mode);
+      renderCustomDays();
       scheduleSave(true);
-    };
-  }
-  for (const btn of $("cpProfileSeg").querySelectorAll(".seg-btn")) {
-    btn.onclick = () => {
-      collectConfigFromDOM();
-      cpProfile = btn.dataset.val;
-      renderCaptureProfile();
     };
   }
 
+  for (const btn of $("customDaysGrid").querySelectorAll(".wday-btn")) {
+    btn.onclick = () => {
+      const d = Number(btn.dataset.day);
+      const cur = new Set(Array.isArray(cfg.custom_days) ? cfg.custom_days : []);
+      if (cur.has(d)) cur.delete(d);
+      else cur.add(d);
+      cfg.custom_days = [...cur].sort((a, b) => a - b);
+      renderCustomDays();
+      scheduleSave(true);
+    };
+  }
+
+  $("addSuffixRuleBtn").onclick = () => {
+    if (!Array.isArray(cfg.suffix_rules)) cfg.suffix_rules = [];
+    cfg.suffix_rules.push({ enabled: true, start: "12:00", end: "13:00", suffix: "午间数据" });
+    renderSuffixRules();
+    scheduleSave(true);
+  };
+
+  $("addCpWinBtn").onclick = () => {
+    if (!cfg.capture_plan) cfg.capture_plan = { enabled: true, windows: [] };
+    if (!Array.isArray(cfg.capture_plan.windows)) cfg.capture_plan.windows = [];
+    cfg.capture_plan.windows.push({ enabled: true, start: "09:00", end: "18:00" });
+    renderCaptureWindows();
+    scheduleSave(true);
+  };
+
   for (const id of [
     "nightEnabled", "enableCapture", "enableDingtalk",
-    "dtClearBeforeSend", "dtSilentSend", "dtAutoSend",
-    "cpSlot1", "cpSlot2"
+    "dtClearBeforeSend", "dtSilentSend", "dtAutoSend", "openWpsAfterRun"
   ]) {
-    $(id).addEventListener("change", () => {
-      if (id === "cpSlot1") $("cpSlot1Body").classList.toggle("disabled", !$("cpSlot1").checked);
-      if (id === "cpSlot2") $("cpSlot2Body").classList.toggle("disabled", !$("cpSlot2").checked);
-      scheduleSave(true);
-    });
+    $(id).addEventListener("change", () => scheduleSave(true));
   }
 
   $("cpEnabled").addEventListener("change", () => {
@@ -2584,8 +3288,11 @@ function bindEvents() {
     $("dtSearch").value = "";
     scheduleSave(true);
   };
+  $("clearSuffixBtn").onclick = () => {
+    $("dtSuffix").value = "";
+    scheduleSave(true);
+  };
 
-  // 时间 & 间隔底部滚轮选择器绑定
   $("dayStartBtn").onclick = () => openPicker({
     title: "白天开始时间", mode: "time", h: cfg.day.sh, m: cfg.day.sm,
     onConfirm: (h, m) => { cfg.day.sh = h; cfg.day.sm = m; scheduleSave(true); }
@@ -2612,25 +3319,6 @@ function bindEvents() {
     onConfirm: (h, m) => { cfg.night.ih = h; cfg.night.im = m; scheduleSave(true); }
   });
 
-  const bindCpTimeBtn = (btnId, key, title) => {
-    $(btnId).onclick = () => {
-      const val = (cfg.capture_plan && cfg.capture_plan[cpProfile] && cfg.capture_plan[cpProfile][key]) || "09:00";
-      const [h, m] = val.split(":").map((x) => parseInt(x, 10) || 0);
-      openPicker({
-        title, mode: "time", h, m,
-        onConfirm: (nh, nm) => {
-          cfg.capture_plan[cpProfile][key] = hmStr(nh, nm);
-          renderCaptureProfile();
-          scheduleSave(true);
-        }
-      });
-    };
-  };
-  bindCpTimeBtn("cpStart1Btn", "start1", "时段 1 开始时间");
-  bindCpTimeBtn("cpEnd1Btn", "end1", "时段 1 结束时间");
-  bindCpTimeBtn("cpStart2Btn", "start2", "时段 2 开始时间");
-  bindCpTimeBtn("cpEnd2Btn", "end2", "时段 2 结束时间");
-
   $("pickerCancel").onclick = () => $("pickerMask").classList.remove("show");
   $("pickerMask").onclick = (e) => {
     if (e.target === $("pickerMask")) $("pickerMask").classList.remove("show");
@@ -2644,6 +3332,42 @@ function bindEvents() {
     }
     $("pickerMask").classList.remove("show");
     onConfirm(h, m);
+  };
+
+  for (const btn of $("pointModeSeg").querySelectorAll(".seg-btn")) {
+    btn.onclick = () => {
+      editingPointMode = btn.dataset.val;
+      applySegmented("pointModeSeg", "pointModeThumb", editingPointMode);
+    };
+  }
+  $("pointCustomSufOn").addEventListener("change", () => {
+    $("pointCustomSufWrap").style.display = $("pointCustomSufOn").checked ? "flex" : "none";
+  });
+  $("pointCancel").onclick = () => $("pointMask").classList.remove("show");
+  $("pointMask").onclick = (e) => {
+    if (e.target === $("pointMask")) $("pointMask").classList.remove("show");
+  };
+  $("pointDone").onclick = () => {
+    if (!editingPointHm) return;
+    if (!cfg.point_overrides) cfg.point_overrides = {};
+    const hasCustom = $("pointCustomSufOn").checked;
+    if (editingPointMode === "default" && !hasCustom) {
+      delete cfg.point_overrides[editingPointHm];
+    } else {
+      cfg.point_overrides[editingPointHm] = {
+        mode: editingPointMode,
+        suffix: hasCustom ? $("pointCustomSufInput").value.trim() : null,
+      };
+    }
+    $("pointMask").classList.remove("show");
+    scheduleSave(true);
+  };
+  $("pointResetBtn").onclick = () => {
+    if (editingPointHm && cfg.point_overrides) {
+      delete cfg.point_overrides[editingPointHm];
+    }
+    $("pointMask").classList.remove("show");
+    scheduleSave(true);
   };
 
   $("togglePassBtn").innerHTML = SVG_EYE;
@@ -2710,7 +3434,9 @@ function bindEvents() {
     if (!ok) return;
     const res = await api("/api/reset", "POST");
     cfg = res.config;
+    latestTimetable = Array.isArray(res.timetable) ? res.timetable : [];
     renderConfig();
+    renderTimetable(latestTimetable);
     showToast("已恢复默认设置");
   };
 
@@ -2734,7 +3460,9 @@ function bindEvents() {
   bindEvents();
   const data = await api("/api/config");
   cfg = data.config;
+  latestTimetable = Array.isArray(data.timetable) ? data.timetable : [];
   renderConfig();
+  renderTimetable(latestTimetable);
   await pollState();
   setInterval(pollState, 900);
 })();
@@ -2797,7 +3525,7 @@ def _make_handler(ctrl, token):
                 return
 
             if parsed.path == "/api/config":
-                self._send_json({"ok": True, "config": ctrl.get_config()})
+                self._send_json({"ok": True, "config": ctrl.get_config(), "timetable": ctrl.get_timetable()})
                 return
 
             self._send_json({"ok": False, "message": "Not Found"}, HTTPStatus.NOT_FOUND)
@@ -2811,7 +3539,7 @@ def _make_handler(ctrl, token):
             if parsed.path == "/api/config":
                 body = self._read_json()
                 saved = ctrl.save_config(body)
-                self._send_json({"ok": True, "config": saved})
+                self._send_json({"ok": True, "config": saved, "timetable": ctrl.get_timetable()})
                 return
 
             if parsed.path == "/api/run-now":
@@ -2838,7 +3566,7 @@ def _make_handler(ctrl, token):
 
             if parsed.path == "/api/reset":
                 saved = ctrl.reset_config()
-                self._send_json({"ok": True, "config": saved})
+                self._send_json({"ok": True, "config": saved, "timetable": ctrl.get_timetable()})
                 return
 
             if parsed.path == "/api/clear-logs":

@@ -552,7 +552,8 @@ def set_clipboard_image_from_file(path):
 CONFIG_PATH = app_dir() / "config.json"
 
 DEFAULT_CONFIG = {
-    "day_mode": "daily",
+    "day_mode": "daily",         # daily | workday | weekend | custom
+    "custom_days": [0, 1, 2, 3, 4],  # 0=周一 .. 6=周日
     "day": {"sh": 9, "sm": 0, "eh": 18, "em": 0, "ih": 2, "im": 0},
     "night": {"sh": 18, "sm": 0, "eh": 23, "em": 0, "ih": 2, "im": 0},
     "night_enabled": True,       # 是否启用晚上时段自动执行
@@ -565,10 +566,16 @@ DEFAULT_CONFIG = {
     "dt_clear_before_send": True,  # 粘贴前先清空聊天输入框原有残留内容
     "dt_silent_send": True,      # 发送前自动勾选「设为静音」（静音发送）
     "dt_search": "文件小助手",    # 钉钉搜索的会话名
-    "dt_suffix": "数据",          # 消息标题后缀：当前时间 + 后缀
-    # 独立截图发送时段：只约束自动计划，手动按钮始终可以立即发送。
+    "dt_suffix": "",             # 默认后缀：留空表示平时仅发时间戳，只在命中的分时段规则加后缀
+    "suffix_rules": [],          # [{"enabled": True, "start": "11:30", "end": "12:30", "suffix": "午间数据"}]
+    "point_overrides": {},       # {"HH:MM": {"mode": "default|send|table_only", "suffix": None|"xxx"}}
+    "open_wps_after_run": False, # 每轮跑完是否自动用系统浏览器/WPS打开表格（默认关闭避免自动值守弹窗扰民）
+    # 独立截图发送时段：只约束自动计划，手动按钮始终可以立即执行。
     "capture_plan": {
         "enabled": False,
+        "windows": [
+            {"enabled": True, "start": "09:00", "end": "18:00"},
+        ],
         "workday": {
             "slot1": True, "start1": "09:00", "end1": "18:00",
             "slot2": False, "start2": "18:00", "end2": "22:00",
@@ -592,21 +599,132 @@ def _deep_merge(default, saved):
     return out
 
 
+def _norm_hm_str(s, default="09:00"):
+    try:
+        parts = str(s or "").strip().split(":")
+        if len(parts) != 2:
+            return default
+        h = max(0, min(23, int(parts[0])))
+        m = max(0, min(59, int(parts[1])))
+        return f"{h:02d}:{m:02d}"
+    except Exception:
+        return default
+
+
+def normalize_config(cfg):
+    """规范化并兼容旧版配置结构，确保日期模式、分时段后缀与允许窗口字段合法。"""
+    import copy
+    out = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), cfg if isinstance(cfg, dict) else {})
+
+    if out.get("day_mode") not in ("daily", "workday", "weekend", "custom"):
+        out["day_mode"] = "daily"
+
+    raw_days = out.get("custom_days")
+    if isinstance(raw_days, list):
+        clean_days = sorted({int(d) for d in raw_days if str(d).isdigit() and 0 <= int(d) <= 6})
+        out["custom_days"] = clean_days
+    else:
+        out["custom_days"] = [0, 1, 2, 3, 4]
+
+    for key, def_slot in (("day", DEFAULT_CONFIG["day"]), ("night", DEFAULT_CONFIG["night"])):
+        sl = out.get(key) if isinstance(out.get(key), dict) else {}
+        out[key] = {
+            "sh": max(0, min(23, int(sl.get("sh", def_slot["sh"])))),
+            "sm": max(0, min(59, int(sl.get("sm", def_slot["sm"])))),
+            "eh": max(0, min(23, int(sl.get("eh", def_slot["eh"])))),
+            "em": max(0, min(59, int(sl.get("em", def_slot["em"])))),
+            "ih": max(0, min(12, int(sl.get("ih", def_slot["ih"])))),
+            "im": max(0, min(59, int(sl.get("im", def_slot["im"])))),
+        }
+
+    raw_suf = out.get("dt_suffix")
+    out["dt_suffix"] = "" if raw_suf is None else str(raw_suf).strip()
+    out["dt_search"] = str(out.get("dt_search") or "文件小助手").strip() or "文件小助手"
+    out["open_wps_after_run"] = bool(out.get("open_wps_after_run", False))
+
+    rules = []
+    for item in (out.get("suffix_rules") or []):
+        if not isinstance(item, dict):
+            continue
+        rules.append({
+            "enabled": bool(item.get("enabled", True)),
+            "start": _norm_hm_str(item.get("start"), "11:30"),
+            "end": _norm_hm_str(item.get("end"), "12:30"),
+            "suffix": str(item.get("suffix") or "").strip(),
+        })
+    out["suffix_rules"] = rules
+
+    overrides = {}
+    raw_ov = out.get("point_overrides")
+    if isinstance(raw_ov, dict):
+        for k, v in raw_ov.items():
+            if not isinstance(v, dict):
+                continue
+            hm_k = _norm_hm_str(k, "")
+            if not hm_k:
+                continue
+            mode = v.get("mode", "default")
+            if mode not in ("default", "send", "table_only"):
+                mode = "default"
+            suf_v = v.get("suffix", None)
+            if suf_v is not None:
+                suf_v = str(suf_v).strip()
+            if mode == "default" and suf_v is None:
+                continue
+            overrides[hm_k] = {"mode": mode, "suffix": suf_v}
+    out["point_overrides"] = overrides
+
+    cp = out.get("capture_plan") if isinstance(out.get("capture_plan"), dict) else {}
+    raw_cp = cfg.get("capture_plan") if isinstance(cfg, dict) and isinstance(cfg.get("capture_plan"), dict) else {}
+    saved_has_windows = "windows" in raw_cp
+    wins = []
+    if saved_has_windows or isinstance(cp.get("windows"), list):
+        raw_wins = cp.get("windows") or []
+        if not saved_has_windows and raw_cp:
+            # 旧版 config 迁移：仅从用户实际保存的 workday/weekend 已勾选槽位合并成统一多窗口
+            migrated = []
+            seen = set()
+            for prof_name in ("workday", "weekend"):
+                prof = raw_cp.get(prof_name) if isinstance(raw_cp.get(prof_name), dict) else {}
+                for idx in (1, 2):
+                    if prof.get(f"slot{idx}", False):
+                        st = _norm_hm_str(prof.get(f"start{idx}"), "09:00")
+                        ed = _norm_hm_str(prof.get(f"end{idx}"), "18:00")
+                        if (st, ed) not in seen:
+                            seen.add((st, ed))
+                            migrated.append({"enabled": True, "start": st, "end": ed})
+            if migrated:
+                raw_wins = migrated
+        for w in raw_wins:
+            if not isinstance(w, dict):
+                continue
+            wins.append({
+                "enabled": bool(w.get("enabled", True)),
+                "start": _norm_hm_str(w.get("start"), "09:00"),
+                "end": _norm_hm_str(w.get("end"), "18:00"),
+            })
+    cp["windows"] = wins
+    cp["enabled"] = bool(cp.get("enabled", False))
+    out["capture_plan"] = cp
+    return out
+
+
 def load_config():
     try:
         if CONFIG_PATH.exists():
             import json
             saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            return _deep_merge(DEFAULT_CONFIG, saved)
+            return normalize_config(saved)
     except Exception:
         pass
-    return _deep_merge(DEFAULT_CONFIG, {})
+    return normalize_config({})
 
 
 def save_config(cfg):
     try:
         import json
-        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+        normed = normalize_config(cfg)
+        CONFIG_PATH.write_text(json.dumps(normed, ensure_ascii=False, indent=2),
                                encoding="utf-8")
     except Exception:
         pass
@@ -617,26 +735,96 @@ def parse_hm(s):
     return int(h), int(m)
 
 
-def in_slot(now, start, end):
+def in_time_window(cur_min, start_str, end_str, inclusive_end=True):
+    """判断分钟数 cur_min (0..1439) 是否落入时段 start_str ~ end_str（支持单点与跨零点）。"""
     try:
-        sh, sm = parse_hm(start)
-        eh, em = parse_hm(end)
-        cur = now.tm_hour * 60 + now.tm_min
+        sh, sm = parse_hm(_norm_hm_str(start_str, "00:00"))
+        eh, em = parse_hm(_norm_hm_str(end_str, "00:00"))
         s = sh * 60 + sm
         e = eh * 60 + em
-        if s <= e:
-            return s <= cur < e
-        return cur >= s or cur < e
+        if s == e:
+            return cur_min == s
+        if s < e:
+            return (s <= cur_min <= e) if inclusive_end else (s <= cur_min < e)
+        return (cur_min >= s or cur_min <= e) if inclusive_end else (cur_min >= s or cur_min < e)
     except Exception:
         return False
 
 
-def capture_allowed_now(cfg, now=None):
-    """自动计划是否允许此时截图发送；未启用独立计划时保持原行为。"""
+def in_slot(now, start, end):
+    try:
+        cur = now.tm_hour * 60 + now.tm_min
+        return in_time_window(cur, start, end, inclusive_end=False)
+    except Exception:
+        return False
+
+
+def is_run_day_allowed(cfg, lt=None):
+    """判断指定日期（默认今天）是否允许执行自动计划：daily / workday / weekend / custom。"""
+    lt = lt or time.localtime()
+    mode = (cfg or {}).get("day_mode", "daily")
+    wday = lt.tm_wday  # 0=周一 .. 6=周日
+    if mode == "workday":
+        return wday < 5
+    if mode == "weekend":
+        return wday >= 5
+    if mode == "custom":
+        days = (cfg or {}).get("custom_days")
+        if days is None:
+            days = [0, 1, 2, 3, 4]
+        return wday in set(int(x) for x in days if str(x).isdigit())
+    return True
+
+
+def resolve_suffix_for_time(cfg, lt=None, hm_override=None):
+    """按单点覆盖 -> 分时段后缀规则 -> 默认后缀 解析指定时刻的消息后缀，返回 (suffix, source)。"""
+    lt = lt or time.localtime()
+    hm = _norm_hm_str(hm_override, f"{lt.tm_hour:02d}:{lt.tm_min:02d}") if hm_override else f"{lt.tm_hour:02d}:{lt.tm_min:02d}"
+    h, m = parse_hm(hm)
+    cur_min = h * 60 + m
+
+    ov = ((cfg or {}).get("point_overrides") or {}).get(hm)
+    if isinstance(ov, dict) and "suffix" in ov and ov["suffix"] is not None:
+        return str(ov["suffix"]).strip(), "单点设置"
+
+    for rule in ((cfg or {}).get("suffix_rules") or []):
+        if not isinstance(rule, dict) or not rule.get("enabled", True):
+            continue
+        st = _norm_hm_str(rule.get("start"), "00:00")
+        ed = _norm_hm_str(rule.get("end"), "00:00")
+        if in_time_window(cur_min, st, ed, inclusive_end=True):
+            return str(rule.get("suffix") or "").strip(), f"{st}-{ed}"
+
+    default_suf = (cfg or {}).get("dt_suffix")
+    return ("" if default_suf is None else str(default_suf).strip()), "默认"
+
+
+def capture_allowed_now(cfg, now=None, hm_override=None):
+    """自动计划是否允许此时截图发钉钉；先查单点覆盖，再查多时段允许窗口。"""
+    now = now or time.localtime()
+    hm = _norm_hm_str(hm_override, f"{now.tm_hour:02d}:{now.tm_min:02d}") if hm_override else f"{now.tm_hour:02d}:{now.tm_min:02d}"
+    h, m = parse_hm(hm)
+    cur_min = h * 60 + m
+
+    ov = ((cfg or {}).get("point_overrides") or {}).get(hm)
+    if isinstance(ov, dict):
+        if ov.get("mode") == "send":
+            return True
+        if ov.get("mode") == "table_only":
+            return False
+
     plan = (cfg or {}).get("capture_plan") or {}
     if not plan.get("enabled", False):
         return True
-    now = now or time.localtime()
+
+    windows = plan.get("windows")
+    if isinstance(windows, list):
+        for w in windows:
+            if isinstance(w, dict) and w.get("enabled", True):
+                if in_time_window(cur_min, w.get("start", "09:00"), w.get("end", "18:00"), inclusive_end=True):
+                    return True
+        return False
+
     profile = plan.get("weekend" if now.tm_wday >= 5 else "workday") or {}
     for i in (1, 2):
         if profile.get(f"slot{i}", False) and in_slot(
@@ -644,6 +832,68 @@ def capture_allowed_now(cfg, now=None):
                 profile.get(f"end{i}", "18:00")):
             return True
     return False
+
+
+def build_daily_timetable(cfg):
+    """根据白天与夜间时段设置，生成 00:00~23:59 全天确定性触发排期表及每点动作/后缀。"""
+    cfg = normalize_config(cfg)
+    points = {}  # minute -> period ("白天" | "夜间")
+
+    slots = [("白天", cfg["day"])]
+    if cfg.get("night_enabled", True):
+        slots.append(("夜间", cfg["night"]))
+
+    for period_label, sl in slots:
+        gap = max(1, int(sl["ih"]) * 60 + int(sl["im"]))
+        start_m = int(sl["sh"]) * 60 + int(sl["sm"])
+        end_m = int(sl["eh"]) * 60 + int(sl["em"])
+        if start_m < end_m:
+            span = end_m - start_m
+        elif start_m > end_m:
+            span = (1440 - start_m) + end_m
+        else:
+            span = 1440
+        offset = 0
+        guard = 0
+        while offset < span and guard < 1442:
+            m = (start_m + offset) % 1440
+            if m not in points:
+                points[m] = period_label
+            offset += gap
+            guard += 1
+
+    g_cap = bool(cfg.get("enable_capture", True))
+    g_dt = bool(cfg.get("enable_dingtalk", False))
+    overrides = cfg.get("point_overrides") or {}
+    timetable = []
+    for m in sorted(points.keys()):
+        hm = f"{m // 60:02d}:{m % 60:02d}"
+        ov = overrides.get(hm) if isinstance(overrides.get(hm), dict) else {}
+        ov_mode = ov.get("mode", "default")
+        if ov_mode not in ("default", "send", "table_only"):
+            ov_mode = "default"
+        if ov_mode == "send":
+            do_capture = True
+            do_dingtalk = True
+        elif ov_mode == "table_only":
+            do_capture = False
+            do_dingtalk = False
+        else:
+            allowed = capture_allowed_now(cfg, hm_override=hm)
+            do_capture = g_cap and allowed
+            do_dingtalk = g_dt and allowed and do_capture
+        suf, suf_src = resolve_suffix_for_time(cfg, hm_override=hm)
+        timetable.append({
+            "time": hm,
+            "min": m,
+            "period": points[m],
+            "do_capture": do_capture,
+            "do_dingtalk": do_dingtalk,
+            "suffix": suf,
+            "suffix_source": suf_src,
+            "override_mode": ov_mode,
+        })
+    return timetable
 
 
 def cleanup_wps_tabs(context, keep=MAX_KEEP_WPS_TABS, wps_url=None):
@@ -1383,19 +1633,13 @@ def _is_search_popup_open():
     return False
 
 
-def send_dingtalk_image(cfg):
-    """把 WPS 复制的表格图片发到指定钉钉会话，再发一条“时间+后缀”文字。
-
-    防误贴与高命中率设计：
-      1) 搜索前先把剪贴板图片存成临时文件，搜索期间剪贴板不存图片；
-      2) 优先用去除了 Emoji 的纯文字核心词搜索，规避 SendInput 代理对丢字与钉钉漏搜；
-      3) 通过 ToolSaveBits 顶层窗口是否彻底消失确认已经真正离开搜索框进入会话；
-      4) 点击底部消息编辑区中央并在粘贴图片/文字前双重检测焦点控件，若仍在顶部搜索区立即安全拦截。
-    """
+def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None):
+    """把 WPS 复制的表格图片发到指定钉钉会话，再发一条“时间(+分时段后缀)”文字。"""
     check_stop()
     search_name = (cfg.get("dt_search") or "文件小助手").strip()
-    suffix = (cfg.get("dt_suffix") or "数据").strip()
+    suffix, suffix_src = resolve_suffix_for_time(cfg, lt=trigger_lt, hm_override=trigger_hm)
     text_msg = time.strftime("%Y-%m-%d %H:%M") + (" " + suffix if suffix else "")
+    log(f"  消息文案：{text_msg}（后缀来源：{suffix_src}）")
     search_candidates, search_tokens = _extract_search_keywords(search_name)
 
     try:
@@ -2236,9 +2480,10 @@ def send_dingtalk_image(cfg):
             pass
 
 
-def run_once(round_num, cfg=None):
+def run_once(round_num, cfg=None, trigger_lt=None, trigger_hm=None):
     reset_stop()
     start_time = time.time()
+    trigger_lt = trigger_lt or time.localtime(start_time)
     start_str = time.strftime("%Y-%m-%d %H:%M:%S")
     if cfg is None:
         cfg = load_config()
@@ -2417,7 +2662,7 @@ def run_once(round_num, cfg=None):
         try:
             check_stop()
             set_step("正在发送到钉钉…")
-            send_dingtalk_image(cfg)
+            send_dingtalk_image(cfg, trigger_lt=trigger_lt, trigger_hm=trigger_hm)
         except Exception as e:
             if "手动停止" in str(e):
                 raise
@@ -2435,30 +2680,31 @@ def run_once(round_num, cfg=None):
     set_step("✅ 本轮跑完")
     log(f"✅ 本轮全部完成，用时 {duration} 秒")
 
-    log("正在打开数据汇总表给你看...")
-    wps_paths = [
-        r"C:\Program Files\Kingsoft\WPS Office\office6\wps.exe",
-        r"C:\Program Files (x86)\Kingsoft\WPS Office\office6\wps.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Kingsoft\WPS Office\office6\wps.exe"),
-    ]
-    wps_found = False
-    wps_path = None
-    for wp in wps_paths:
-        if os.path.exists(wp):
-            wps_found = True
-            wps_path = wp
-            break
-    if wps_found:
-        log("检测到WPS，用WPS打开")
-        try:
-            subprocess.Popen([wps_path, wps_url])
-        except Exception:
+    if cfg.get("open_wps_after_run", False):
+        log("正在打开数据汇总表给你看...")
+        wps_paths = [
+            r"C:\Program Files\Kingsoft\WPS Office\office6\wps.exe",
+            r"C:\Program Files (x86)\Kingsoft\WPS Office\office6\wps.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Kingsoft\WPS Office\office6\wps.exe"),
+        ]
+        wps_found = False
+        wps_path = None
+        for wp in wps_paths:
+            if os.path.exists(wp):
+                wps_found = True
+                wps_path = wp
+                break
+        if wps_found:
+            log("检测到WPS，用WPS打开")
+            try:
+                subprocess.Popen([wps_path, wps_url])
+            except Exception:
+                import webbrowser
+                webbrowser.open(wps_url)
+        else:
+            log("没装WPS，用浏览器打开")
             import webbrowser
             webbrowser.open(wps_url)
-    else:
-        log("没装WPS，用浏览器打开")
-        import webbrowser
-        webbrowser.open(wps_url)
 
     return end_time
 
@@ -2467,6 +2713,7 @@ def run_capture_only(round_num="截图", cfg=None):
     """独立截图发送：不下载、不写入，只处理 WPS 汇总表和钉钉。"""
     reset_stop()
     start_time = time.time()
+    trigger_lt = time.localtime(start_time)
     if cfg is None:
         cfg = load_config()
     wps_url = (cfg.get("wps_url") or WPS_URL).strip() or WPS_URL
@@ -2509,7 +2756,7 @@ def run_capture_only(round_num="截图", cfg=None):
     check_stop()
     log("3/3 正在粘贴到钉钉并发送…")
     set_step("正在发送到钉钉…")
-    send_dingtalk_image(cfg)
+    send_dingtalk_image(cfg, trigger_lt=trigger_lt)
     notify_last_run()
     end_time = time.time()
     set_step("✅ 本轮跑完")
