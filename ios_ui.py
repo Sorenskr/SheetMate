@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-"""SheetMate v2.0.0 Apple iOS 18 风格控制中心界面与动态任务调度后端。"""
+"""SheetMate v2.0.0 Apple iOS 18 原生风格控制中心界面与调度后端。"""
 
-import html
 import json
 import os
 import re
 import secrets
 import subprocess
-import sys
 import threading
 import time
 import webbrowser
@@ -31,9 +29,18 @@ STEP_PROGRESS = {
     "✅ 本轮跑完": 1.0,
 }
 
+_DECORATIVE_SYMBOL_RE = re.compile(
+    r"[\u2600-\u27BF\U0001F300-\U0001FAFF\u23F0-\u23FA\u25A0-\u25FF\uFE0F]+"
+)
+
+
+def _strip_symbols(text):
+    """剥离界面展示文案中的粗糙 Windows Emoji，仅保留干净文字。"""
+    return _DECORATIVE_SYMBOL_RE.sub("", str(text or "")).strip()
+
 
 def _find_app_shell_browser():
-    """查找可作为独立 --app 原生感窗口启动的 Chromium 内核浏览器。"""
+    """查找可作为独立 --app 窗口启动的 Chromium 内核浏览器。"""
     candidates = [
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
@@ -46,7 +53,6 @@ def _find_app_shell_browser():
         if path and os.path.exists(path):
             return path, "edge_or_chrome"
 
-    # 兜底尝试 Playwright 内置 Chromium
     pw_base = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or (
         Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "ms-playwright"
     ))
@@ -78,7 +84,7 @@ class _SheetMateController:
         self.stop_flag = False
         self.need_login_prompt = False
 
-        self.status_level = "idle"  # idle | running | ok | err | stopped
+        self.status_level = "idle"
         self.step_text = "空闲中，等待开始"
         self.progress = 0.0
         self.error_text = ""
@@ -107,40 +113,45 @@ class _SheetMateController:
             pass
 
     def _on_log(self, msg):
+        raw = str(msg).strip()
         level = "info"
-        s = str(msg)
-        if s.startswith("✅"):
+        if raw.startswith("✅"):
             level = "ok"
-        elif s.startswith("❌"):
+        elif raw.startswith("❌"):
             level = "err"
-        elif s.startswith("⚠️") or "警告" in s or "未成功" in s or "未命中" in s:
+        elif raw.startswith("⚠️") or "警告" in raw or "未成功" in raw or "未命中" in raw or "尚未" in raw:
             level = "warn"
-        elif s.startswith("====") or s.startswith("📊") or s.startswith("📸"):
+        elif raw.startswith("====") or raw.startswith("📊") or raw.startswith("📸"):
             level = "head"
+        clean_msg = _strip_symbols(raw) or raw
+        if re.fullmatch(r"=+", clean_msg):
+            return
         with self._lock:
             self._log_seq += 1
             self.logs.append({
                 "id": self._log_seq,
                 "time": time.strftime("%H:%M:%S"),
                 "level": level,
-                "text": s,
+                "text": clean_msg,
             })
             if len(self.logs) > 600:
                 self.logs = self.logs[-500:]
 
     def _on_step(self, text):
+        raw = str(text)
+        clean_text = _strip_symbols(raw) or raw
         with self._lock:
-            self.step_text = text
-            prog = STEP_PROGRESS.get(text)
+            self.step_text = clean_text
+            prog = STEP_PROGRESS.get(raw) or STEP_PROGRESS.get(clean_text)
             if prog is not None:
                 self.progress = prog
                 if not self.glass.closed:
-                    self.glass.update_step(text, prog)
-            if text.startswith("✅"):
+                    self.glass.update_step(clean_text, prog)
+            if raw.startswith("✅"):
                 self.status_level = "ok"
-            elif text.startswith("❌"):
+            elif raw.startswith("❌"):
                 self.status_level = "err"
-            elif text.startswith("⏹"):
+            elif raw.startswith("⏹"):
                 self.status_level = "stopped"
             elif self.job_running or self.capture_running:
                 self.status_level = "running"
@@ -152,7 +163,7 @@ class _SheetMateController:
     def _on_login_prompt_show(self):
         with self._lock:
             self.need_login_prompt = True
-        self._on_log("⏳ 请在弹出的浏览器中扫码登录 WPS，登录完成后将自动继续")
+        self._on_log("请在弹出的浏览器中扫码登录 WPS，完成后将自动继续")
 
     def _on_login_prompt_close(self):
         with self._lock:
@@ -217,7 +228,7 @@ class _SheetMateController:
             self.progress = 0.02
             self.step_text = "准备开始手动任务…"
         threading.Thread(target=self._run_once_worker, args=("手动", True), daemon=True).start()
-        return True, "已开始运行"
+        return True, "已开始全流程任务"
 
     def start_capture_only(self):
         with self._lock:
@@ -235,41 +246,41 @@ class _SheetMateController:
 
     def _run_once_worker(self, round_name, owns_lock=True):
         self.glass.show()
-        self.glass.update_step(f"正在跑第 {round_name} 轮…", 0.02)
+        self.glass.update_step(f"正在运行第 {round_name} 轮…", 0.02)
         try:
             run_cfg = self.get_config()
             if isinstance(round_name, int) and not self.app.capture_allowed_now(run_cfg):
                 run_cfg["enable_capture"] = False
                 run_cfg["enable_dingtalk"] = False
                 self.app.log("  当前不在截图发送时段，本轮只下载并更新表格")
-                self._on_step("🕒 不在截图发送时段，仅更新表格")
+                self._on_step("不在发群时段，仅更新表格")
             self.app.run_once(round_name, run_cfg)
-            done_text = "✅ 手动任务已完成" if not isinstance(round_name, int) else f"✅ 第 {round_name} 轮已完成"
+            done_text = "手动任务已完成" if not isinstance(round_name, int) else f"第 {round_name} 轮已完成"
             with self._lock:
                 self.status_level = "ok"
                 self.step_text = done_text
                 self.progress = 1.0
                 self.error_text = ""
-            self.glass.finish("✅ 本轮跑完")
+            self.glass.finish("本轮已完成")
             self.glass.close(1100)
         except Exception as exc:
             if "手动停止" in str(exc):
-                self.app.log("⏹ 已手动停止")
+                self.app.log("已手动停止")
                 with self._lock:
                     self.status_level = "stopped"
-                    self.step_text = "⏹ 已停止"
+                    self.step_text = "已手动停止"
                     self.error_text = ""
-                self.glass.fail("⏹ 已手动停止")
+                self.glass.fail("已手动停止")
                 self.glass.close(700)
             else:
                 self.app.log_error(exc, f"执行失败-{round_name}")
-                tip = self.app.human_error(exc)
+                tip = _strip_symbols(self.app.human_error(exc))
                 self.app.log(f"❌ 本轮失败：{tip}")
                 with self._lock:
                     self.status_level = "err"
-                    self.step_text = "❌ 运行失败，请看下方说明"
+                    self.step_text = "运行失败，请查看详情"
                     self.error_text = tip
-                self.glass.fail("❌ " + tip)
+                self.glass.fail(tip)
                 self.glass.close(1800)
         finally:
             with self._lock:
@@ -289,29 +300,29 @@ class _SheetMateController:
             self.app.run_capture_only("截图", run_cfg)
             with self._lock:
                 self.status_level = "ok"
-                self.step_text = "✅ 截图发送完成"
+                self.step_text = "截图发送已完成"
                 self.progress = 1.0
                 self.error_text = ""
-            self.glass.finish("✅ 截图发送完成")
+            self.glass.finish("截图发送已完成")
             self.glass.close(1400)
         except Exception as exc:
             if "手动停止" in str(exc):
-                self.app.log("⏹ 已手动停止")
+                self.app.log("已手动停止")
                 with self._lock:
                     self.status_level = "stopped"
-                    self.step_text = "⏹ 已停止"
+                    self.step_text = "已手动停止"
                     self.error_text = ""
-                self.glass.fail("⏹ 已手动停止")
+                self.glass.fail("已手动停止")
                 self.glass.close(700)
             else:
                 self.app.log_error(exc, "独立截图失败")
-                tip = self.app.human_error(exc)
+                tip = _strip_symbols(self.app.human_error(exc))
                 self.app.log(f"❌ 独立截图失败：{tip}")
                 with self._lock:
                     self.status_level = "err"
-                    self.step_text = "❌ 截图发送失败"
+                    self.step_text = "截图发送失败"
                     self.error_text = tip
-                self.glass.fail("❌ " + tip)
+                self.glass.fail(tip)
                 self.glass.close(1800)
         finally:
             with self._lock:
@@ -357,20 +368,14 @@ class _SheetMateController:
         return True, "已开启自动值守", True
 
     def _compute_next_slot_start(self, cfg, now_ts):
-        """计算不在任何运行窗口内时，下一个有效窗口的精确开始时间戳。"""
-        slots = [
-            f"{cfg['day']['sh']:02d}:{cfg['day']['sm']:02d}",
-        ]
+        slots = [f"{cfg['day']['sh']:02d}:{cfg['day']['sm']:02d}"]
         if cfg.get("night_enabled", True):
             slots.append(f"{cfg['night']['sh']:02d}:{cfg['night']['sm']:02d}")
-        slot_ends = {
-            slots[0]: f"{cfg['day']['eh']:02d}:{cfg['day']['em']:02d}",
-        }
+        slot_ends = {slots[0]: f"{cfg['day']['eh']:02d}:{cfg['day']['em']:02d}"}
         if len(slots) > 1:
             slot_ends[slots[1]] = f"{cfg['night']['eh']:02d}:{cfg['night']['em']:02d}"
 
         day_mode = cfg.get("day_mode", "daily")
-        # 逐分钟向前探查最多 4 天，精准兼容跨夜及仅工作日
         base_min = int(now_ts // 60) * 60
         for offset_min in range(1, 4 * 24 * 60):
             ts = base_min + offset_min * 60
@@ -395,7 +400,7 @@ class _SheetMateController:
                 with self._lock:
                     if not self.job_running and not self.capture_running:
                         self.status_level = "idle"
-                        self.step_text = "今天是非工作日，自动值守休眠中"
+                        self.step_text = "非工作日，自动值守休眠中"
                     self.next_run_ts = nxt
                     self.next_run_str = time.strftime("%m-%d %H:%M", time.localtime(nxt)) if nxt else "—"
                 for _ in range(10):
@@ -450,7 +455,7 @@ class _SheetMateController:
             next_ts = (last_run_start + interval_sec) if last_run_start else now_ts
             with self._lock:
                 if not self.job_running and not self.capture_running:
-                    slot_label = "白天" if slot == "day" else "晚上"
+                    slot_label = "白天" if slot == "day" else "夜间"
                     self.status_level = "idle"
                     self.step_text = f"自动值守中（{slot_label}时段）"
                 self.next_run_ts = next_ts
@@ -467,59 +472,75 @@ class _SheetMateController:
             self.next_run_str = "—"
             if not self.job_running and not self.capture_running:
                 self.status_level = "stopped"
-                self.step_text = "⏹ 自动值守已停止"
+                self.step_text = "自动值守已停止"
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<title>📊暗号表助手</title>
+<title>暗号表助手</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0%25' stop-color='%23007AFF'/%3E%3Cstop offset='100%25' stop-color='%235856D6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='15' fill='url(%23g)'/%3E%3Crect x='14' y='34' width='9' height='16' rx='3' fill='white'/%3E%3Crect x='27.5' y='24' width='9' height='26' rx='3' fill='white'/%3E%3Crect x='41' y='14' width='9' height='36' rx='3' fill='white'/%3E%3C/svg%3E" />
 <style>
   :root {
     --bg: #F2F2F7;
     --nav: rgba(242, 242, 247, 0.78);
+    --tabbar: rgba(249, 249, 251, 0.86);
     --card: #FFFFFF;
-    --card-soft: #F9F9FB;
+    --card-press: #F5F5F8;
     --sep: rgba(60, 60, 67, 0.12);
+    --sep-strong: rgba(60, 60, 67, 0.22);
     --text: #000000;
     --text-2: #3C3C43;
     --sub: #8E8E93;
-    --pill: rgba(120, 120, 128, 0.12);
-    --pill-blue: rgba(0, 122, 255, 0.11);
-    --switch-off: rgba(120, 120, 128, 0.24);
+    --sub-2: #AEAEB2;
+    --fill: rgba(120, 120, 128, 0.12);
+    --fill-2: rgba(120, 120, 128, 0.08);
+    --pill-blue: rgba(0, 122, 255, 0.10);
+    --switch-off: rgba(120, 120, 128, 0.20);
     --shadow: 0 2px 14px rgba(0, 0, 0, 0.045);
-    --sheet-bg: rgba(255, 255, 255, 0.92);
-    --log-bg: #F6F7FA;
+    --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.12);
+    --sheet-bg: rgba(255, 255, 255, 0.94);
     --blue: #007AFF;
     --green: #34C759;
     --orange: #FF9500;
     --red: #FF3B30;
     --indigo: #5856D6;
+    --teal: #32ADE6;
+    --purple: #AF52DE;
+    --pink: #FF2D55;
     --spring: cubic-bezier(0.32, 0.72, 0, 1);
   }
   [data-theme="dark"] {
     --bg: #000000;
-    --nav: rgba(18, 18, 20, 0.78);
+    --nav: rgba(16, 16, 18, 0.82);
+    --tabbar: rgba(22, 22, 24, 0.88);
     --card: #1C1C1E;
-    --card-soft: #242426;
-    --sep: rgba(255, 255, 255, 0.13);
+    --card-press: #262629;
+    --sep: rgba(84, 84, 88, 0.42);
+    --sep-strong: rgba(84, 84, 88, 0.65);
     --text: #FFFFFF;
     --text-2: #EBEBF5;
     --sub: #8E8E93;
-    --pill: rgba(120, 120, 128, 0.28);
-    --pill-blue: rgba(10, 132, 255, 0.22);
-    --switch-off: rgba(120, 120, 128, 0.36);
+    --sub-2: #636366;
+    --fill: rgba(120, 120, 128, 0.28);
+    --fill-2: rgba(120, 120, 128, 0.18);
+    --pill-blue: rgba(10, 132, 255, 0.18);
+    --switch-off: rgba(120, 120, 128, 0.34);
     --shadow: 0 4px 20px rgba(0, 0, 0, 0.45);
-    --sheet-bg: rgba(30, 30, 34, 0.92);
-    --log-bg: #141416;
+    --shadow-lg: 0 18px 40px rgba(0, 0, 0, 0.55);
+    --sheet-bg: rgba(28, 28, 30, 0.94);
     --blue: #0A84FF;
     --green: #30D158;
     --orange: #FF9F0A;
     --red: #FF453A;
     --indigo: #5E5CE6;
+    --teal: #64D2FF;
+    --purple: #BF5AF2;
+    --pink: #FF375F;
   }
+
   * {
     box-sizing: border-box;
     -webkit-tap-highlight-color: transparent;
@@ -527,94 +548,274 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   html, body {
     margin: 0;
     padding: 0;
+    min-height: 100vh;
     background: var(--bg);
     color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "PingFang SC", "Microsoft YaHei UI", "Segoe UI Emoji", "Apple Color Emoji", sans-serif;
+    font-family: "SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", "Microsoft YaHei UI", sans-serif;
     font-size: 14px;
     line-height: 1.4;
+    letter-spacing: -0.01em;
     -webkit-font-smoothing: antialiased;
     overflow-x: hidden;
     user-select: none;
   }
-  ::-webkit-scrollbar { width: 5px; height: 5px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: rgba(142, 142, 147, 0.35); border-radius: 99px; }
-
-  /* 顶部毛玻璃导航栏 */
-  .nav {
-    position: sticky;
+  body::before {
+    content: "";
+    position: fixed;
     top: 0;
-    z-index: 40;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 16px;
-    background: var(--nav);
-    backdrop-filter: saturate(180%) blur(24px);
-    -webkit-backdrop-filter: saturate(180%) blur(24px);
-    border-bottom: 0.5px solid var(--sep);
+    left: 0;
+    right: 0;
+    height: 220px;
+    background: radial-gradient(120% 200px at 50% 0%, rgba(0, 122, 255, 0.08), rgba(88, 86, 214, 0.03) 58%, transparent 100%);
+    pointer-events: none;
+    z-index: 0;
   }
-  .nav-left {
-    display: flex;
-    align-items: center;
-    gap: 10px;
+  [data-theme="dark"] body::before {
+    background: radial-gradient(120% 200px at 50% 0%, rgba(10, 132, 255, 0.14), rgba(94, 92, 230, 0.06) 58%, transparent 100%);
   }
-  .app-icon {
-    width: 34px;
-    height: 34px;
-    border-radius: 9px;
-    box-shadow: 0 3px 10px rgba(0, 122, 255, 0.25);
-    flex-shrink: 0;
-  }
-  .app-title-wrap {
+
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(142, 142, 147, 0.30); border-radius: 99px; }
+
+  .shell {
+    position: relative;
+    z-index: 1;
+    max-width: 430px;
+    margin: 0 auto;
+    min-height: 100vh;
     display: flex;
     flex-direction: column;
   }
-  .app-title {
+
+  /* 顶部毛玻璃导航 + 灵动岛 */
+  .top-header {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    padding: 10px 16px 10px;
+    background: var(--nav);
+    backdrop-filter: saturate(190%) blur(28px);
+    -webkit-backdrop-filter: saturate(190%) blur(28px);
+    border-bottom: 0.5px solid var(--sep);
+  }
+
+  .island-slot {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 10px;
+  }
+  .island {
+    background: #0B0B0D;
+    color: #FFFFFF;
+    border-radius: 999px;
+    padding: 7px 14px;
+    min-width: 196px;
+    max-width: 100%;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.18), inset 0 0 0 0.5px rgba(255, 255, 255, 0.14);
+    transition: all 0.36s var(--spring);
+  }
+  .island.expanded {
+    width: 100%;
+    border-radius: 22px;
+    padding: 12px 14px;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.24), inset 0 0 0 0.5px rgba(255, 255, 255, 0.16);
+  }
+  .island-top {
     display: flex;
     align-items: center;
-    gap: 6px;
-    font-size: 16px;
-    font-weight: 700;
-    letter-spacing: -0.3px;
+    justify-content: space-between;
+    gap: 10px;
   }
-  .ver-badge {
-    font-size: 10px;
+  .island-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    flex: 1;
+  }
+  .island-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #30D158;
+    box-shadow: 0 0 0 3px rgba(48, 209, 88, 0.22);
+    flex-shrink: 0;
+    transition: background 0.25s;
+  }
+  .island-dot.err { background: #FF453A; box-shadow: 0 0 0 3px rgba(255, 69, 58, 0.25); }
+  .island-dot.stopped { background: #8E8E93; box-shadow: none; }
+  .island-dot.sched {
+    background: #30D158;
+    animation: dot-breathe 1.8s ease-in-out infinite;
+  }
+  @keyframes dot-breathe {
+    0%, 100% { box-shadow: 0 0 0 2px rgba(48, 209, 88, 0.22); }
+    50% { box-shadow: 0 0 0 5px rgba(48, 209, 88, 0.42); }
+  }
+
+  .ios-spinner {
+    position: relative;
+    width: 15px;
+    height: 15px;
+    flex-shrink: 0;
+    display: none;
+  }
+  .island.busy .ios-spinner { display: block; }
+  .island.busy .island-dot { display: none; }
+  .ios-spinner div {
+    position: absolute;
+    left: 46%;
+    top: 4%;
+    width: 10%;
+    height: 28%;
+    background: #FFFFFF;
+    border-radius: 50px;
+    transform-origin: center 165%;
+    animation: ios-spin 0.9s linear infinite;
+  }
+  @keyframes ios-spin {
+    0% { opacity: 1; }
+    100% { opacity: 0.16; }
+  }
+
+  .island-text {
+    font-size: 12.5px;
     font-weight: 600;
-    padding: 1px 6px;
-    border-radius: 99px;
+    color: rgba(255, 255, 255, 0.95);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .island-pill-tag {
+    font-size: 11px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.7);
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }
+  .island-stop {
+    display: none;
+    border: none;
+    background: #FF453A;
+    color: #FFFFFF;
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 999px;
+    cursor: pointer;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .island.busy .island-stop { display: inline-flex; }
+  .island.busy .island-pill-tag { display: none; }
+  .island-stop:active { transform: scale(0.92); }
+
+  .island-prog {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    margin-top: 9px;
+  }
+  .island.busy .island-prog { display: flex; }
+  .island-track {
+    flex: 1;
+    height: 4.5px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.18);
+    overflow: hidden;
+  }
+  .island-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #0A84FF, #30D158);
+    transition: width 0.35s var(--spring);
+  }
+  .island-pct {
+    font-size: 11px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.85);
+    min-width: 30px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .island-alert {
+    display: none;
+    margin-top: 8px;
+    padding: 7px 10px;
+    border-radius: 12px;
+    font-size: 11.5px;
+    font-weight: 500;
+    line-height: 1.35;
+    word-break: break-word;
+  }
+  .island-alert.err {
+    display: block;
+    background: rgba(255, 69, 58, 0.22);
+    color: #FF8A84;
+  }
+  .island-alert.login {
+    display: block;
+    background: rgba(10, 132, 255, 0.24);
+    color: #7CC4FF;
+  }
+
+  /* iOS Large Title Bar */
+  .nav-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .large-title-wrap {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .large-title {
+    margin: 0;
+    font-size: 25px;
+    font-weight: 700;
+    letter-spacing: -0.6px;
+    color: var(--text);
+  }
+  .ver-pill {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
     background: var(--pill-blue);
     color: var(--blue);
-  }
-  .app-sub {
-    font-size: 11px;
-    color: var(--sub);
+    font-variant-numeric: tabular-nums;
   }
   .nav-actions {
     display: flex;
     align-items: center;
     gap: 8px;
   }
-  .icon-pill-btn {
+  .nav-circle-btn {
     position: relative;
     width: 32px;
     height: 32px;
     border: none;
     border-radius: 50%;
-    background: var(--pill);
+    background: var(--fill);
     color: var(--text);
     display: flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    font-size: 15px;
-    transition: transform 0.18s var(--spring), background 0.2s;
+    transition: transform 0.16s var(--spring), background 0.2s;
   }
-  .icon-pill-btn:active { transform: scale(0.9); }
+  .nav-circle-btn:active { transform: scale(0.9); }
+  .nav-circle-btn svg { width: 16px; height: 16px; }
   .update-dot {
     position: absolute;
-    top: 4px;
-    right: 4px;
+    top: 3px;
+    right: 3px;
     width: 7px;
     height: 7px;
     border-radius: 50%;
@@ -622,323 +823,288 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     display: none;
   }
 
-  /* 主体容器 */
-  .container {
-    max-width: 540px;
-    margin: 0 auto;
-    padding: 12px 14px 36px;
+  /* 主内容滚动区 */
+  .main-content {
+    flex: 1;
+    padding: 14px 16px 94px;
+  }
+  .tab-pane {
+    display: none;
+    flex-direction: column;
+    gap: 18px;
+    animation: pane-in 0.22s var(--spring);
+  }
+  .tab-pane.active { display: flex; }
+  @keyframes pane-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Shortcuts 风格主运行卡 */
+  .hero-action {
+    border: none;
+    width: 100%;
+    text-align: left;
+    border-radius: 20px;
+    padding: 18px 18px;
+    background: linear-gradient(135deg, #007AFF 0%, #1B64F2 52%, #4C46D6 100%);
+    color: #FFFFFF;
+    box-shadow: 0 10px 26px rgba(0, 122, 255, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    cursor: pointer;
+    transition: transform 0.18s var(--spring), opacity 0.2s;
+  }
+  .hero-action:active:not(:disabled) { transform: scale(0.975); }
+  .hero-action:disabled { opacity: 0.55; cursor: not-allowed; }
+  .hero-copy {
     display: flex;
     flex-direction: column;
-    gap: 14px;
-  }
-
-  /* 灵动岛实时活动卡片 */
-  .live-card {
-    background: var(--card);
-    border-radius: 22px;
-    padding: 14px 16px;
-    box-shadow: var(--shadow);
-    border: 0.5px solid var(--sep);
-    transition: background 0.3s, border-color 0.3s, transform 0.25s var(--spring);
-  }
-  .live-card.running {
-    background: linear-gradient(135deg, #161A23 0%, #1C2436 100%);
-    color: #FFFFFF;
-    border-color: rgba(10, 132, 255, 0.35);
-  }
-  .live-top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-  }
-  .live-status {
-    display: flex;
-    align-items: center;
-    gap: 10px;
+    gap: 4px;
     min-width: 0;
-    flex: 1;
   }
-  .status-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background: var(--green);
-    flex-shrink: 0;
-    box-shadow: 0 0 0 3px rgba(52, 199, 89, 0.2);
+  .hero-title {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -0.3px;
   }
-  .status-dot.err { background: var(--red); box-shadow: 0 0 0 3px rgba(255, 59, 48, 0.2); }
-  .status-dot.stopped { background: var(--sub); box-shadow: none; }
-
-  /* iOS 菊花加载器 */
-  .ios-spinner {
-    position: relative;
-    width: 18px;
-    height: 18px;
-    flex-shrink: 0;
-    display: none;
-  }
-  .live-card.running .ios-spinner { display: block; }
-  .live-card.running .status-dot { display: none; }
-  .ios-spinner div {
-    position: absolute;
-    left: 46%;
-    top: 3%;
-    width: 10%;
-    height: 28%;
-    background: #FFFFFF;
-    border-radius: 50px;
-    transform-origin: center 170%;
-    animation: ios-spin 0.9s linear infinite;
-  }
-  @keyframes ios-spin {
-    0% { opacity: 1; }
-    100% { opacity: 0.15; }
-  }
-  .step-title {
-    font-size: 15px;
-    font-weight: 600;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .stop-btn {
-    display: none;
-    border: none;
-    background: var(--red);
-    color: #FFFFFF;
-    font-size: 12px;
-    font-weight: 600;
-    padding: 5px 12px;
-    border-radius: 99px;
-    cursor: pointer;
-    flex-shrink: 0;
-    transition: transform 0.16s var(--spring);
-  }
-  .live-card.running .stop-btn { display: inline-flex; align-items: center; gap: 4px; }
-  .stop-btn:active { transform: scale(0.92); }
-
-  .progress-wrap {
-    margin-top: 11px;
-    display: none;
-    align-items: center;
-    gap: 10px;
-  }
-  .live-card.running .progress-wrap { display: flex; }
-  .progress-track {
-    flex: 1;
-    height: 5px;
-    background: rgba(255, 255, 255, 0.16);
-    border-radius: 99px;
-    overflow: hidden;
-  }
-  .progress-fill {
-    height: 100%;
-    width: 0%;
-    border-radius: 99px;
-    background: linear-gradient(90deg, #0A84FF, #30D158);
-    transition: width 0.35s var(--spring);
-  }
-  .progress-pct {
-    font-size: 11px;
-    font-weight: 600;
+  .hero-sub {
+    font-size: 12.5px;
     color: rgba(255, 255, 255, 0.85);
-    min-width: 32px;
-    text-align: right;
   }
-
-  .live-meta {
-    margin-top: 10px;
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .meta-pill {
-    flex: 1;
-    min-width: 140px;
-    background: var(--pill);
-    border-radius: 10px;
-    padding: 6px 10px;
+  .hero-play {
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.22);
+    backdrop-filter: blur(8px);
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    font-size: 11px;
+    justify-content: center;
+    flex-shrink: 0;
   }
-  .live-card.running .meta-pill {
-    background: rgba(255, 255, 255, 0.1);
-    color: rgba(255, 255, 255, 0.88);
-  }
-  .meta-pill span:first-child { color: var(--sub); }
-  .live-card.running .meta-pill span:first-child { color: rgba(255, 255, 255, 0.6); }
-  .meta-val { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .hero-play svg { width: 18px; height: 18px; color: #FFFFFF; margin-left: 2px; }
 
-  .error-banner {
-    display: none;
-    margin-top: 10px;
-    padding: 8px 11px;
-    border-radius: 11px;
-    background: rgba(255, 59, 48, 0.12);
-    color: var(--red);
-    font-size: 12px;
-    font-weight: 500;
-    word-break: break-word;
-  }
-  .login-banner {
-    display: none;
-    margin-top: 10px;
-    padding: 8px 11px;
-    border-radius: 11px;
-    background: rgba(0, 122, 255, 0.18);
-    color: #5AC8FA;
-    font-size: 12px;
-    font-weight: 600;
-  }
-
-  /* 控制中心三大触感按钮 */
-  .cc-grid {
+  /* 双栏控制中心磁贴 */
+  .tile-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 10px;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
   }
-  .cc-btn {
+  .cc-tile {
     border: 0.5px solid var(--sep);
     background: var(--card);
     color: var(--text);
     border-radius: 18px;
-    padding: 13px 10px 12px;
+    padding: 15px 14px 14px;
     box-shadow: var(--shadow);
     cursor: pointer;
     display: flex;
     flex-direction: column;
     align-items: flex-start;
-    gap: 7px;
+    gap: 10px;
     text-align: left;
-    transition: transform 0.18s var(--spring), background 0.25s, opacity 0.2s, box-shadow 0.25s;
+    transition: transform 0.18s var(--spring), background 0.25s, border-color 0.25s, box-shadow 0.25s;
   }
-  .cc-btn:active:not(:disabled) { transform: scale(0.95); }
-  .cc-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-  .cc-ico {
-    width: 34px;
-    height: 34px;
+  .cc-tile:active:not(:disabled) { transform: scale(0.96); }
+  .cc-tile:disabled { opacity: 0.5; cursor: not-allowed; }
+  .tile-ico {
+    width: 36px;
+    height: 36px;
     border-radius: 50%;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 15px;
     color: #FFFFFF;
   }
-  .cc-ico.blue { background: var(--blue); }
-  .cc-ico.orange { background: var(--orange); }
-  .cc-ico.green { background: var(--green); }
-  .cc-title { font-size: 13px; font-weight: 700; }
-  .cc-sub { font-size: 10.5px; color: var(--sub); line-height: 1.2; }
+  .tile-ico svg { width: 18px; height: 18px; }
+  .tile-ico.orange { background: var(--orange); }
+  .tile-ico.green { background: var(--green); }
+  .tile-title { font-size: 14.5px; font-weight: 700; letter-spacing: -0.2px; }
+  .tile-sub { font-size: 11.5px; color: var(--sub); line-height: 1.3; }
 
-  .cc-btn.schedule-on {
-    background: linear-gradient(135deg, #28CD41 0%, #34C759 100%);
+  .cc-tile.schedule-on {
+    background: linear-gradient(145deg, #34C759 0%, #248A3D 100%);
     color: #FFFFFF;
     border-color: transparent;
-    box-shadow: 0 6px 18px rgba(52, 199, 89, 0.35);
+    box-shadow: 0 8px 22px rgba(52, 199, 89, 0.30);
   }
-  .cc-btn.schedule-on .cc-ico {
-    background: rgba(255, 255, 255, 0.25);
-    animation: pulse-ring 2s infinite;
+  .cc-tile.schedule-on .tile-ico {
+    background: rgba(255, 255, 255, 0.24);
   }
-  .cc-btn.schedule-on .cc-sub { color: rgba(255, 255, 255, 0.88); }
-  @keyframes pulse-ring {
-    0%, 100% { transform: scale(1); }
-    50% { transform: scale(1.07); }
+  .cc-tile.schedule-on .tile-sub {
+    color: rgba(255, 255, 255, 0.88);
   }
 
-  /* iOS 分组列表 */
+  /* iOS 18 设置分组列表 */
+  .section-wrap {
+    display: flex;
+    flex-direction: column;
+  }
   .section-head {
-    padding: 0 12px 4px;
-    font-size: 12px;
-    font-weight: 600;
+    padding: 0 14px 6px;
+    font-size: 12.5px;
+    font-weight: 500;
     color: var(--sub);
     display: flex;
     align-items: center;
     justify-content: space-between;
   }
+  .section-footer {
+    padding: 7px 14px 0;
+    font-size: 12px;
+    color: var(--sub);
+    line-height: 1.45;
+  }
+  .section-footer.warn { color: var(--orange); }
+
   .ios-group {
     background: var(--card);
-    border-radius: 16px;
+    border-radius: 14px;
     box-shadow: var(--shadow);
     border: 0.5px solid var(--sep);
     overflow: hidden;
   }
+
   .ios-row {
+    position: relative;
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: 12px;
     padding: 11px 14px;
-    min-height: 46px;
-    position: relative;
+    min-height: 48px;
+    background: var(--card);
+    transition: background 0.15s;
   }
+  .ios-row.clickable { cursor: pointer; }
+  .ios-row.clickable:active { background: var(--card-press); }
   .ios-row + .ios-row::before {
     content: "";
     position: absolute;
-    left: 14px;
+    left: 56px;
     right: 0;
     top: 0;
     height: 0.5px;
     background: var(--sep);
   }
-  .row-col {
+  .ios-row.no-icon-sep + .ios-row::before {
+    left: 14px;
+  }
+
+  /* Apple 30x30 连续圆角方形 SF 图标块 */
+  .sf-badge {
+    width: 30px;
+    height: 30px;
+    border-radius: 7.5px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #FFFFFF;
+    flex-shrink: 0;
+    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.25);
+  }
+  .sf-badge svg { width: 17px; height: 17px; }
+  .sf-blue { background: linear-gradient(180deg, #0A84FF, #007AFF); }
+  .sf-green { background: linear-gradient(180deg, #32D74B, #28CD41); }
+  .sf-indigo { background: linear-gradient(180deg, #6E6CEB, #5856D6); }
+  .sf-orange { background: linear-gradient(180deg, #FFA726, #FF9500); }
+  .sf-teal { background: linear-gradient(180deg, #5AC8FA, #32ADE6); }
+  .sf-purple { background: linear-gradient(180deg, #BF5AF2, #AF52DE); }
+  .sf-pink { background: linear-gradient(180deg, #FF375F, #FF2D55); }
+  .sf-red { background: linear-gradient(180deg, #FF453A, #FF3B30); }
+  .sf-gray { background: linear-gradient(180deg, #98989D, #8E8E93); }
+
+  .row-main {
+    flex: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    min-width: 0;
-    flex: 1;
+    gap: 1.5px;
   }
-  .row-label {
-    font-size: 14px;
+  .row-title {
+    font-size: 14.5px;
     font-weight: 500;
+    color: var(--text);
+  }
+  .row-sub {
+    font-size: 12px;
+    color: var(--sub);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .row-right {
     display: flex;
     align-items: center;
     gap: 6px;
+    flex-shrink: 0;
+    max-width: 52%;
   }
-  .row-desc {
-    font-size: 11.5px;
+  .row-val {
+    font-size: 13.5px;
     color: var(--sub);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-variant-numeric: tabular-nums;
   }
-
-  /* 滑块分段控制器 */
-  .segmented {
-    position: relative;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    background: var(--pill);
-    border-radius: 10px;
-    padding: 2.5px;
-    min-width: 176px;
-  }
-  .seg-thumb {
-    position: absolute;
-    top: 2.5px;
-    bottom: 2.5px;
-    left: 2.5px;
-    width: calc(50% - 2.5px);
-    background: var(--card);
-    border-radius: 8px;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+  .chevron-svg {
+    width: 13px;
+    height: 13px;
+    color: var(--sub-2);
+    flex-shrink: 0;
     transition: transform 0.25s var(--spring);
   }
-  [data-theme="dark"] .seg-thumb { background: #3A3A3C; }
-  .seg-btn {
-    position: relative;
-    z-index: 1;
-    border: none;
-    background: transparent;
-    color: var(--text);
-    font-size: 12.5px;
-    font-weight: 600;
-    padding: 5px 10px;
-    cursor: pointer;
-    text-align: center;
-  }
 
-  /* 苹果弹簧开关 51x31 */
+  /* 内联清爽无框输入框 */
+  .field-inline {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+  }
+  .field-inline input {
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--blue);
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    text-align: right;
+    text-overflow: ellipsis;
+    width: 100%;
+    min-width: 0;
+    user-select: text;
+  }
+  .field-inline input::placeholder {
+    color: var(--sub-2);
+    font-weight: 400;
+  }
+  .field-inline input.left-align {
+    text-align: left;
+    color: var(--text);
+  }
+  .clear-circle {
+    border: none;
+    padding: 0;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--sub-2);
+    color: #FFFFFF;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .clear-circle svg { width: 10px; height: 10px; }
+
+  /* 苹果 51x31 弹簧开关 */
   .ios-switch {
     position: relative;
     display: inline-block;
@@ -957,7 +1123,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     cursor: pointer;
     background: var(--switch-off);
     border-radius: 31px;
-    transition: background 0.25s var(--spring);
+    transition: background 0.24s var(--spring);
   }
   .ios-slider::before {
     content: "";
@@ -968,24 +1134,62 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     top: 2px;
     background: #FFFFFF;
     border-radius: 50%;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.20), 0 0 1px rgba(0, 0, 0, 0.08);
     transition: transform 0.26s var(--spring);
   }
   .ios-switch input:checked + .ios-slider { background: var(--green); }
   .ios-switch input:checked + .ios-slider::before { transform: translateX(20px); }
 
-  /* 时间胶囊 & 间隔选择 */
+  /* 滑块分段控件 */
+  .segmented {
+    position: relative;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    background: var(--fill);
+    border-radius: 9px;
+    padding: 2px;
+    min-width: 158px;
+  }
+  .seg-thumb {
+    position: absolute;
+    top: 2px;
+    bottom: 2px;
+    left: 2px;
+    width: calc(50% - 2px);
+    background: var(--card);
+    border-radius: 7px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+    transition: transform 0.26s var(--spring);
+  }
+  [data-theme="dark"] .seg-thumb { background: #3A3A3C; }
+  .seg-btn {
+    position: relative;
+    z-index: 1;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 5px 10px;
+    cursor: pointer;
+    text-align: center;
+  }
+
+  /* 时段卡片与纯苹果胶囊（无原生 ugly select / time input） */
   .slot-block {
+    position: relative;
     padding: 12px 14px;
     display: flex;
     flex-direction: column;
     gap: 10px;
-    position: relative;
   }
-  .slot-block + .slot-block::before {
+  .slot-block + .slot-block::before,
+  .ios-row + .slot-block::before,
+  .slot-block + .ios-row::before {
     content: "";
     position: absolute;
-    left: 14px;
+    left: 56px;
     right: 0;
     top: 0;
     height: 0.5px;
@@ -995,118 +1199,54 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 10px;
   }
-  .slot-body {
+  .slot-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .slot-controls {
     display: flex;
     align-items: center;
     justify-content: space-between;
     flex-wrap: wrap;
     gap: 8px;
+    padding-left: 42px;
     transition: opacity 0.2s;
   }
-  .slot-body.disabled {
-    opacity: 0.42;
+  .slot-controls.disabled {
+    opacity: 0.38;
     pointer-events: none;
   }
-  .time-range {
+  .pill-pair {
     display: flex;
     align-items: center;
     gap: 6px;
   }
-  .time-pill {
+  .ios-pill-btn {
     border: none;
-    outline: none;
     background: var(--pill-blue);
     color: var(--blue);
     font-family: inherit;
     font-size: 13.5px;
-    font-weight: 700;
-    padding: 5px 9px;
+    font-weight: 600;
+    padding: 5px 11px;
     border-radius: 9px;
     cursor: pointer;
     font-variant-numeric: tabular-nums;
+    transition: transform 0.14s var(--spring), background 0.16s;
   }
-  .gap-wrap {
-    display: flex;
-    align-items: center;
-    gap: 4px;
+  .ios-pill-btn:active { transform: scale(0.94); }
+  .ios-pill-btn.neutral {
+    background: var(--fill);
+    color: var(--text);
+  }
+  .pill-sep {
     font-size: 12px;
     color: var(--sub);
   }
-  .gap-select {
-    border: none;
-    outline: none;
-    background: var(--pill);
-    color: var(--text);
-    font-family: inherit;
-    font-size: 12.5px;
-    font-weight: 600;
-    padding: 5px 7px;
-    border-radius: 8px;
-    cursor: pointer;
-  }
-  .overlap-tip {
-    display: none;
-    padding: 8px 14px;
-    background: rgba(255, 149, 0, 0.1);
-    color: var(--orange);
-    font-size: 11.5px;
-    line-height: 1.4;
-    border-top: 0.5px solid var(--sep);
-  }
 
-  /* 输入框 */
-  .field-wrap {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    background: var(--pill);
-    border-radius: 10px;
-    padding: 6px 10px;
-    width: 100%;
-    margin-top: 6px;
-  }
-  .field-wrap input {
-    border: none;
-    outline: none;
-    background: transparent;
-    color: var(--text);
-    font-family: inherit;
-    font-size: 13.5px;
-    width: 100%;
-    user-select: text;
-  }
-  .clear-btn {
-    border: none;
-    background: rgba(142, 142, 147, 0.35);
-    color: #FFFFFF;
-    width: 18px;
-    height: 18px;
-    border-radius: 50%;
-    font-size: 11px;
-    line-height: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    flex-shrink: 0;
-  }
-  .kw-preview {
-    margin-top: 6px;
-    font-size: 11.5px;
-    color: var(--blue);
-    background: var(--pill-blue);
-    border-radius: 8px;
-    padding: 5px 9px;
-    line-height: 1.35;
-  }
-  .msg-preview {
-    margin-top: 6px;
-    font-size: 11.5px;
-    color: var(--sub);
-  }
-
-  /* 手风琴折叠面板 */
   .accordion-body {
     max-height: 0;
     overflow: hidden;
@@ -1115,68 +1255,267 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .accordion-body.open {
     max-height: 460px;
   }
-  .chevron {
-    font-size: 12px;
-    color: var(--sub);
-    transition: transform 0.25s var(--spring);
-  }
-  .chevron.open { transform: rotate(90deg); }
 
-  /* 日志卡 */
+  /* 日志控制台 */
   .log-tools {
     display: flex;
     gap: 6px;
   }
-  .mini-pill-btn {
+  .mini-pill {
     border: none;
-    background: var(--pill);
+    background: var(--fill);
     color: var(--blue);
+    font-family: inherit;
     font-size: 11.5px;
     font-weight: 600;
-    padding: 3px 9px;
-    border-radius: 99px;
+    padding: 4px 10px;
+    border-radius: 999px;
     cursor: pointer;
   }
-  .mini-pill-btn.active { background: var(--blue); color: #FFFFFF; }
+  .mini-pill.active {
+    background: var(--blue);
+    color: #FFFFFF;
+  }
   .log-box {
-    background: var(--log-bg);
-    padding: 10px 12px;
-    height: 185px;
+    background: var(--card);
+    padding: 10px 14px;
+    height: 220px;
     overflow-y: auto;
-    font-family: "Cascadia Mono", "Consolas", "Microsoft YaHei UI", monospace;
+    font-family: "SF Mono", "Cascadia Mono", "Consolas", "Microsoft YaHei UI", monospace;
     font-size: 11.5px;
-    line-height: 1.5;
+    line-height: 1.55;
     user-select: text;
   }
-  .log-line { word-break: break-all; margin-bottom: 2px; }
-  .log-time { color: var(--sub); margin-right: 6px; }
-  .log-ok { color: var(--green); }
-  .log-err { color: var(--red); font-weight: 600; }
-  .log-warn { color: var(--orange); }
-  .log-head { color: var(--blue); font-weight: 600; }
+  .log-empty {
+    color: var(--sub);
+    text-align: center;
+    padding-top: 84px;
+    font-family: inherit;
+    font-size: 12.5px;
+  }
+  .log-line {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    margin-bottom: 3px;
+    word-break: break-all;
+  }
+  .log-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    margin-top: 6px;
+    flex-shrink: 0;
+    background: var(--sub-2);
+  }
+  .log-dot.ok { background: var(--green); }
+  .log-dot.err { background: var(--red); }
+  .log-dot.warn { background: var(--orange); }
+  .log-dot.head { background: var(--blue); }
+  .log-time { color: var(--sub); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+  .log-msg.ok { color: var(--green); font-weight: 500; }
+  .log-msg.err { color: var(--red); font-weight: 600; }
+  .log-msg.warn { color: var(--orange); }
+  .log-msg.head { color: var(--blue); font-weight: 600; }
 
-  /* 恢复默认设置 */
-  .reset-btn {
+  /* 独立红色 iOS 操作卡 */
+  .danger-card-btn {
     width: 100%;
     border: 0.5px solid var(--sep);
     background: var(--card);
     color: var(--red);
-    font-size: 14px;
-    font-weight: 600;
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 500;
     padding: 13px;
-    border-radius: 16px;
+    border-radius: 14px;
     box-shadow: var(--shadow);
     cursor: pointer;
-    transition: transform 0.16s var(--spring);
+    transition: background 0.15s, transform 0.16s var(--spring);
   }
-  .reset-btn:active { transform: scale(0.97); }
+  .danger-card-btn:active {
+    background: var(--card-press);
+    transform: scale(0.985);
+  }
+
+  /* 底部固定毛玻璃 4 栏 Tab Bar */
+  .tabbar-wrap {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 50;
+    display: flex;
+    justify-content: center;
+    pointer-events: none;
+  }
+  .tabbar {
+    pointer-events: auto;
+    width: 100%;
+    max-width: 430px;
+    height: 64px;
+    padding: 6px 8px 10px;
+    background: var(--tabbar);
+    backdrop-filter: saturate(190%) blur(28px);
+    -webkit-backdrop-filter: saturate(190%) blur(28px);
+    border-top: 0.5px solid var(--sep);
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    align-items: center;
+  }
+  .tab-btn {
+    border: none;
+    background: transparent;
+    color: var(--sub);
+    font-family: inherit;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    cursor: pointer;
+    padding: 2px 0;
+    transition: color 0.18s, transform 0.14s var(--spring);
+  }
+  .tab-btn:active { transform: scale(0.92); }
+  .tab-btn svg { width: 22px; height: 22px; }
+  .tab-btn span { font-size: 10.5px; font-weight: 500; }
+  .tab-btn.active { color: var(--blue); }
+  .tab-btn.active span { font-weight: 600; }
+
+  /* 底部毛玻璃滚轮选择器（替代原生 Ugly select & input[type=time]） */
+  .sheet-mask {
+    position: fixed;
+    inset: 0;
+    z-index: 85;
+    background: rgba(0, 0, 0, 0.34);
+    backdrop-filter: blur(4px);
+    display: none;
+    align-items: flex-end;
+    justify-content: center;
+  }
+  .sheet-mask.show { display: flex; }
+  .ios-sheet {
+    width: 100%;
+    max-width: 430px;
+    background: var(--sheet-bg);
+    backdrop-filter: saturate(190%) blur(32px);
+    -webkit-backdrop-filter: saturate(190%) blur(32px);
+    border-radius: 22px 22px 0 0;
+    box-shadow: var(--shadow-lg);
+    border-top: 0.5px solid var(--sep);
+    padding-bottom: 18px;
+    animation: sheet-up 0.26s var(--spring);
+  }
+  @keyframes sheet-up {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+  }
+  .sheet-handle {
+    width: 36px;
+    height: 4.5px;
+    border-radius: 999px;
+    background: var(--sep-strong);
+    margin: 9px auto 4px;
+  }
+  .sheet-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 16px 12px;
+    border-bottom: 0.5px solid var(--sep);
+  }
+  .sheet-btn {
+    border: none;
+    background: transparent;
+    color: var(--blue);
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 500;
+    cursor: pointer;
+    padding: 4px 6px;
+  }
+  .sheet-btn.done { font-weight: 700; }
+  .sheet-title { font-size: 15px; font-weight: 600; color: var(--text); }
+  .sheet-readout {
+    text-align: center;
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--text);
+    padding: 12px 16px 8px;
+    letter-spacing: -0.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .preset-row {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 7px;
+    padding: 0 16px 12px;
+  }
+  .preset-chip {
+    border: none;
+    background: var(--fill);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 5px 11px;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .preset-chip.active {
+    background: var(--blue);
+    color: #FFFFFF;
+  }
+  .wheel-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    padding: 0 20px;
+  }
+  .wheel-col-label {
+    text-align: center;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--sub);
+    margin-bottom: 6px;
+  }
+  .wheel-list {
+    height: 184px;
+    overflow-y: auto;
+    border-radius: 14px;
+    background: var(--fill-2);
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .wheel-opt {
+    border: none;
+    background: transparent;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 500;
+    padding: 7px 0;
+    border-radius: 9px;
+    cursor: pointer;
+    font-variant-numeric: tabular-nums;
+  }
+  .wheel-opt.selected {
+    background: var(--card);
+    color: var(--blue);
+    font-weight: 700;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+  }
 
   /* iOS 毛玻璃 Alert 弹窗 */
   .modal-mask {
     position: fixed;
     inset: 0;
-    z-index: 90;
-    background: rgba(0, 0, 0, 0.35);
+    z-index: 95;
+    background: rgba(0, 0, 0, 0.36);
     backdrop-filter: blur(6px);
     display: none;
     align-items: center;
@@ -1185,12 +1524,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .modal-mask.show { display: flex; }
   .ios-alert {
-    width: 290px;
+    width: 280px;
     background: var(--sheet-bg);
-    backdrop-filter: saturate(180%) blur(24px);
+    backdrop-filter: saturate(180%) blur(28px);
     border-radius: 16px;
     overflow: hidden;
-    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+    box-shadow: var(--shadow-lg);
     border: 0.5px solid var(--sep);
     animation: pop-in 0.22s var(--spring);
   }
@@ -1202,7 +1541,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     padding: 18px 16px 15px;
     text-align: center;
   }
-  .alert-title { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
+  .alert-title { font-size: 16px; font-weight: 700; margin-bottom: 5px; }
   .alert-msg { font-size: 13px; color: var(--text-2); line-height: 1.4; }
   .alert-actions {
     display: grid;
@@ -1214,7 +1553,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     border: none;
     background: transparent;
     padding: 12px 8px;
-    font-size: 15px;
+    font-family: inherit;
+    font-size: 15.5px;
     font-weight: 500;
     color: var(--blue);
     cursor: pointer;
@@ -1226,15 +1566,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   /* 顶部 Toast */
   .toast {
     position: fixed;
-    top: 14px;
+    top: 16px;
     left: 50%;
-    transform: translate(-50%, -70px);
+    transform: translate(-50%, -76px);
     z-index: 100;
     background: rgba(28, 28, 30, 0.92);
     color: #FFFFFF;
     backdrop-filter: blur(18px);
     padding: 8px 16px;
-    border-radius: 99px;
+    border-radius: 999px;
     font-size: 12.5px;
     font-weight: 600;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
@@ -1248,309 +1588,473 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <body>
   <div class="toast" id="toast">已保存</div>
 
-  <header class="nav">
-    <div class="nav-left">
-      <svg class="app-icon" viewBox="0 0 64 64" fill="none">
-        <defs>
-          <linearGradient id="g" x1="0" y1="0" x2="0" y2="64" gradientUnits="userSpaceOnUse">
-            <stop offset="0%" stop-color="#007AFF"/>
-            <stop offset="100%" stop-color="#FF9500"/>
-          </linearGradient>
-        </defs>
-        <rect width="64" height="64" rx="16" fill="url(#g)"/>
-        <rect x="14" y="34" width="9" height="16" rx="3" fill="white" fill-opacity="0.95"/>
-        <rect x="27.5" y="24" width="9" height="26" rx="3" fill="white" fill-opacity="0.95"/>
-        <rect x="41" y="14" width="9" height="36" rx="3" fill="white" fill-opacity="0.95"/>
-      </svg>
-      <div class="app-title-wrap">
-        <div class="app-title">
-          <span>暗号表助手</span>
-          <span class="ver-badge" id="verBadge">v2.0.0</span>
-        </div>
-        <div class="app-sub">自动下载 · 填表 · 汇总截图送达</div>
-      </div>
-    </div>
-    <div class="nav-actions">
-      <button class="icon-pill-btn" id="updateBtn" title="检查更新" style="display:none;">
-        <span>⬇</span><span class="update-dot" id="updateDot"></span>
-      </button>
-      <button class="icon-pill-btn" id="themeBtn" title="切换浅色/深色外观">🌓</button>
-    </div>
-  </header>
-
-  <main class="container">
-    <!-- 灵动岛实时活动卡 -->
-    <section class="live-card" id="liveCard">
-      <div class="live-top">
-        <div class="live-status">
-          <div class="status-dot" id="statusDot"></div>
-          <div class="ios-spinner" id="iosSpinner">
-            <div style="transform:rotate(0deg);animation-delay:-0.9s"></div>
-            <div style="transform:rotate(30deg);animation-delay:-0.825s"></div>
-            <div style="transform:rotate(60deg);animation-delay:-0.75s"></div>
-            <div style="transform:rotate(90deg);animation-delay:-0.675s"></div>
-            <div style="transform:rotate(120deg);animation-delay:-0.6s"></div>
-            <div style="transform:rotate(150deg);animation-delay:-0.525s"></div>
-            <div style="transform:rotate(180deg);animation-delay:-0.45s"></div>
-            <div style="transform:rotate(210deg);animation-delay:-0.375s"></div>
-            <div style="transform:rotate(240deg);animation-delay:-0.3s"></div>
-            <div style="transform:rotate(270deg);animation-delay:-0.225s"></div>
-            <div style="transform:rotate(300deg);animation-delay:-0.15s"></div>
-            <div style="transform:rotate(330deg);animation-delay:-0.075s"></div>
-          </div>
-          <div class="step-title" id="stepText">空闲中，等待开始</div>
-        </div>
-        <button class="stop-btn" id="stopBtn">■ 停止</button>
-      </div>
-      <div class="progress-wrap">
-        <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
-        <div class="progress-pct" id="progressPct">0%</div>
-      </div>
-      <div class="live-meta">
-        <div class="meta-pill"><span>上次完成</span><span class="meta-val" id="lastRun">—</span></div>
-        <div class="meta-pill"><span>下次自动执行</span><span class="meta-val" id="nextRun">—</span></div>
-      </div>
-      <div class="login-banner" id="loginBanner">⏳ 请在弹出的浏览器里扫码登录 WPS，完成后将自动继续…</div>
-      <div class="error-banner" id="errorBanner"></div>
-    </section>
-
-    <!-- 控制中心三大触感按钮 -->
-    <section class="cc-grid">
-      <button class="cc-btn" id="btnNow">
-        <div class="cc-ico blue">▶</div>
-        <div class="cc-title">立即跑一次</div>
-        <div class="cc-sub">下载 · 填表 · 发群</div>
-      </button>
-      <button class="cc-btn" id="btnCapture">
-        <div class="cc-ico orange">▣</div>
-        <div class="cc-title">仅截图发送</div>
-        <div class="cc-sub">汇总表截图发钉钉</div>
-      </button>
-      <button class="cc-btn" id="btnSchedule">
-        <div class="cc-ico green">◷</div>
-        <div class="cc-title" id="schedTitle">自动值守</div>
-        <div class="cc-sub" id="schedSub">点击开启定时计划</div>
-      </button>
-    </section>
-
-    <!-- 分组1：自动值守计划 -->
-    <div>
-      <div class="section-head"><span>自动值守计划</span><span>改完立即生效</span></div>
-      <div class="ios-group">
-        <div class="ios-row">
-          <div class="row-col">
-            <div class="row-label">📅 运行日期</div>
-            <div class="row-desc">仅限制自动值守，手动触发不受影响</div>
-          </div>
-          <div class="segmented" id="dayModeSeg">
-            <div class="seg-thumb" id="dayModeThumb"></div>
-            <button class="seg-btn" data-val="daily">每天运行</button>
-            <button class="seg-btn" data-val="workday">仅工作日</button>
-          </div>
-        </div>
-
-        <div class="slot-block">
-          <div class="slot-head">
-            <span class="row-label">☀️ 白天时段</span>
-            <span class="row-desc" id="daySummary"></span>
-          </div>
-          <div class="slot-body">
-            <div class="time-range">
-              <input type="time" class="time-pill" id="dayStart" />
-              <span style="color:var(--sub)">至</span>
-              <input type="time" class="time-pill" id="dayEnd" />
+  <div class="shell">
+    <!-- 顶部粘性导航 + 灵动岛 -->
+    <header class="top-header">
+      <div class="island-slot">
+        <div class="island" id="island">
+          <div class="island-top">
+            <div class="island-left">
+              <div class="island-dot" id="islandDot"></div>
+              <div class="ios-spinner" id="iosSpinner">
+                <div style="transform:rotate(0deg);animation-delay:-0.9s"></div>
+                <div style="transform:rotate(30deg);animation-delay:-0.825s"></div>
+                <div style="transform:rotate(60deg);animation-delay:-0.75s"></div>
+                <div style="transform:rotate(90deg);animation-delay:-0.675s"></div>
+                <div style="transform:rotate(120deg);animation-delay:-0.6s"></div>
+                <div style="transform:rotate(150deg);animation-delay:-0.525s"></div>
+                <div style="transform:rotate(180deg);animation-delay:-0.45s"></div>
+                <div style="transform:rotate(210deg);animation-delay:-0.375s"></div>
+                <div style="transform:rotate(240deg);animation-delay:-0.3s"></div>
+                <div style="transform:rotate(270deg);animation-delay:-0.225s"></div>
+                <div style="transform:rotate(300deg);animation-delay:-0.15s"></div>
+                <div style="transform:rotate(330deg);animation-delay:-0.075s"></div>
+              </div>
+              <div class="island-text" id="stepText">空闲中，等待开始</div>
             </div>
-            <div class="gap-wrap">
-              <span>每隔</span>
-              <select class="gap-select" id="dayIh"></select>
-              <span>时</span>
-              <select class="gap-select" id="dayIm"></select>
-              <span>分</span>
-            </div>
+            <div class="island-pill-tag" id="islandTag">待命</div>
+            <button class="island-stop" id="stopBtn" title="停止任务">
+              <svg viewBox="0 0 16 16" fill="currentColor" style="width:10px;height:10px;"><rect x="3" y="3" width="10" height="10" rx="2"/></svg>
+              <span>停止</span>
+            </button>
           </div>
-        </div>
-
-        <div class="slot-block">
-          <div class="slot-head">
-            <span class="row-label">🌙 晚上时段</span>
-            <label class="ios-switch"><input type="checkbox" id="nightEnabled" /><span class="ios-slider"></span></label>
+          <div class="island-prog">
+            <div class="island-track"><div class="island-fill" id="progressFill"></div></div>
+            <div class="island-pct" id="progressPct">0%</div>
           </div>
-          <div class="slot-body" id="nightBody">
-            <div class="time-range">
-              <input type="time" class="time-pill" id="nightStart" />
-              <span style="color:var(--sub)">至</span>
-              <input type="time" class="time-pill" id="nightEnd" />
-            </div>
-            <div class="gap-wrap">
-              <span>每隔</span>
-              <select class="gap-select" id="nightIh"></select>
-              <span>时</span>
-              <select class="gap-select" id="nightIm"></select>
-              <span>分</span>
-            </div>
-          </div>
-        </div>
-        <div class="overlap-tip" id="overlapTip">
-          ⚠️ 白天与晚上时段存在重叠，系统会按统一的间隔节拍运行，交界处不会重复连跑。
+          <div class="island-alert" id="islandAlert"></div>
         </div>
       </div>
-    </div>
 
-    <!-- 分组2：截图与钉钉投递 -->
-    <div>
-      <div class="section-head"><span>截图与钉钉投递</span></div>
-      <div class="ios-group">
-        <div class="ios-row">
-          <div class="row-col">
-            <div class="row-label">🖼 复制数据汇总图片</div>
-            <div class="row-desc">写入在线表后选中 C6:AJ 并高清复制</div>
-          </div>
-          <label class="ios-switch"><input type="checkbox" id="enableCapture" /><span class="ios-slider"></span></label>
+      <div class="nav-bar">
+        <div class="large-title-wrap">
+          <h1 class="large-title">暗号表助手</h1>
+          <span class="ver-pill" id="verBadge">v2.0.0</span>
         </div>
-        <div class="ios-row">
-          <div class="row-col">
-            <div class="row-label">💬 发送到钉钉会话</div>
-            <div class="row-desc">自动检索目标群聊/会话并粘贴图片</div>
-          </div>
-          <label class="ios-switch"><input type="checkbox" id="enableDingtalk" /><span class="ios-slider"></span></label>
-        </div>
-        <div class="ios-row">
-          <div class="row-col">
-            <div class="row-label">🧹 发送前清空输入框</div>
-            <div class="row-desc">粘贴前自动清空框内残留草稿，防止误发</div>
-          </div>
-          <label class="ios-switch"><input type="checkbox" id="dtClearBeforeSend" /><span class="ios-slider"></span></label>
-        </div>
-        <div class="ios-row">
-          <div class="row-col">
-            <div class="row-label">🔕 默认设为静音发送</div>
-            <div class="row-desc">自动展开「发送」右侧菜单勾选「设为静音」</div>
-          </div>
-          <label class="ios-switch"><input type="checkbox" id="dtSilentSend" /><span class="ios-slider"></span></label>
-        </div>
-        <div class="ios-row">
-          <div class="row-col">
-            <div class="row-label">⚡ 粘贴后自动按 Enter 发送</div>
-            <div class="row-desc">默认关闭：贴好图文并挂上「静音发送」后停在输入框待你确认</div>
-          </div>
-          <label class="ios-switch"><input type="checkbox" id="dtAutoSend" /><span class="ios-slider"></span></label>
-        </div>
-        <div class="ios-row" style="flex-direction:column;align-items:stretch;">
-          <div class="row-label">🎯 目标群聊 / 会话名称</div>
-          <div class="field-wrap">
-            <input type="text" id="dtSearch" placeholder="例如：👑 秋茶慕杰组 🔥｜十一月🥁一鼓作气" />
-            <button class="clear-btn" id="clearSearchBtn" title="清空">✕</button>
-          </div>
-          <div class="kw-preview" id="kwPreview"></div>
-        </div>
-        <div class="ios-row" style="flex-direction:column;align-items:stretch;">
-          <div class="row-label">🏷 消息时间后缀</div>
-          <div class="field-wrap">
-            <input type="text" id="dtSuffix" placeholder="例如：暗号数据" />
-          </div>
-          <div class="msg-preview" id="msgPreview"></div>
+        <div class="nav-actions">
+          <button class="nav-circle-btn" id="updateBtn" title="检查更新" style="display:none;">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+            <span class="update-dot" id="updateDot"></span>
+          </button>
+          <button class="nav-circle-btn" id="themeBtn" title="切换外观"></button>
         </div>
       </div>
-    </div>
+    </header>
 
-    <!-- 分组3：发群时段限制（手风琴） -->
-    <div>
-      <div class="section-head"><span>发群时段限制</span></div>
-      <div class="ios-group">
-        <div class="ios-row">
-          <div class="row-col">
-            <div class="row-label">🕒 仅在允许时段截图发群</div>
-            <div class="row-desc">关闭时全天每次均发群；手动点击始终发群</div>
+    <main class="main-content">
+      <!-- Tab 1: 控制台 -->
+      <section class="tab-pane active" id="pane-home">
+        <button class="hero-action" id="btnNow">
+          <div class="hero-copy">
+            <div class="hero-title">立即开始全流程</div>
+            <div class="hero-sub">下载三份数据 · 填入在线表 · 截图发钉钉</div>
           </div>
-          <label class="ios-switch"><input type="checkbox" id="cpEnabled" /><span class="ios-slider"></span></label>
+          <div class="hero-play">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v14l11-7-11-7z"/></svg>
+          </div>
+        </button>
+
+        <div class="tile-grid">
+          <button class="cc-tile" id="btnCapture">
+            <div class="tile-ico orange">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="3"/><circle cx="12" cy="12" r="3"/></svg>
+            </div>
+            <div>
+              <div class="tile-title">仅截图发送</div>
+              <div class="tile-sub">仅截取汇总表并送达钉钉</div>
+            </div>
+          </button>
+
+          <button class="cc-tile" id="btnSchedule">
+            <div class="tile-ico green">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+            </div>
+            <div>
+              <div class="tile-title" id="schedTitle">自动值守</div>
+              <div class="tile-sub" id="schedSub">点击开启定时计划</div>
+            </div>
+          </button>
         </div>
-        <div class="accordion-body" id="cpAccordion">
-          <div class="ios-row">
-            <span class="row-label">适用日期配置</span>
-            <div class="segmented" id="cpProfileSeg">
-              <div class="seg-thumb" id="cpProfileThumb"></div>
-              <button class="seg-btn" data-val="workday">工作日</button>
-              <button class="seg-btn" data-val="weekend">非工作日</button>
-            </div>
-          </div>
-          <div class="slot-block">
-            <div class="slot-head">
-              <span class="row-label">时段 1</span>
-              <label class="ios-switch"><input type="checkbox" id="cpSlot1" /><span class="ios-slider"></span></label>
-            </div>
-            <div class="slot-body" id="cpSlot1Body">
-              <div class="time-range">
-                <input type="time" class="time-pill" id="cpStart1" />
-                <span style="color:var(--sub)">至</span>
-                <input type="time" class="time-pill" id="cpEnd1" />
+
+        <div class="section-wrap">
+          <div class="section-head"><span>当前配置概览</span><span>点击可快速修改</span></div>
+          <div class="ios-group">
+            <div class="ios-row clickable" data-jump="dingtalk">
+              <div class="sf-badge sf-indigo">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">目标钉钉会话</div>
+                <div class="row-sub">打开后按 Ctrl+Shift+F 粘贴并回车</div>
+              </div>
+              <div class="row-right">
+                <span class="row-val" id="sumTarget">文件小助手</span>
+                <svg class="chevron-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
               </div>
             </div>
-          </div>
-          <div class="slot-block">
-            <div class="slot-head">
-              <span class="row-label">时段 2</span>
-              <label class="ios-switch"><input type="checkbox" id="cpSlot2" /><span class="ios-slider"></span></label>
+
+            <div class="ios-row clickable" data-jump="dingtalk">
+              <div class="sf-badge sf-orange">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.73 21a2 2 0 01-3.46 0"/><path d="M18.63 13A17.89 17.89 0 0118 8"/><path d="M6.26 6.26A5.86 5.86 0 006 8c0 7-3 9-3 9h14"/><path d="M18 8a6 6 0 00-9.33-5"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">发送策略</div>
+                <div class="row-sub">草稿清理 · 静音 · 确认方式</div>
+              </div>
+              <div class="row-right">
+                <span class="row-val" id="sumPolicy">静音 · 暂不发</span>
+                <svg class="chevron-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+              </div>
             </div>
-            <div class="slot-body" id="cpSlot2Body">
-              <div class="time-range">
-                <input type="time" class="time-pill" id="cpStart2" />
-                <span style="color:var(--sub)">至</span>
-                <input type="time" class="time-pill" id="cpEnd2" />
+
+            <div class="ios-row clickable" data-jump="schedule">
+              <div class="sf-badge sf-green">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="3"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">定时计划</div>
+                <div class="row-sub" id="sumScheduleSub">每天运行</div>
+              </div>
+              <div class="row-right">
+                <span class="row-val" id="sumNextRun">—</span>
+                <svg class="chevron-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+              </div>
+            </div>
+
+            <div class="ios-row clickable" data-jump="more">
+              <div class="sf-badge sf-gray">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 109-9 9.75 9.75 0 00-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">上次完成时间</div>
+                <div class="row-sub">查看详细运行日志记录</div>
+              </div>
+              <div class="row-right">
+                <span class="row-val" id="lastRun">—</span>
+                <svg class="chevron-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
               </div>
             </div>
           </div>
         </div>
-      </div>
-    </div>
+      </section>
 
-    <!-- 分组4：数据源与连接设置（手风琴） -->
-    <div>
-      <div class="section-head"><span>高级设置</span></div>
-      <div class="ios-group">
-        <div class="ios-row" id="connToggle" style="cursor:pointer;">
-          <div class="row-col">
-            <div class="row-label">🔗 数据源与后台账号</div>
-            <div class="row-desc">修改 WPS 表格链接或后台登录凭据</div>
+      <!-- Tab 2: 钉钉投递 -->
+      <section class="tab-pane" id="pane-dingtalk">
+        <div class="section-wrap">
+          <div class="section-head"><span>目标与附言</span></div>
+          <div class="ios-group">
+            <div class="ios-row">
+              <div class="sf-badge sf-teal">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="5"/></svg>
+              </div>
+              <div class="row-title" style="flex-shrink:0;">目标群聊</div>
+              <div class="field-inline">
+                <input type="text" id="dtSearch" placeholder="输入完整群名或联系人" />
+                <button class="clear-circle" id="clearSearchBtn" title="清空">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <div class="ios-row">
+              <div class="sf-badge sf-indigo">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 01-2.83 0L2 12V2h10l8.59 8.59a2 2 0 010 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+              </div>
+              <div class="row-title" style="flex-shrink:0;">时间后缀</div>
+              <div class="field-inline">
+                <input type="text" id="dtSuffix" placeholder="例如：暗号数据" />
+              </div>
+            </div>
           </div>
-          <span class="chevron" id="connChevron">❯</span>
+          <div class="section-footer" id="kwPreview">打开钉钉后按 Ctrl+Shift+F 粘贴目标名称并按 Enter 直达</div>
+          <div class="section-footer" id="msgPreview" style="padding-top:3px;">消息附言预览：—</div>
         </div>
-        <div class="accordion-body" id="connAccordion">
-          <div class="ios-row" style="flex-direction:column;align-items:stretch;">
-            <div class="row-label">WPS 在线表格链接</div>
-            <div class="field-wrap"><input type="text" id="wpsUrl" /></div>
-          </div>
-          <div class="ios-row" style="flex-direction:column;align-items:stretch;">
-            <div class="row-label">Luya 后台账号</div>
-            <div class="field-wrap"><input type="text" id="luyaUser" /></div>
-          </div>
-          <div class="ios-row" style="flex-direction:column;align-items:stretch;">
-            <div class="row-label">Luya 后台密码</div>
-            <div class="field-wrap">
-              <input type="password" id="luyaPass" />
-              <button class="mini-pill-btn" id="togglePassBtn">显示</button>
+
+        <div class="section-wrap">
+          <div class="section-head"><span>投递行为控制</span></div>
+          <div class="ios-group">
+            <div class="ios-row">
+              <div class="sf-badge sf-green">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">复制汇总表图片</div>
+                <div class="row-sub">选中 C6:AJ 并高清复制到剪贴板</div>
+              </div>
+              <label class="ios-switch"><input type="checkbox" id="enableCapture" /><span class="ios-slider"></span></label>
+            </div>
+
+            <div class="ios-row">
+              <div class="sf-badge sf-blue">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">自动发送到钉钉</div>
+                <div class="row-sub">自动唤醒钉钉并进入目标会话框</div>
+              </div>
+              <label class="ios-switch"><input type="checkbox" id="enableDingtalk" /><span class="ios-slider"></span></label>
+            </div>
+
+            <div class="ios-row">
+              <div class="sf-badge sf-purple">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">发送前清空输入框</div>
+                <div class="row-sub">粘贴前先清空草稿，防止错发旧内容</div>
+              </div>
+              <label class="ios-switch"><input type="checkbox" id="dtClearBeforeSend" /><span class="ios-slider"></span></label>
+            </div>
+
+            <div class="ios-row">
+              <div class="sf-badge sf-orange">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.73 21a2 2 0 01-3.46 0"/><path d="M18.63 13A17.89 17.89 0 0118 8"/><path d="M6.26 6.26A5.86 5.86 0 006 8c0 7-3 9-3 9h14"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">设为静音发送</div>
+                <div class="row-sub">自动展开发送按钮右侧菜单并选中</div>
+              </div>
+              <label class="ios-switch"><input type="checkbox" id="dtSilentSend" /><span class="ios-slider"></span></label>
+            </div>
+
+            <div class="ios-row">
+              <div class="sf-badge sf-pink">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">粘贴后自动按 Enter 发送</div>
+                <div class="row-sub">关闭时贴好图文与静音后等待确认</div>
+              </div>
+              <label class="ios-switch"><input type="checkbox" id="dtAutoSend" /><span class="ios-slider"></span></label>
             </div>
           </div>
         </div>
-      </div>
-    </div>
+      </section>
 
-    <!-- 分组5：运行日志 -->
-    <div>
-      <div class="section-head">
-        <span>运行日志</span>
-        <div class="log-tools">
-          <button class="mini-pill-btn active" id="autoScrollBtn">自动滚底</button>
-          <button class="mini-pill-btn" id="copyLogBtn">复制</button>
-          <button class="mini-pill-btn" id="clearLogBtn">清空</button>
+      <!-- Tab 3: 定时计划 -->
+      <section class="tab-pane" id="pane-schedule">
+        <div class="section-wrap">
+          <div class="section-head"><span>自动值守时段</span><span>点击时间胶囊调整</span></div>
+          <div class="ios-group">
+            <div class="ios-row">
+              <div class="sf-badge sf-blue">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="3"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">运行日期</div>
+              </div>
+              <div class="segmented" id="dayModeSeg">
+                <div class="seg-thumb" id="dayModeThumb"></div>
+                <button class="seg-btn" data-val="daily">每天运行</button>
+                <button class="seg-btn" data-val="workday">仅工作日</button>
+              </div>
+            </div>
+
+            <div class="slot-block">
+              <div class="slot-head">
+                <div class="slot-title-wrap">
+                  <div class="sf-badge sf-orange">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>
+                  </div>
+                  <span class="row-title">白天时段</span>
+                </div>
+                <span class="row-sub" id="daySummary"></span>
+              </div>
+              <div class="slot-controls">
+                <div class="pill-pair">
+                  <button class="ios-pill-btn" id="dayStartBtn">09:00</button>
+                  <span class="pill-sep">至</span>
+                  <button class="ios-pill-btn" id="dayEndBtn">18:00</button>
+                </div>
+                <button class="ios-pill-btn neutral" id="dayGapBtn">每 30 分钟</button>
+              </div>
+            </div>
+
+            <div class="slot-block">
+              <div class="slot-head">
+                <div class="slot-title-wrap">
+                  <div class="sf-badge sf-indigo">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+                  </div>
+                  <span class="row-title">晚上时段</span>
+                </div>
+                <label class="ios-switch"><input type="checkbox" id="nightEnabled" /><span class="ios-slider"></span></label>
+              </div>
+              <div class="slot-controls" id="nightBody">
+                <div class="pill-pair">
+                  <button class="ios-pill-btn" id="nightStartBtn">18:00</button>
+                  <span class="pill-sep">至</span>
+                  <button class="ios-pill-btn" id="nightEndBtn">23:00</button>
+                </div>
+                <button class="ios-pill-btn neutral" id="nightGapBtn">每 30 分钟</button>
+              </div>
+            </div>
+          </div>
+          <div class="section-footer warn" id="overlapTip" style="display:none;">
+            白天与晚上时段存在重叠，系统会按统一节拍运行，交界处不会重复连跑。
+          </div>
+        </div>
+
+        <div class="section-wrap">
+          <div class="section-head"><span>发群时段限制</span></div>
+          <div class="ios-group">
+            <div class="ios-row">
+              <div class="sf-badge sf-red">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">仅允许时段截图发群</div>
+                <div class="row-sub">关闭时全天自动均发群，手动触发不受限</div>
+              </div>
+              <label class="ios-switch"><input type="checkbox" id="cpEnabled" /><span class="ios-slider"></span></label>
+            </div>
+
+            <div class="accordion-body" id="cpAccordion">
+              <div class="ios-row">
+                <div class="row-main"><div class="row-title">适用日期</div></div>
+                <div class="segmented" id="cpProfileSeg">
+                  <div class="seg-thumb" id="cpProfileThumb"></div>
+                  <button class="seg-btn" data-val="workday">工作日</button>
+                  <button class="seg-btn" data-val="weekend">非工作日</button>
+                </div>
+              </div>
+
+              <div class="slot-block">
+                <div class="slot-head">
+                  <span class="row-title">允许时段 1</span>
+                  <label class="ios-switch"><input type="checkbox" id="cpSlot1" /><span class="ios-slider"></span></label>
+                </div>
+                <div class="slot-controls" id="cpSlot1Body" style="padding-left:0;">
+                  <div class="pill-pair">
+                    <button class="ios-pill-btn" id="cpStart1Btn">09:00</button>
+                    <span class="pill-sep">至</span>
+                    <button class="ios-pill-btn" id="cpEnd1Btn">18:00</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="slot-block">
+                <div class="slot-head">
+                  <span class="row-title">允许时段 2</span>
+                  <label class="ios-switch"><input type="checkbox" id="cpSlot2" /><span class="ios-slider"></span></label>
+                </div>
+                <div class="slot-controls" id="cpSlot2Body" style="padding-left:0;">
+                  <div class="pill-pair">
+                    <button class="ios-pill-btn" id="cpStart2Btn">18:00</button>
+                    <span class="pill-sep">至</span>
+                    <button class="ios-pill-btn" id="cpEnd2Btn">22:00</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab 4: 记录与账号 -->
+      <section class="tab-pane" id="pane-more">
+        <div class="section-wrap">
+          <div class="section-head">
+            <span>运行日志</span>
+            <div class="log-tools">
+              <button class="mini-pill active" id="autoScrollBtn">自动滚底</button>
+              <button class="mini-pill" id="copyLogBtn">复制</button>
+              <button class="mini-pill" id="clearLogBtn">清空</button>
+            </div>
+          </div>
+          <div class="ios-group">
+            <div class="log-box" id="logBox">
+              <div class="log-empty" id="logEmpty">暂无运行日志</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-wrap">
+          <div class="section-head"><span>数据源与后台账号</span></div>
+          <div class="ios-group">
+            <div class="ios-row">
+              <div class="sf-badge sf-blue">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
+              </div>
+              <div class="row-title" style="flex-shrink:0;">WPS 链接</div>
+              <div class="field-inline">
+                <input type="text" id="wpsUrl" placeholder="在线表格网址" />
+              </div>
+            </div>
+
+            <div class="ios-row">
+              <div class="sf-badge sf-teal">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+              </div>
+              <div class="row-title" style="flex-shrink:0;">Luya 账号</div>
+              <div class="field-inline">
+                <input type="text" id="luyaUser" placeholder="后台登录账号" />
+              </div>
+            </div>
+
+            <div class="ios-row">
+              <div class="sf-badge sf-gray">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+              </div>
+              <div class="row-title" style="flex-shrink:0;">Luya 密码</div>
+              <div class="field-inline">
+                <input type="password" id="luyaPass" placeholder="后台登录密码" />
+                <button class="mini-pill" id="togglePassBtn" type="button" style="display:inline-flex;align-items:center;padding:4px 8px;" title="显示或隐藏密码"></button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <button class="danger-card-btn" id="resetBtn">恢复默认设置</button>
+      </section>
+    </main>
+  </div>
+
+  <!-- 底部固定毛玻璃 4 栏 Tab Bar -->
+  <nav class="tabbar-wrap">
+    <div class="tabbar" id="tabbar">
+      <button class="tab-btn active" data-tab="home">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        <span>控制台</span>
+      </button>
+      <button class="tab-btn" data-tab="dingtalk">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+        <span>钉钉投递</span>
+      </button>
+      <button class="tab-btn" data-tab="schedule">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        <span>定时计划</span>
+      </button>
+      <button class="tab-btn" data-tab="more">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>
+        <span>记录账号</span>
+      </button>
+    </div>
+  </nav>
+
+  <!-- iOS 底部毛玻璃滚轮选择器 -->
+  <div class="sheet-mask" id="pickerMask">
+    <div class="ios-sheet">
+      <div class="sheet-handle"></div>
+      <div class="sheet-header">
+        <button class="sheet-btn" id="pickerCancel">取消</button>
+        <div class="sheet-title" id="pickerTitle">选择时间</div>
+        <button class="sheet-btn done" id="pickerDone">完成</button>
+      </div>
+      <div class="sheet-readout" id="pickerReadout">09:00</div>
+      <div class="preset-row" id="pickerPresets"></div>
+      <div class="wheel-grid">
+        <div>
+          <div class="wheel-col-label" id="wheelLeftLabel">小时</div>
+          <div class="wheel-list" id="wheelLeft"></div>
+        </div>
+        <div>
+          <div class="wheel-col-label" id="wheelRightLabel">分钟</div>
+          <div class="wheel-list" id="wheelRight"></div>
         </div>
       </div>
-      <div class="ios-group">
-        <div class="log-box" id="logBox"></div>
-      </div>
     </div>
-
-    <button class="reset-btn" id="resetBtn">恢复默认设置</button>
-  </main>
+  </div>
 
   <!-- iOS 毛玻璃模态弹窗 -->
   <div class="modal-mask" id="modalMask">
@@ -1570,12 +2074,53 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 const TOKEN = __TOKEN_JSON__;
 const $ = (id) => document.getElementById(id);
 
+const SVG_MOON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>`;
+const SVG_SUN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>`;
+const SVG_EYE = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
+const SVG_EYE_OFF = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`;
+
 let cfg = {};
 let cpProfile = "workday";
 let autoScroll = true;
 let lastLogSeq = 0;
 let saveTimer = null;
 let updateUrl = "";
+let pickerState = null;
+
+function cleanText(s) {
+  return String(s || "").replace(/[\u2600-\u27BF\uFE0F\u200D]|[\uD83C-\uDBFF][\uDC00-\uDFFF]/g, "").trim();
+}
+
+function pad2(n) {
+  return String(Math.max(0, Number(n) || 0)).padStart(2, "0");
+}
+
+function hmStr(h, m) {
+  return `${pad2(h)}:${pad2(m)}`;
+}
+
+function formatGapText(ih, im) {
+  const h = Number(ih) || 0;
+  const m = Number(im) || 0;
+  if (h > 0 && m > 0) return `每 ${h} 时 ${m} 分`;
+  if (h > 0) return `每 ${h} 小时`;
+  return `每 ${Math.max(1, m)} 分钟`;
+}
+
+function slotMinutes(s) {
+  const parts = String(s || "0:0").split(":");
+  return (parseInt(parts[0], 10) || 0) * 60 + (parseInt(parts[1], 10) || 0);
+}
+
+function slotsOverlap(s1, e1, s2, e2) {
+  const toSegments = (a, b) => a <= b ? [[a, b]] : [[a, 1440], [0, b]];
+  for (const [a1, a2] of toSegments(slotMinutes(s1), slotMinutes(e1))) {
+    for (const [b1, b2] of toSegments(slotMinutes(s2), slotMinutes(e2))) {
+      if (Math.max(a1, b1) < Math.min(a2, b2)) return true;
+    }
+  }
+  return false;
+}
 
 function showToast(msg) {
   const el = $("toast");
@@ -1593,6 +2138,16 @@ async function api(path, method = "GET", body = null) {
   if (body !== null) opts.body = JSON.stringify(body);
   const res = await fetch(path, opts);
   return await res.json();
+}
+
+function switchTab(name) {
+  for (const btn of $("tabbar").querySelectorAll(".tab-btn")) {
+    btn.classList.toggle("active", btn.dataset.tab === name);
+  }
+  for (const pane of document.querySelectorAll(".tab-pane")) {
+    pane.classList.toggle("active", pane.id === `pane-${name}`);
+  }
+  window.scrollTo({ top: 0, behavior: "instant" });
 }
 
 function iosAlert(title, msg, { okText = "好", cancelText = null, danger = false } = {}) {
@@ -1623,86 +2178,107 @@ function iosAlert(title, msg, { okText = "好", cancelText = null, danger = fals
   });
 }
 
-function initSelectOptions() {
-  for (const [hid, mid] of [["dayIh", "dayIm"], ["nightIh", "nightIm"]]) {
-    const hSel = $(hid), mSel = $(mid);
-    for (let i = 0; i <= 12; i++) {
-      hSel.add(new Option(String(i).padStart(2, "0"), String(i)));
-    }
-    for (let i = 0; i < 60; i++) {
-      mSel.add(new Option(String(i).padStart(2, "0"), String(i)));
-    }
+function openPicker({ title, mode, h, m, onConfirm }) {
+  pickerState = {
+    mode,
+    h: Number(h) || 0,
+    m: Number(m) || 0,
+    onConfirm,
+  };
+  $("pickerTitle").textContent = title;
+  $("wheelLeftLabel").textContent = mode === "gap" ? "间隔小时" : "时";
+  $("wheelRightLabel").textContent = mode === "gap" ? "间隔分钟" : "分";
+
+  const presets = mode === "gap"
+    ? [
+        { label: "15分钟", h: 0, m: 15 },
+        { label: "30分钟", h: 0, m: 30 },
+        { label: "45分钟", h: 0, m: 45 },
+        { label: "1小时", h: 1, m: 0 },
+        { label: "2小时", h: 2, m: 0 },
+      ]
+    : [
+        { label: "08:00", h: 8, m: 0 },
+        { label: "09:00", h: 9, m: 0 },
+        { label: "12:00", h: 12, m: 0 },
+        { label: "18:00", h: 18, m: 0 },
+        { label: "22:00", h: 22, m: 0 },
+        { label: "23:59", h: 23, m: 59 },
+      ];
+
+  const maxH = mode === "gap" ? 12 : 23;
+  const leftEl = $("wheelLeft");
+  const rightEl = $("wheelRight");
+  leftEl.innerHTML = "";
+  rightEl.innerHTML = "";
+
+  for (let i = 0; i <= maxH; i++) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "wheel-opt";
+    b.dataset.v = String(i);
+    b.textContent = mode === "gap" ? `${i} 时` : pad2(i);
+    b.onclick = () => {
+      pickerState.h = i;
+      syncPickerSelection();
+    };
+    leftEl.appendChild(b);
   }
-}
-
-function pad2(n) {
-  return String(Number(n) || 0).padStart(2, "0");
-}
-
-function hmStr(h, m) {
-  return `${pad2(h)}:${pad2(m)}`;
-}
-
-function parseHm(str, defH = 9, defM = 0) {
-  const parts = String(str || "").split(":");
-  if (parts.length !== 2) return [defH, defM];
-  return [Math.max(0, Math.min(23, parseInt(parts[0], 10) || 0)),
-          Math.max(0, Math.min(59, parseInt(parts[1], 10) || 0))];
-}
-
-function slotMinutes(s) {
-  const [h, m] = parseHm(s);
-  return h * 60 + m;
-}
-
-function slotsOverlap(s1, e1, s2, e2) {
-  const toSegments = (a, b) => a <= b ? [[a, b]] : [[a, 1440], [0, b]];
-  const segA = toSegments(slotMinutes(s1), slotMinutes(e1));
-  const segB = toSegments(slotMinutes(s2), slotMinutes(e2));
-  for (const [a1, a2] of segA) {
-    for (const [b1, b2] of segB) {
-      if (Math.max(a1, b1) < Math.min(a2, b2)) return true;
-    }
+  for (let i = 0; i < 60; i++) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "wheel-opt";
+    b.dataset.v = String(i);
+    b.textContent = mode === "gap" ? `${i} 分` : pad2(i);
+    b.onclick = () => {
+      pickerState.m = i;
+      syncPickerSelection();
+    };
+    rightEl.appendChild(b);
   }
-  return false;
-}
 
-function updateKeywordPreview() {
-  const raw = ($("dtSearch").value || "").trim();
-  const tokens = raw.match(/[\u4e00-\u9fffA-Za-z0-9]+/g) || [];
-  if (!raw) {
-    $("kwPreview").textContent = "将默认搜索：文件小助手";
-    return;
+  const presetWrap = $("pickerPresets");
+  presetWrap.innerHTML = "";
+  for (const p of presets) {
+    const c = document.createElement("button");
+    c.type = "button";
+    c.className = "preset-chip";
+    c.textContent = p.label;
+    c.dataset.h = String(p.h);
+    c.dataset.m = String(p.m);
+    c.onclick = () => {
+      pickerState.h = p.h;
+      pickerState.m = p.m;
+      syncPickerSelection();
+    };
+    presetWrap.appendChild(c);
   }
-  if (tokens.length === 0) {
-    $("kwPreview").textContent = `搜索词：${raw}`;
-    return;
+
+  $("pickerMask").classList.add("show");
+  syncPickerSelection(true);
+}
+
+function syncPickerSelection(scroll = false) {
+  if (!pickerState) return;
+  const { mode, h, m } = pickerState;
+  $("pickerReadout").textContent = mode === "gap"
+    ? formatGapText(h, m)
+    : hmStr(h, m);
+
+  for (const chip of $("pickerPresets").querySelectorAll(".preset-chip")) {
+    const match = Number(chip.dataset.h) === h && Number(chip.dataset.m) === m;
+    chip.classList.toggle("active", match);
   }
-  const ordered = [...tokens].sort((a, b) => b.length - a.length);
-  const best = ordered.length >= 2 && `${ordered[0]} ${ordered[1]}`.length <= 14
-    ? `${ordered[0]} ${ordered[1]}` : ordered[0];
-  $("kwPreview").textContent = `智能检索策略：优先用纯文字词「${best}」精准搜群，自动绕开 Emoji 干扰`;
-}
-
-function updateMsgPreview() {
-  const suffix = ($("dtSuffix").value || "").trim() || "数据";
-  const now = new Date();
-  const stamp = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())} ${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
-  $("msgPreview").textContent = `消息预览：${stamp} ${suffix}`;
-}
-
-function updateSlotSummaries() {
-  const ds = $("dayStart").value || "09:00";
-  const de = $("dayEnd").value || "18:00";
-  const dg = Number($("dayIh").value) * 60 + Number($("dayIm").value);
-  $("daySummary").textContent = `${ds}–${de} · 每 ${dg} 分钟`;
-
-  const nOn = $("nightEnabled").checked;
-  $("nightBody").classList.toggle("disabled", !nOn);
-
-  const ns = $("nightStart").value || "18:00";
-  const ne = $("nightEnd").value || "23:00";
-  $("overlapTip").style.display = (nOn && slotsOverlap(ds, de, ns, ne)) ? "block" : "none";
+  for (const opt of $("wheelLeft").querySelectorAll(".wheel-opt")) {
+    const sel = Number(opt.dataset.v) === h;
+    opt.classList.toggle("selected", sel);
+    if (sel && scroll) opt.scrollIntoView({ block: "center" });
+  }
+  for (const opt of $("wheelRight").querySelectorAll(".wheel-opt")) {
+    const sel = Number(opt.dataset.v) === m;
+    opt.classList.toggle("selected", sel);
+    if (sel && scroll) opt.scrollIntoView({ block: "center" });
+  }
 }
 
 function applySegmented(segId, thumbId, value) {
@@ -1712,32 +2288,70 @@ function applySegmented(segId, thumbId, value) {
   $(thumbId).style.transform = `translateX(${idx * 100}%)`;
 }
 
+function updateSummaries() {
+  const targetName = ($("dtSearch").value || "").trim() || "文件小助手";
+  $("sumTarget").textContent = targetName;
+  $("kwPreview").textContent = `将在钉钉按 Ctrl+Shift+F 直接粘贴「${targetName}」并按 Enter 进入会话`;
+
+  const suffix = ($("dtSuffix").value || "").trim() || "数据";
+  const now = new Date();
+  const stamp = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())} ${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
+  $("msgPreview").textContent = `消息附言预览：${stamp} ${suffix}`;
+
+  const policyParts = [];
+  policyParts.push($("dtClearBeforeSend").checked ? "先清空" : "保留草稿");
+  policyParts.push($("dtSilentSend").checked ? "静音" : "常规");
+  policyParts.push($("dtAutoSend").checked ? "自动发送" : "暂不发送");
+  $("sumPolicy").textContent = policyParts.join(" · ");
+
+  const ds = hmStr(cfg.day.sh, cfg.day.sm);
+  const de = hmStr(cfg.day.eh, cfg.day.em);
+  const dg = cfg.day.ih * 60 + cfg.day.im;
+  $("dayStartBtn").textContent = ds;
+  $("dayEndBtn").textContent = de;
+  $("dayGapBtn").textContent = formatGapText(cfg.day.ih, cfg.day.im);
+  $("daySummary").textContent = `${ds}-${de} 每${dg}分`;
+
+  const nOn = $("nightEnabled").checked;
+  $("nightBody").classList.toggle("disabled", !nOn);
+  const ns = hmStr(cfg.night.sh, cfg.night.sm);
+  const ne = hmStr(cfg.night.eh, cfg.night.em);
+  $("nightStartBtn").textContent = ns;
+  $("nightEndBtn").textContent = ne;
+  $("nightGapBtn").textContent = formatGapText(cfg.night.ih, cfg.night.im);
+
+  $("overlapTip").style.display = (nOn && slotsOverlap(ds, de, ns, ne)) ? "block" : "none";
+  $("sumScheduleSub").textContent = `${cfg.day_mode === "workday" ? "仅工作日" : "每天运行"} · 白天 ${ds}-${de}${nOn ? " / 夜间" : ""}`;
+}
+
 function renderCaptureProfile() {
-  const cp = (cfg.capture_plan && cfg.capture_plan[cpProfile]) || {};
+  if (!cfg.capture_plan) cfg.capture_plan = { enabled: false, workday: {}, weekend: {} };
+  if (!cfg.capture_plan[cpProfile]) {
+    cfg.capture_plan[cpProfile] = {
+      slot1: true, start1: "09:00", end1: "18:00",
+      slot2: false, start2: "18:00", end2: "22:00",
+    };
+  }
+  const cp = cfg.capture_plan[cpProfile];
   $("cpSlot1").checked = Boolean(cp.slot1);
-  $("cpStart1").value = cp.start1 || "09:00";
-  $("cpEnd1").value = cp.end1 || "18:00";
+  $("cpStart1Btn").textContent = cp.start1 || "09:00";
+  $("cpEnd1Btn").textContent = cp.end1 || "18:00";
   $("cpSlot1Body").classList.toggle("disabled", !$("cpSlot1").checked);
 
   $("cpSlot2").checked = Boolean(cp.slot2);
-  $("cpStart2").value = cp.start2 || "18:00";
-  $("cpEnd2").value = cp.end2 || "22:00";
+  $("cpStart2Btn").textContent = cp.start2 || "18:00";
+  $("cpEnd2Btn").textContent = cp.end2 || "22:00";
   $("cpSlot2Body").classList.toggle("disabled", !$("cpSlot2").checked);
+
   applySegmented("cpProfileSeg", "cpProfileThumb", cpProfile);
 }
 
 function renderConfig() {
-  applySegmented("dayModeSeg", "dayModeThumb", cfg.day_mode || "daily");
-  $("dayStart").value = hmStr(cfg.day.sh, cfg.day.sm);
-  $("dayEnd").value = hmStr(cfg.day.eh, cfg.day.em);
-  $("dayIh").value = String(cfg.day.ih);
-  $("dayIm").value = String(cfg.day.im);
+  if (!cfg.day) cfg.day = { sh: 9, sm: 0, eh: 18, em: 0, ih: 0, im: 30 };
+  if (!cfg.night) cfg.night = { sh: 18, sm: 0, eh: 23, em: 0, ih: 0, im: 30 };
 
+  applySegmented("dayModeSeg", "dayModeThumb", cfg.day_mode || "daily");
   $("nightEnabled").checked = cfg.night_enabled !== false;
-  $("nightStart").value = hmStr(cfg.night.sh, cfg.night.sm);
-  $("nightEnd").value = hmStr(cfg.night.eh, cfg.night.em);
-  $("nightIh").value = String(cfg.night.ih);
-  $("nightIm").value = String(cfg.night.im);
 
   $("enableCapture").checked = cfg.enable_capture !== false;
   $("enableDingtalk").checked = Boolean(cfg.enable_dingtalk);
@@ -1756,25 +2370,10 @@ function renderConfig() {
   $("luyaUser").value = cfg.luya_user || "";
   $("luyaPass").value = cfg.luya_pass || "";
 
-  updateSlotSummaries();
-  updateKeywordPreview();
-  updateMsgPreview();
+  updateSummaries();
 }
 
 function collectConfigFromDOM() {
-  const [dsh, dsm] = parseHm($("dayStart").value, 9, 0);
-  const [deh, dem] = parseHm($("dayEnd").value, 18, 0);
-  const [nsh, nsm] = parseHm($("nightStart").value, 18, 0);
-  const [neh, nem] = parseHm($("nightEnd").value, 23, 0);
-
-  cfg.day = {
-    sh: dsh, sm: dsm, eh: deh, em: dem,
-    ih: Number($("dayIh").value), im: Number($("dayIm").value),
-  };
-  cfg.night = {
-    sh: nsh, sm: nsm, eh: neh, em: nem,
-    ih: Number($("nightIh").value), im: Number($("nightIm").value),
-  };
   cfg.night_enabled = $("nightEnabled").checked;
   cfg.enable_capture = $("enableCapture").checked;
   cfg.enable_dingtalk = $("enableDingtalk").checked;
@@ -1789,21 +2388,14 @@ function collectConfigFromDOM() {
 
   if (!cfg.capture_plan) cfg.capture_plan = { enabled: false, workday: {}, weekend: {} };
   cfg.capture_plan.enabled = $("cpEnabled").checked;
-  cfg.capture_plan[cpProfile] = {
-    slot1: $("cpSlot1").checked,
-    start1: $("cpStart1").value || "09:00",
-    end1: $("cpEnd1").value || "18:00",
-    slot2: $("cpSlot2").checked,
-    start2: $("cpStart2").value || "18:00",
-    end2: $("cpEnd2").value || "22:00",
-  };
+  if (!cfg.capture_plan[cpProfile]) cfg.capture_plan[cpProfile] = {};
+  cfg.capture_plan[cpProfile].slot1 = $("cpSlot1").checked;
+  cfg.capture_plan[cpProfile].slot2 = $("cpSlot2").checked;
   return cfg;
 }
 
 function scheduleSave(immediate = false) {
-  updateSlotSummaries();
-  updateKeywordPreview();
-  updateMsgPreview();
+  updateSummaries();
   clearTimeout(saveTimer);
   const runSave = async () => {
     const data = collectConfigFromDOM();
@@ -1828,20 +2420,25 @@ function formatCountdown(nextTs, serverNow) {
 
 function appendLogLines(items) {
   if (!items || !items.length) return;
+  const empty = $("logEmpty");
+  if (empty) empty.style.display = "none";
   const box = $("logBox");
   const frag = document.createDocumentFragment();
   for (const item of items) {
-    const div = document.createElement("div");
-    div.className = "log-line";
+    const row = document.createElement("div");
+    row.className = "log-line";
+    const dot = document.createElement("span");
+    dot.className = `log-dot ${item.level || "info"}`;
     const t = document.createElement("span");
     t.className = "log-time";
-    t.textContent = `[${item.time}]`;
-    const body = document.createElement("span");
-    body.className = `log-${item.level}`;
-    body.textContent = item.text;
-    div.appendChild(t);
-    div.appendChild(body);
-    frag.appendChild(div);
+    t.textContent = item.time;
+    const msg = document.createElement("span");
+    msg.className = `log-msg ${item.level || "info"}`;
+    msg.textContent = cleanText(item.text) || item.text;
+    row.appendChild(dot);
+    row.appendChild(t);
+    row.appendChild(msg);
+    frag.appendChild(row);
   }
   box.appendChild(frag);
   while (box.children.length > 500) {
@@ -1856,41 +2453,63 @@ async function pollState() {
   try {
     const st = await api(`/api/state?since=${lastLogSeq}`);
     $("verBadge").textContent = `v${st.version}`;
-    const card = $("liveCard");
-    card.classList.toggle("running", Boolean(st.busy));
 
-    const dot = $("statusDot");
-    dot.className = "status-dot" + (st.status_level === "err" ? " err" : st.status_level === "stopped" ? " stopped" : "");
+    const island = $("island");
+    const busy = Boolean(st.busy);
+    const hasAlert = Boolean(st.need_login_prompt || st.error_text);
+    island.classList.toggle("busy", busy);
+    island.classList.toggle("expanded", busy || hasAlert);
 
-    $("stepText").textContent = st.step_text || "空闲中";
+    const dot = $("islandDot");
+    dot.className = "island-dot"
+      + (st.status_level === "err" ? " err"
+        : st.status_level === "stopped" ? " stopped"
+        : st.schedule_running ? " sched" : "");
+
+    $("stepText").textContent = cleanText(st.step_text) || "空闲中";
     const pct = Math.round((st.progress || 0) * 100);
     $("progressFill").style.width = `${pct}%`;
     $("progressPct").textContent = `${pct}%`;
 
-    $("lastRun").textContent = st.last_run_str || "—";
     const cd = st.schedule_running ? formatCountdown(st.next_run_ts, st.server_now) : "";
-    $("nextRun").textContent = st.next_run_str && st.next_run_str !== "—" && cd
-      ? `${st.next_run_str} (${cd})` : (st.next_run_str || "—");
-
-    $("loginBanner").style.display = st.need_login_prompt ? "block" : "none";
-    const errEl = $("errorBanner");
-    if (st.error_text) {
-      errEl.textContent = "⚠️ " + st.error_text;
-      errEl.style.display = "block";
+    if (st.schedule_running && cd) {
+      $("islandTag").textContent = cd;
+    } else if (st.status_level === "err") {
+      $("islandTag").textContent = "异常";
+    } else if (st.status_level === "ok") {
+      $("islandTag").textContent = "已完成";
     } else {
-      errEl.style.display = "none";
+      $("islandTag").textContent = "待命";
     }
 
-    $("btnNow").disabled = Boolean(st.busy);
-    $("btnCapture").disabled = Boolean(st.busy);
+    const alertEl = $("islandAlert");
+    if (st.need_login_prompt) {
+      alertEl.className = "island-alert login";
+      alertEl.textContent = "请在弹出的浏览器中扫码登录 WPS，完成后将自动继续";
+    } else if (st.error_text) {
+      alertEl.className = "island-alert err";
+      alertEl.textContent = cleanText(st.error_text);
+    } else {
+      alertEl.className = "island-alert";
+      alertEl.textContent = "";
+    }
+
+    $("lastRun").textContent = st.last_run_str || "—";
+    $("sumNextRun").textContent = st.next_run_str && st.next_run_str !== "—" && cd
+      ? `${st.next_run_str} (${cd})` : (st.next_run_str || "—");
+
+    $("btnNow").disabled = busy;
+    $("btnCapture").disabled = busy;
 
     const schedBtn = $("btnSchedule");
     schedBtn.classList.toggle("schedule-on", Boolean(st.schedule_running));
     $("schedTitle").textContent = st.schedule_running ? "值守运行中" : "自动值守";
-    $("schedSub").textContent = st.schedule_running ? "点击可停止定时计划" : "点击开启定时计划";
+    $("schedSub").textContent = st.schedule_running
+      ? (cd ? `距下次 ${cd}` : "点击可停止定时计划")
+      : "点击开启定时计划";
 
     if (st.log_seq < lastLogSeq) {
-      $("logBox").innerHTML = "";
+      $("logBox").innerHTML = `<div class="log-empty" id="logEmpty">暂无运行日志</div>`;
     }
     lastLogSeq = st.log_seq;
     appendLogLines(st.logs);
@@ -1907,18 +2526,25 @@ async function pollState() {
 }
 
 function initTheme() {
-  const saved = localStorage.getItem("sheetmate_theme") || "light";
+  const saved = localStorage.getItem("sheetmate_ios18_theme") || "light";
   document.documentElement.setAttribute("data-theme", saved);
-  $("themeBtn").textContent = saved === "dark" ? "☀️" : "🌙";
+  $("themeBtn").innerHTML = saved === "dark" ? SVG_SUN : SVG_MOON;
   $("themeBtn").onclick = () => {
     const cur = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
     document.documentElement.setAttribute("data-theme", cur);
-    localStorage.setItem("sheetmate_theme", cur);
-    $("themeBtn").textContent = cur === "dark" ? "☀️" : "🌙";
+    localStorage.setItem("sheetmate_ios18_theme", cur);
+    $("themeBtn").innerHTML = cur === "dark" ? SVG_SUN : SVG_MOON;
   };
 }
 
 function bindEvents() {
+  for (const btn of $("tabbar").querySelectorAll(".tab-btn")) {
+    btn.onclick = () => switchTab(btn.dataset.tab);
+  }
+  for (const row of document.querySelectorAll(".ios-row[data-jump]")) {
+    row.onclick = () => switchTab(row.dataset.jump);
+  }
+
   for (const btn of $("dayModeSeg").querySelectorAll(".seg-btn")) {
     btn.onclick = () => {
       cfg.day_mode = btn.dataset.val;
@@ -1935,10 +2561,9 @@ function bindEvents() {
   }
 
   for (const id of [
-    "dayStart", "dayEnd", "dayIh", "dayIm",
-    "nightEnabled", "nightStart", "nightEnd", "nightIh", "nightIm",
-    "enableCapture", "enableDingtalk", "dtClearBeforeSend", "dtSilentSend", "dtAutoSend",
-    "cpSlot1", "cpStart1", "cpEnd1", "cpSlot2", "cpStart2", "cpEnd2"
+    "nightEnabled", "enableCapture", "enableDingtalk",
+    "dtClearBeforeSend", "dtSilentSend", "dtAutoSend",
+    "cpSlot1", "cpSlot2"
   ]) {
     $(id).addEventListener("change", () => {
       if (id === "cpSlot1") $("cpSlot1Body").classList.toggle("disabled", !$("cpSlot1").checked);
@@ -1960,18 +2585,73 @@ function bindEvents() {
     scheduleSave(true);
   };
 
-  $("connToggle").onclick = () => {
-    const acc = $("connAccordion");
-    const open = !acc.classList.contains("open");
-    acc.classList.toggle("open", open);
-    $("connChevron").classList.toggle("open", open);
+  // 时间 & 间隔底部滚轮选择器绑定
+  $("dayStartBtn").onclick = () => openPicker({
+    title: "白天开始时间", mode: "time", h: cfg.day.sh, m: cfg.day.sm,
+    onConfirm: (h, m) => { cfg.day.sh = h; cfg.day.sm = m; scheduleSave(true); }
+  });
+  $("dayEndBtn").onclick = () => openPicker({
+    title: "白天结束时间", mode: "time", h: cfg.day.eh, m: cfg.day.em,
+    onConfirm: (h, m) => { cfg.day.eh = h; cfg.day.em = m; scheduleSave(true); }
+  });
+  $("dayGapBtn").onclick = () => openPicker({
+    title: "白天执行间隔", mode: "gap", h: cfg.day.ih, m: cfg.day.im,
+    onConfirm: (h, m) => { cfg.day.ih = h; cfg.day.im = m; scheduleSave(true); }
+  });
+
+  $("nightStartBtn").onclick = () => openPicker({
+    title: "晚上开始时间", mode: "time", h: cfg.night.sh, m: cfg.night.sm,
+    onConfirm: (h, m) => { cfg.night.sh = h; cfg.night.sm = m; scheduleSave(true); }
+  });
+  $("nightEndBtn").onclick = () => openPicker({
+    title: "晚上结束时间", mode: "time", h: cfg.night.eh, m: cfg.night.em,
+    onConfirm: (h, m) => { cfg.night.eh = h; cfg.night.em = m; scheduleSave(true); }
+  });
+  $("nightGapBtn").onclick = () => openPicker({
+    title: "晚上执行间隔", mode: "gap", h: cfg.night.ih, m: cfg.night.im,
+    onConfirm: (h, m) => { cfg.night.ih = h; cfg.night.im = m; scheduleSave(true); }
+  });
+
+  const bindCpTimeBtn = (btnId, key, title) => {
+    $(btnId).onclick = () => {
+      const val = (cfg.capture_plan && cfg.capture_plan[cpProfile] && cfg.capture_plan[cpProfile][key]) || "09:00";
+      const [h, m] = val.split(":").map((x) => parseInt(x, 10) || 0);
+      openPicker({
+        title, mode: "time", h, m,
+        onConfirm: (nh, nm) => {
+          cfg.capture_plan[cpProfile][key] = hmStr(nh, nm);
+          renderCaptureProfile();
+          scheduleSave(true);
+        }
+      });
+    };
+  };
+  bindCpTimeBtn("cpStart1Btn", "start1", "时段 1 开始时间");
+  bindCpTimeBtn("cpEnd1Btn", "end1", "时段 1 结束时间");
+  bindCpTimeBtn("cpStart2Btn", "start2", "时段 2 开始时间");
+  bindCpTimeBtn("cpEnd2Btn", "end2", "时段 2 结束时间");
+
+  $("pickerCancel").onclick = () => $("pickerMask").classList.remove("show");
+  $("pickerMask").onclick = (e) => {
+    if (e.target === $("pickerMask")) $("pickerMask").classList.remove("show");
+  };
+  $("pickerDone").onclick = () => {
+    if (!pickerState) return;
+    const { mode, h, m, onConfirm } = pickerState;
+    if (mode === "gap" && h === 0 && m === 0) {
+      showToast("执行间隔不能为 0 分钟");
+      return;
+    }
+    $("pickerMask").classList.remove("show");
+    onConfirm(h, m);
   };
 
+  $("togglePassBtn").innerHTML = SVG_EYE;
   $("togglePassBtn").onclick = () => {
     const inp = $("luyaPass");
     const show = inp.type === "password";
     inp.type = show ? "text" : "password";
-    $("togglePassBtn").textContent = show ? "隐藏" : "显示";
+    $("togglePassBtn").innerHTML = show ? SVG_EYE_OFF : SVG_EYE;
   };
 
   $("btnNow").onclick = async () => {
@@ -2016,7 +2696,7 @@ function bindEvents() {
   };
   $("clearLogBtn").onclick = async () => {
     await api("/api/clear-logs", "POST");
-    $("logBox").innerHTML = "";
+    $("logBox").innerHTML = `<div class="log-empty" id="logEmpty">暂无运行日志</div>`;
     lastLogSeq = 0;
     showToast("日志已清空");
   };
@@ -2024,7 +2704,7 @@ function bindEvents() {
   $("resetBtn").onclick = async () => {
     const ok = await iosAlert(
       "恢复默认设置",
-      "当前运行的时段、间隔与钉钉群设置将被重置为出厂默认值。",
+      "当前时段、执行间隔与钉钉群设置将重置为出厂默认值。",
       { okText: "恢复默认", cancelText: "取消", danger: true }
     );
     if (!ok) return;
@@ -2051,7 +2731,6 @@ function bindEvents() {
 
 (async function bootstrap() {
   initTheme();
-  initSelectOptions();
   bindEvents();
   const data = await api("/api/config");
   cfg = data.config;
@@ -2190,7 +2869,7 @@ def start_ui_server(app, glass, tk_root):
 
 
 def show_settings_window(app):
-    """启动 iOS 18 风格原生感桌面控制中心 + 隐藏 Tk 驱动灵动岛浮窗。"""
+    """启动 iOS 18 风格桌面控制中心 + 隐藏 Tk 驱动灵动岛浮窗。"""
     import tkinter as tk
     import neu_ui as neu
 
@@ -2200,12 +2879,12 @@ def show_settings_window(app):
 
     server, ctrl, url, _token = start_ui_server(app, glass, tk_root)
 
-    win_w, win_h = 500, 880
+    win_w, win_h = 430, 840
     sw, sh = tk_root.winfo_screenwidth(), tk_root.winfo_screenheight()
     wx = max(20, (sw - win_w) // 2)
     wy = max(20, (sh - win_h) // 2)
 
-    shell_exe, kind = _find_app_shell_browser()
+    shell_exe, _kind = _find_app_shell_browser()
     proc = None
     launched_at = time.time()
 
@@ -2251,11 +2930,9 @@ def show_settings_window(app):
 
     def _watch_lifecycle():
         now = time.time()
-        # 方式1：前端发出 pagehide 关闭信号且超过 1.6 秒无新心跳重连，说明窗口真的关掉了
         if ctrl.close_requested_at > 0 and (now - ctrl.close_requested_at) > 1.6 and (now - ctrl.last_heartbeat) > 1.4:
             _shutdown()
             return
-        # 方式2：若独立 Edge 进程存在超过 3 秒后自行退出且最近 2.5 秒无前端心跳，则干净退出
         if proc is not None and (now - launched_at) > 3.0 and proc.poll() is not None and (now - ctrl.last_heartbeat) > 2.5:
             _shutdown()
             return

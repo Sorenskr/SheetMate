@@ -1025,12 +1025,19 @@ class GlassProgress:
         if i < n:
             self.win.after(18, lambda: self._fade_in(i + 1, n))
 
+    @staticmethod
+    def _clean_text(text):
+        import re
+        s = re.sub(r"[\u2600-\u27BF\U0001F300-\U0001FAFF\u23F0-\u23FA\u25A0-\u25FF\uFE0F]+", "", str(text or "")).strip()
+        return s
+
     def update_step(self, text, progress, color=None):
         self._ui(lambda: self._update_step(text, progress, color))
 
     def _update_step(self, text, progress, color=None):
         if self.closed or self.win is None or not hasattr(self, "step_lab"):
             return
+        text = self._clean_text(text)
         self._target = max(0.0, min(1.0, progress))
         if color:
             self._bar_color = color
@@ -1073,12 +1080,13 @@ class GlassProgress:
         else:
             self._bar_id = None
 
-    def finish(self, text="✅ 本轮跑完"):
+    def finish(self, text="本轮已完成"):
         self._ui(lambda: self._finish(text))
 
     def _finish(self, text):
         if self.closed or self.win is None or not hasattr(self, "step_lab"):
             return
+        text = self._clean_text(text) or "本轮已完成"
         self._bar_color = "#34c759"
         self._target = 1.0
         if self.step_lab.cget("text") != text:
@@ -1092,6 +1100,7 @@ class GlassProgress:
     def _fail(self, text):
         if self.win is None or not hasattr(self, "step_lab"):
             return
+        text = self._clean_text(text)
         self._bar_color = "#ff3b30"
         self._draw_bar(self._cur)
         if self.step_lab.cget("text") != text:

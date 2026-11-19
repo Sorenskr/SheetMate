@@ -1562,13 +1562,49 @@ def send_dingtalk_image(cfg):
                 _find_tab(doc, 0)
             except Exception:
                 pass
-            if tab_rect is not None and tab_rect.top - doc_rect.top > 30:
+            if tab_rect is not None and tab_rect.top - doc_rect.top > 12:
                 fx = int(doc_rect.left + (doc_rect.right - doc_rect.left) * 0.35)
-                fy = int(tab_rect.top - 28)
+                fy = int((doc_rect.top + tab_rect.top) / 2)
             else:
-                fx = int(doc_rect.left + 160)
-                fy = int(doc_rect.top + 32)
+                fx = int(doc_rect.left + (doc_rect.right - doc_rect.left) * 0.30)
+                fy = int(doc_rect.top + max(16, (doc_rect.bottom - doc_rect.top) * 0.035))
             ua.Click(fx, fy, waitTime=0.15)
+
+        def _iter_search_docs(doc):
+            documents = []
+            for _h, ctl in _search_controls():
+                try:
+                    d = ctl.DocumentControl(searchDepth=12, Name="advancedSearch")
+                    if d.Exists(0.05):
+                        documents.append(d)
+                except Exception:
+                    pass
+            return documents or [doc]
+
+        def _has_search_history(doc):
+            """判断搜索弹窗当前是否仍显示“搜索历史”区块（搜索框尚未接收到输入）。"""
+            found_hist = False
+
+            def _scan(ctrl, depth):
+                nonlocal found_hist
+                if found_hist or depth > 24:
+                    return
+                for ch in ctrl.GetChildren():
+                    try:
+                        if ch.ControlTypeName == "TextControl" and (ch.Name or "").strip() == "搜索历史":
+                            rect = ch.BoundingRectangle
+                            if rect.right > rect.left and rect.bottom > rect.top:
+                                found_hist = True
+                                return
+                    except Exception:
+                        pass
+                    _scan(ch, depth + 1)
+
+            for d in _iter_search_docs(doc):
+                _scan(d, 0)
+                if found_hist:
+                    break
+            return found_hist
 
         def _feature_item(doc):
             """解析搜索弹窗文档并精确返回命中的目标行控件矩形或控件。"""
@@ -1583,8 +1619,11 @@ def send_dingtalk_image(cfg):
             found = []
             headings = []
             text_items = []
+            hist_rect = None
+            common_rect = None
 
             def collect(ctrl, depth):
+                nonlocal hist_rect, common_rect
                 if depth > 24:
                     return
                 for k in ctrl.GetChildren():
@@ -1592,31 +1631,41 @@ def send_dingtalk_image(cfg):
                         ct = k.ControlTypeName
                         if ct in ("TextControl", "ButtonControl", "ListItemControl", "HyperlinkControl"):
                             name = k.Name or ""
-                            if name:
-                                rect = k.BoundingRectangle
-                                if rect.right > rect.left and rect.bottom > rect.top:
-                                    text_items.append((k, name, rect))
+                            name_stripped = name.strip()
+                            rect = k.BoundingRectangle
+                            valid_rect = rect.right > rect.left and rect.bottom > rect.top
+                            if name and valid_rect:
+                                text_items.append((k, name, rect))
+                            if ct == "TextControl" and valid_rect:
+                                if name_stripped == "搜索历史" and hist_rect is None:
+                                    hist_rect = rect
+                                elif name_stripped == "常用" and common_rect is None:
+                                    common_rect = rect
                             normalized = norm(name)
-                            if ct == "TextControl" and name in ("功能", "群组"):
-                                headings.append((name, k.BoundingRectangle))
-                            elif target and normalized.startswith(target):
-                                found.append((k, k.BoundingRectangle))
+                            if ct == "TextControl" and name_stripped in ("功能", "群组", "联系人", "常用") and valid_rect:
+                                headings.append((name_stripped, rect))
+                            elif target and normalized.startswith(target) and valid_rect:
+                                found.append((k, rect))
                     except Exception:
                         pass
                     collect(k, depth + 1)
 
-            documents = []
-            for _h, ctl in _search_controls():
-                try:
-                    d = ctl.DocumentControl(searchDepth=12, Name="advancedSearch")
-                    if d.Exists(0.05):
-                        documents.append(d)
-                except Exception:
-                    pass
-            if not documents:
-                documents = [doc]
-            for d in documents:
+            for d in _iter_search_docs(doc):
                 collect(d, 0)
+
+            def _in_history(r):
+                return (
+                    hist_rect is not None
+                    and r.top >= hist_rect.top - 4
+                    and (
+                        (common_rect is not None and r.top < common_rect.top - 4)
+                        or (common_rect is None and r.top < hist_rect.bottom + 90)
+                    )
+                )
+
+            if hist_rect is not None:
+                found = [(k, r) for k, r in found if not _in_history(r)]
+                text_items = [(k, name, r) for k, name, r in text_items if not _in_history(r)]
 
             # 按行聚合并拼接群名、emoji 与徽标文本
             if not found and (norm_tokens or len(target) >= 2):
@@ -1638,7 +1687,7 @@ def send_dingtalk_image(cfg):
                     candidates = [
                         (k, r) for k, name, r in row_items
                         if norm(name) and not norm(name).isdigit()
-                        and name not in ("功能", "群组", "内部群", "综合", "联系人", "聊天记录", "文档")
+                        and name.strip() not in ("功能", "群组", "内部群", "综合", "联系人", "聊天记录", "文档", "搜索历史", "常用")
                     ]
                     if candidates:
                         return max(candidates, key=lambda x: x[1].right - x[1].left)
@@ -1916,81 +1965,104 @@ def send_dingtalk_image(cfg):
             if bad2:
                 raise RuntimeError(f"检测到焦点仍在钉钉搜索框（{reason2}），已安全拦截粘贴")
 
-        # 3) 全局搜索定位目标会话（依次尝试提取出的高命中率纯文字关键词）
-        _force_front()
-        time.sleep(0.6)
-        chat_ready = False
-        for _attempt in range(3):
-            check_stop()
-            if _link_box() is not None:
-                _close_link_box()
-            _open_global_search()
-            popup_ctl, doc = None, None
-            for _ in range(20):
+        # 3) 全局搜索直达目标会话（Ctrl+Shift+F 打开即聚焦，直接粘贴完整目标名称并按 Enter 进入）
+        direct_candidates = [search_name] + [c for c in search_candidates if c and c != search_name]
+
+        def _wait_search_closed(loops=10, step=0.25):
+            for _ in range(loops):
                 check_stop()
-                popup_ctl, doc = _search_doc()
-                if doc is not None:
-                    break
-                time.sleep(0.45)
-            if doc is None:
-                log("  搜索窗口没打开，正在重试…")
-                continue
-
-            matched = None
-            for kw_idx, kw in enumerate(search_candidates):
-                check_stop()
-                _focus_search_input(popup_ctl, doc)
-                time.sleep(0.18)
-                ua.SendKeys("{Ctrl}a", waitTime=0.1)
-                ua.SendKeys("{BackSpace}", waitTime=0.1)
-                time.sleep(0.1)
-                # 纯 BMP 字符走 SendInput；若末尾兜底词含 4 字节 Emoji 代理对则安全走剪贴板粘贴（此时无图片）
-                if any(ord(ch) > 0xFFFF for ch in kw):
-                    _paste_text(kw, verify=False)
-                else:
-                    _type_unicode(kw)
-
-                wait_loops = 12 if kw_idx < len(search_candidates) - 1 else 16
-                for _ in range(wait_loops):
-                    check_stop()
-                    matched = _feature_item(doc)
-                    if matched is not None:
-                        break
-                    time.sleep(0.45)
-                if matched is not None:
-                    break
-                log(f"  关键词「{kw}」未匹配，切换下一关键词重试…")
-
-            if matched is None:
-                log("  没搜到目标，关闭搜索框后重试…")
-                ua.SendKeys("{Esc}", waitTime=0.25)
-                time.sleep(0.6)
-                continue
-
-            item_ctl, item_rect = matched
-            cx = int((item_rect.left + item_rect.right) / 2)
-            cy = int((item_rect.top + item_rect.bottom) / 2)
-            ua.Click(cx, cy, waitTime=0.3)
-
-            # 严禁仅用 _search_doc() is None 判断！必须确认 ToolSaveBits 搜索窗完全关闭
-            entered = False
-            for _ in range(18):
-                check_stop()
-                time.sleep(0.35)
+                time.sleep(step)
                 if not _is_search_popup_open():
                     time.sleep(0.2)
                     if not _is_search_popup_open():
-                        entered = True
-                        break
-            if entered:
-                chat_ready = True
+                        return True
+            return False
+
+        chat_ready = False
+        for _attempt in range(3):
+            check_stop()
+            _force_front()
+            time.sleep(0.45)
+            if _link_box() is not None:
+                _close_link_box()
+            _open_global_search()
+
+            opened = False
+            for _ in range(14):
+                check_stop()
+                if _is_search_popup_open():
+                    opened = True
+                    break
+                time.sleep(0.25)
+            popup_ctl, doc = (None, None) if opened else _search_doc()
+            if not opened and doc is None:
+                log("  搜索窗口没打开，正在重试…")
+                continue
+            time.sleep(0.3)
+
+            for kw_idx, kw in enumerate(direct_candidates):
+                check_stop()
+                if kw_idx > 0:
+                    if not _is_search_popup_open():
+                        _open_global_search()
+                        for _ in range(14):
+                            check_stop()
+                            if _is_search_popup_open():
+                                break
+                            time.sleep(0.25)
+                        time.sleep(0.25)
+                    popup_ctl, doc = _search_doc()
+                    if doc is not None:
+                        _focus_search_input(popup_ctl, doc)
+                        time.sleep(0.15)
+
+                ua.SendKeys("{Ctrl}a", waitTime=0.08)
+                ua.SendKeys("{Back}", waitTime=0.08)
+                if not _paste_text(kw, verify=True):
+                    log(f"  关键词「{kw}」写入剪贴板未就绪，跳过重试…")
+                    continue
+                time.sleep(0.85)
+
+                # 极端情况下若搜索历史仍未消失，重新聚焦搜索框再贴一遍兜底
+                popup_ctl, doc = _search_doc()
+                if doc is not None and _has_search_history(doc):
+                    log(f"  检测到搜索框尚未接收内容，重新聚焦并粘贴「{kw}」…")
+                    _focus_search_input(popup_ctl, doc)
+                    time.sleep(0.15)
+                    ua.SendKeys("{Ctrl}a", waitTime=0.08)
+                    ua.SendKeys("{Back}", waitTime=0.08)
+                    if _paste_text(kw, verify=True):
+                        time.sleep(0.85)
+
+                # 直接按 Enter 打开首选/高亮会话
+                ua.SendKeys("{Enter}", waitTime=0.3)
+                if _wait_search_closed(loops=10, step=0.25):
+                    chat_ready = True
+                    break
+
+                # 若回车后弹窗未退，且列表已有搜索结果，尝试精准点击命中行兜底
+                popup_ctl, doc = _search_doc()
+                if doc is not None and not _has_search_history(doc):
+                    matched = _feature_item(doc)
+                    if matched is not None:
+                        _item_ctl, item_rect = matched
+                        cx = int((item_rect.left + item_rect.right) / 2)
+                        cy = int((item_rect.top + item_rect.bottom) / 2)
+                        ua.Click(cx, cy, waitTime=0.3)
+                        if _wait_search_closed(loops=10, step=0.25):
+                            chat_ready = True
+                            break
+                log(f"  关键词「{kw}」未直接进入会话，尝试下一候选词…")
+
+            if chat_ready:
                 break
-            log("  搜索弹窗尚未退出，关闭后重试…")
+            log("  本轮未进入目标会话，关闭搜索框后重试…")
             ua.SendKeys("{Esc}", waitTime=0.25)
             time.sleep(0.5)
 
         if not chat_ready:
             raise RuntimeError("没能定位到钉钉会话，已停止发送")
+        clear_clipboard_windows()
         log("  已打开目标会话，准备粘贴图片")
 
         # 4) 聚焦底部聊天输入框并先清空残留内容，再把图片写入剪贴板并粘贴
@@ -2004,10 +2076,10 @@ def send_dingtalk_image(cfg):
 
         if cfg.get("dt_clear_before_send", True):
             ua.SendKeys("{Ctrl}a", waitTime=0.15)
-            ua.SendKeys("{BackSpace}", waitTime=0.15)
+            ua.SendKeys("{Back}", waitTime=0.15)
             ua.SendKeys("{Delete}", waitTime=0.15)
             ua.SendKeys("{Ctrl}a", waitTime=0.1)
-            ua.SendKeys("{BackSpace}", waitTime=0.2)
+            ua.SendKeys("{Back}", waitTime=0.2)
             log("  已清空发送框内原有内容")
 
         if not set_clipboard_image_from_file(tmp_img):
