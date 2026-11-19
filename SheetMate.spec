@@ -1,13 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('icon.png', '.'), ('icon.ico', '.')]
+datas = [('icon.png', '.'), ('icon.ico', '.'), ('templates', 'templates')]
 binaries = []
 hiddenimports = ['openpyxl', 'PIL', 'typing_extensions', 'uiautomation',
-                 'comtypes', 'neu_ui', 'sheetmate_ui', 'ios_ui']
+                 'comtypes', 'pywinauto', 'pyautogui', 'pyscreeze',
+                 'pymsgbox', 'pytweening', 'pygetwindow', 'pyperclip',
+                 'mouseinfo', 'cv2', 'numpy', 'win32api', 'win32con',
+                 'win32gui', 'win32process', 'neu_ui', 'sheetmate_ui', 'ios_ui']
 tmp_ret = collect_all('playwright')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-for pkg in ('uiautomation', 'comtypes'):
+for pkg in ('uiautomation', 'comtypes', 'pywinauto', 'pyscreeze'):
     tmp_ret = collect_all(pkg)
     datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

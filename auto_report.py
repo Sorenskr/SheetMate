@@ -211,9 +211,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.0.0","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.0.1","url":"新版exe的下载直链"}
 UPDATE_CHECK_URL = "https://raw.githubusercontent.com/Sorenskr/SheetMate/main/version.json"
 
 _DEFAULT_RUNNING_HINT = "按键提示：临时用电脑可点【暂停】，忙完点【继续】；点【取消】终止本轮"
@@ -586,34 +586,41 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
     # 8. 钉钉未搜索到目标群聊
     if stage == "dingtalk_search":
         target = extra.get("search_name") or "目标群聊"
+        acts = [
+            {"id": "skip_search", "label": "已手动开群·直接粘贴", "style": "primary"},
+            {"id": "retry", "label": "重新搜索群聊", "style": "secondary"},
+        ]
+        if extra.get("can_skip_target"):
+            acts.append({"id": "skip_target", "label": f"跳过「{target[:8]}」·发下一个", "style": "secondary"})
         return {
-            "title": f"钉钉未能自动搜到群聊「{target}」",
+            "title": f"钉钉未能自动搜到会话「{target}」",
             "detail": (
                 "表格图片已安全保存，不会丢失！您可以任选一种方式继续：\n"
-                "方案A（推荐）：直接在钉钉里手动点开目标群聊窗口，然后点【已手动开群·直接粘贴】，将自动清空草稿、贴图贴字并设为静音；\n"
-                "方案B：确认群聊名称正确或切回钉钉主窗后，点【重新搜索群聊】。"
+                "方案A（推荐）：直接在钉钉里手动点开目标群聊/联系人窗口，然后点【已手动开群·直接粘贴】，将自动清空草稿、贴图贴字；\n"
+                "方案B：确认名称正确或切回钉钉主窗后，点【重新搜索群聊】。"
             ),
-            "hint": "按键提示：手动点开群后点【已手动开群·直接粘贴】，或点【重新搜索群聊】。",
-            "actions": [
-                {"id": "skip_search", "label": "已手动开群·直接粘贴", "style": "primary"},
-                {"id": "retry", "label": "重新搜索群聊", "style": "secondary"},
-            ],
+            "hint": "按键提示：手动点开会话后点【已手动开群·直接粘贴】，或点【重新搜索群聊】。",
+            "actions": acts,
         }
 
     # 9. 钉钉粘贴或输入框焦点受阻
     if stage == "dingtalk_paste":
+        target = extra.get("search_name") or "目标群聊"
+        acts = [
+            {"id": "retry_paste", "label": "直接粘贴重试", "style": "primary"},
+            {"id": "retry", "label": "重新搜索群聊", "style": "secondary"},
+        ]
+        if extra.get("can_skip_target"):
+            acts.append({"id": "skip_target", "label": f"跳过「{target[:8]}」·发下一个", "style": "secondary"})
         return {
-            "title": "钉钉粘贴图片或文字时受阻",
+            "title": f"钉钉粘贴到「{target}」时受阻",
             "detail": (
                 f"表格图片仍已保留（原因：{human_error(err_s)}）。\n"
-                "1. 请在钉钉点开要发送的目标群聊聊天窗口，关闭遮挡小窗；\n"
+                "1. 请在钉钉点开要发送的目标聊天窗口，关闭遮挡小窗；\n"
                 "2. 确认后点【直接粘贴重试】即可把图和文字贴进去，或点【重新搜索群聊】。"
             ),
-            "hint": "按键提示：点开群聊天窗口后点击【直接粘贴重试】继续发送。",
-            "actions": [
-                {"id": "retry_paste", "label": "直接粘贴重试", "style": "primary"},
-                {"id": "retry", "label": "重新搜索群聊", "style": "secondary"},
-            ],
+            "hint": "按键提示：点开聊天窗口后点击【直接粘贴重试】继续发送。",
+            "actions": acts,
         }
 
     return {
@@ -923,10 +930,30 @@ def get_clipboard_image_size():
     return None
 
 
+def _ps_sq(val):
+    """转义 PowerShell 单引号字面量，避免用户目录包含单引号时执行失败。"""
+    return str(val).replace("'", "''")
+
+
+def _find_bundle_asset(rel_path):
+    """兼容源码目录与 PyInstaller 单文件解压目录查找内置资源文件。"""
+    candidates = [Path(__file__).resolve().parent / rel_path]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.insert(0, Path(meipass) / rel_path)
+    candidates.append(app_dir() / rel_path)
+    for p in candidates:
+        try:
+            if p.exists():
+                return p
+        except Exception:
+            pass
+    return None
+
+
 def save_clipboard_image(path):
     """把剪贴板里的图片（位图）保存成文件；只取位图，天然净化掉其他格式。"""
-    out = _ps_clipboard(
-        f"[System.Windows.Forms.Clipboard]::GetImage().Save('{path}')")
+    _ps_clipboard(f"[System.Windows.Forms.Clipboard]::GetImage().Save('{_ps_sq(path)}')")
     return Path(path).exists()
 
 
@@ -937,7 +964,7 @@ def save_clipboard_image_if_exists(path):
     """
     out = _ps_clipboard(
         "if ([System.Windows.Forms.Clipboard]::ContainsImage()) {"
-        f"[System.Windows.Forms.Clipboard]::GetImage().Save('{path}');"
+        f"[System.Windows.Forms.Clipboard]::GetImage().Save('{_ps_sq(path)}');"
         "Write-Output 'saved'} else {Write-Output 'noimage'}")
     if "saved" in out:
         return "saved"
@@ -964,7 +991,7 @@ def set_clipboard_image_from_file(path):
     except Exception:
         use_path = src
     ps = (
-        f"$img=[System.Drawing.Image]::FromFile('{use_path}');"
+        f"$img=[System.Drawing.Image]::FromFile('{_ps_sq(use_path)}');"
         "$bmp=New-Object System.Drawing.Bitmap($img);$ok=$false;"
         "for($i=0;$i -lt 6;$i++){try{[System.Windows.Forms.Clipboard]::SetImage($bmp);"
         "$ok=$true;break}catch{Start-Sleep -Milliseconds 250}};"
@@ -991,11 +1018,14 @@ DEFAULT_CONFIG = {
     "dt_auto_send": False,       # 默认先不自动发；开启后才自动按 Enter 发送
     "dt_clear_before_send": True,  # 粘贴前先清空聊天输入框原有残留内容
     "dt_silent_send": True,      # 发送前自动勾选「设为静音」（静音发送）
-    "dt_search": "文件小助手",    # 钉钉搜索的会话名
+    "dt_search": "文件小助手",    # 钉钉搜索的主会话名（兼容单目标及回退）
+    "dt_targets": [],            # 多目标列表：[{"name": "文件小助手", "enabled": True}, ...]
     "dt_suffix": "",             # 默认后缀：留空表示平时仅发时间戳，只在命中的分时段规则加后缀
     "suffix_rules": [],          # [{"enabled": True, "start": "11:30", "end": "12:30", "suffix": "午间数据"}]
-    "point_overrides": {},       # {"HH:MM": {"mode": "default|send|table_only", "suffix": None|"xxx"}}
+    "point_overrides": {},       # {"HH:MM": {"mode": "default|send|table_only", "suffix": None|"xxx", "silent": None|True|False}}
     "open_wps_after_run": False, # 每轮跑完是否自动用系统浏览器/WPS打开表格（默认关闭避免自动值守弹窗扰民）
+    "prevent_sleep": True,       # 自动值守与运行期间阻止电脑自动休眠/息屏
+    "save_shot_history": True,   # 自动归档最近 20 张汇总表截图至 history_shots
     # 独立截图发送时段：只约束自动计划，手动按钮始终可以立即执行。
     "capture_plan": {
         "enabled": False,
@@ -1012,6 +1042,34 @@ DEFAULT_CONFIG = {
         },
     },
 }
+
+
+def _split_target_names(raw):
+    """按换行或中英文逗号/分号拆分并去重会话名称。"""
+    items = []
+    for part in re.split(r"[\r\n,;，；]+", str(raw or "")):
+        s = part.strip()
+        if s and s not in items:
+            items.append(s)
+    return items
+
+
+def get_enabled_dt_targets(cfg):
+    """按序提取当前配置中所有已启用的钉钉目标群聊/联系人名称列表。"""
+    c = cfg if isinstance(cfg, dict) else {}
+    raw_targets = c.get("dt_targets")
+    if isinstance(raw_targets, list):
+        named_items = [it for it in raw_targets if isinstance(it, dict) and str(it.get("name") or "").strip()]
+        if named_items:
+            out = []
+            for it in named_items:
+                if it.get("enabled", True):
+                    for nm in _split_target_names(it.get("name")):
+                        if nm not in out:
+                            out.append(nm)
+            return out
+    fallback = _split_target_names(c.get("dt_search") or "文件小助手")
+    return fallback or ["文件小助手"]
 
 
 def _deep_merge(default, saved):
@@ -1067,6 +1125,30 @@ def normalize_config(cfg):
     out["dt_suffix"] = "" if raw_suf is None else str(raw_suf).strip()
     out["dt_search"] = str(out.get("dt_search") or "文件小助手").strip() or "文件小助手"
     out["open_wps_after_run"] = bool(out.get("open_wps_after_run", False))
+    out["prevent_sleep"] = bool(out.get("prevent_sleep", True))
+    out["save_shot_history"] = bool(out.get("save_shot_history", True))
+
+    targets = []
+    seen_targets = set()
+    raw_targets = out.get("dt_targets")
+    if isinstance(raw_targets, list):
+        for item in raw_targets:
+            if not isinstance(item, dict):
+                continue
+            nm = str(item.get("name") or "").strip()
+            if nm and nm not in seen_targets:
+                seen_targets.add(nm)
+                targets.append({"name": nm, "enabled": bool(item.get("enabled", True))})
+    if not targets:
+        for nm in _split_target_names(out["dt_search"]):
+            if nm not in seen_targets:
+                seen_targets.add(nm)
+                targets.append({"name": nm, "enabled": True})
+    if not targets:
+        targets = [{"name": "文件小助手", "enabled": True}]
+    out["dt_targets"] = targets
+    first_enabled = next((t["name"] for t in targets if t["enabled"]), targets[0]["name"])
+    out["dt_search"] = first_enabled
 
     rules = []
     for item in (out.get("suffix_rules") or []):
@@ -1095,9 +1177,11 @@ def normalize_config(cfg):
             suf_v = v.get("suffix", None)
             if suf_v is not None:
                 suf_v = str(suf_v).strip()
-            if mode == "default" and suf_v is None:
+            sil_raw = v.get("silent", None)
+            sil_v = sil_raw if isinstance(sil_raw, bool) else None
+            if mode == "default" and suf_v is None and sil_v is None:
                 continue
-            overrides[hm_k] = {"mode": mode, "suffix": suf_v}
+            overrides[hm_k] = {"mode": mode, "suffix": suf_v, "silent": sil_v}
     out["point_overrides"] = overrides
 
     cp = out.get("capture_plan") if isinstance(out.get("capture_plan"), dict) else {}
@@ -1225,6 +1309,134 @@ def resolve_suffix_for_time(cfg, lt=None, hm_override=None):
     return ("" if default_suf is None else str(default_suf).strip()), "默认"
 
 
+def resolve_silent_for_time(cfg, lt=None, hm_override=None):
+    """按单点覆盖 -> 全局默认 解析指定时刻是否开启静音发送，返回 (do_silent, source)。"""
+    lt = lt or time.localtime()
+    hm = _norm_hm_str(hm_override, f"{lt.tm_hour:02d}:{lt.tm_min:02d}") if hm_override else f"{lt.tm_hour:02d}:{lt.tm_min:02d}"
+    ov = ((cfg or {}).get("point_overrides") or {}).get(hm)
+    if isinstance(ov, dict) and isinstance(ov.get("silent"), bool):
+        return bool(ov["silent"]), "单点设置"
+    return bool((cfg or {}).get("dt_silent_send", True)), "全局默认"
+
+
+_keep_awake_lock = threading.Lock()
+_keep_awake_reasons = set()
+
+
+def set_keep_awake(enable=True, reason="manual"):
+    """调用 Win32 SetThreadExecutionState 在自动值守或执行期间阻止电脑自动休眠与息屏。"""
+    if os.name != "nt":
+        return False
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ES_DISPLAY_REQUIRED = 0x00000002
+    with _keep_awake_lock:
+        if enable:
+            _keep_awake_reasons.add(reason)
+            flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+        else:
+            _keep_awake_reasons.discard(reason)
+            if _keep_awake_reasons:
+                return True
+            flags = ES_CONTINUOUS
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.SetThreadExecutionState.argtypes = [wintypes.DWORD]
+        k32.SetThreadExecutionState.restype = wintypes.DWORD
+        prev = k32.SetThreadExecutionState(flags)
+        return prev != 0
+    except Exception:
+        return False
+
+
+def archive_history_shot(src_path, keep=20):
+    """归档最新汇总表截图到本地 history_shots 目录并滚动保留最近 keep 张。"""
+    try:
+        import shutil
+        src = Path(src_path)
+        if not src.exists():
+            return None
+        hist_dir = app_dir() / "history_shots"
+        hist_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        dest = hist_dir / f"汇总_{stamp}.png"
+        if dest.exists():
+            dest = hist_dir / f"汇总_{stamp}_{int(time.time() * 1000) % 1000:03d}.png"
+        shutil.copy2(src, dest)
+        shots = sorted(
+            [p for p in hist_dir.glob("*.png") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old_p in shots[max(1, int(keep)):]:
+            try:
+                old_p.unlink()
+            except Exception:
+                pass
+        return dest
+    except Exception:
+        return None
+
+
+def diagnose_dingtalk_env():
+    """一键检测钉钉安装路径、运行主窗、同权限一致性及图像匹配模板完整性（零键鼠扰动）。"""
+    priv = check_dingtalk_privilege_match()
+    procs = _list_dingtalk_processes()
+    cands = _resolve_dingtalk_exe_candidates()
+    existing_exe = next((p for p in cands if p and os.path.exists(p)), "")
+
+    win_count = 0
+    login_only = False
+    try:
+        wins = _enum_top_windows(
+            target_classes=("DtMainFrameView", "Qt51511QWindowIcon"),
+            target_titles=None,
+        )
+        if not wins:
+            wins = _enum_top_windows(target_classes=None, target_titles=("钉钉", "DingTalk"))
+        win_count = len(wins)
+        if wins:
+            try:
+                import uiautomation as ua  # type: ignore[import-not-found]
+                ctl = ua.ControlFromHandle(wins[0][0])
+                if ctl is not None and _is_dingtalk_login_window(ctl):
+                    login_only = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    tpl_names = ("send_pill.png", "send_arrow.png", "menu_set_silent.png", "badge_silent_on.png")
+    tpl_ok = [nm for nm in tpl_names if _find_bundle_asset(Path("templates") / nm) is not None]
+    tpl_missing = [nm for nm in tpl_names if nm not in tpl_ok]
+
+    self_lbl = "管理员权限" if priv.get("self_elevated") else "普通用户权限"
+    ding_lbl = (
+        "管理员权限" if priv.get("ding_elevated")
+        else ("普通用户权限" if priv.get("ding_elevated") is False else "未运行")
+    )
+    lines = [
+        f"• 本程序权限：{self_lbl}",
+        f"• 钉钉进程：{len(procs)} 个（{ding_lbl}）",
+        f"• 安装路径：{existing_exe or '暂未找到可执行文件'}",
+        f"• 主窗口状态：{'未登录/扫码页' if login_only else (f'已就绪（{win_count} 个主窗）' if win_count else '托盘隐藏或未打开')}",
+        f"• 图像兜底模板：{len(tpl_ok)}/{len(tpl_names)} 张就绪" + (f"（缺失：{','.join(tpl_missing)}）" if tpl_missing else ""),
+    ]
+    if not priv.get("matched", True):
+        lines.append("⚠️ 权限不一致，请关闭后以相同权限启动钉钉或本程序！")
+    ok = bool(priv.get("matched", True)) and bool(tpl_missing == []) and (len(procs) > 0 or bool(existing_exe))
+    return {
+        "ok": ok,
+        "privilege_matched": bool(priv.get("matched", True)),
+        "proc_count": len(procs),
+        "win_count": win_count,
+        "login_only": login_only,
+        "exe_path": existing_exe,
+        "templates_missing": tpl_missing,
+        "summary": "\n".join(lines),
+    }
+
+
 def capture_allowed_now(cfg, now=None, hm_override=None):
     """自动计划是否允许此时截图发钉钉；先查单点覆盖，再查多时段允许窗口。"""
     now = now or time.localtime()
@@ -1309,14 +1521,21 @@ def build_daily_timetable(cfg):
             do_capture = g_cap and allowed
             do_dingtalk = g_dt and allowed and do_capture
         suf, suf_src = resolve_suffix_for_time(cfg, hm_override=hm)
+        do_silent, silent_src = resolve_silent_for_time(cfg, hm_override=hm)
+        sil_ov = ov.get("silent") if isinstance(ov.get("silent"), bool) else None
+        has_custom_suf = ("suffix" in ov and ov["suffix"] is not None)
         timetable.append({
             "time": hm,
             "min": m,
             "period": points[m],
             "do_capture": do_capture,
             "do_dingtalk": do_dingtalk,
+            "do_silent": do_silent,
+            "silent_source": silent_src,
+            "silent_override": sil_ov,
             "suffix": suf,
             "suffix_source": suf_src,
+            "has_custom_suffix": has_custom_suf,
             "override_mode": ov_mode,
         })
     return timetable
@@ -2121,29 +2340,780 @@ def _is_dingtalk_login_window(win):
     return False
 
 
+def get_process_elevation(pid=None):
+    """检测当前进程或指定 PID 是否以管理员权限运行：True(管理员) / False(普通) / None(无法判定)。"""
+    if os.name != "nt":
+        return None
+    TOKEN_QUERY = 0x0008
+    TokenElevation = 20
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    k32.GetCurrentProcess.argtypes = []
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    adv32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    adv32.OpenProcessToken.restype = wintypes.BOOL
+    adv32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+    ]
+    adv32.GetTokenInformation.restype = wintypes.BOOL
+
+    class TOKEN_ELEVATION(ctypes.Structure):
+        _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+    close_proc = False
+    if pid is None:
+        proc_handle = k32.GetCurrentProcess()
+    else:
+        proc_handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not proc_handle:
+            if ctypes.get_last_error() == 5 and get_process_elevation(None) is False:
+                return True
+            return None
+        close_proc = True
+
+    tok = wintypes.HANDLE()
+    try:
+        if not adv32.OpenProcessToken(proc_handle, TOKEN_QUERY, ctypes.byref(tok)):
+            if ctypes.get_last_error() == 5 and pid is not None and get_process_elevation(None) is False:
+                return True
+            return None
+        try:
+            elev = TOKEN_ELEVATION()
+            rl = wintypes.DWORD()
+            ok = adv32.GetTokenInformation(tok, TokenElevation, ctypes.byref(elev), ctypes.sizeof(elev), ctypes.byref(rl))
+            if not ok:
+                return None
+            return bool(elev.TokenIsElevated)
+        finally:
+            k32.CloseHandle(tok)
+    finally:
+        if close_proc and proc_handle:
+            k32.CloseHandle(proc_handle)
+
+
+def _list_dingtalk_processes():
+    """枚举当前系统运行的 DingTalk.exe 进程，返回 [(pid, exe_path), ...]。"""
+    if os.name != "nt":
+        return []
+    TH32CS_SNAPPROCESS = 0x00000002
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+    ]
+    k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32FirstW.restype = wintypes.BOOL
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32NextW.restype = wintypes.BOOL
+
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap in (None, 0, -1, ctypes.c_void_p(-1).value):
+        return []
+    out = []
+    try:
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if not k32.Process32FirstW(snap, ctypes.byref(pe)):
+            return []
+        while True:
+            if (pe.szExeFile or "").lower() == "dingtalk.exe":
+                pid = int(pe.th32ProcessID)
+                exe_path = ""
+                hp = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                if hp:
+                    try:
+                        buf = ctypes.create_unicode_buffer(1024)
+                        sz = wintypes.DWORD(1024)
+                        if k32.QueryFullProcessImageNameW(hp, 0, buf, ctypes.byref(sz)):
+                            exe_path = buf.value
+                    finally:
+                        k32.CloseHandle(hp)
+                out.append((pid, exe_path))
+            if not k32.Process32NextW(snap, ctypes.byref(pe)):
+                break
+    finally:
+        k32.CloseHandle(snap)
+    return out
+
+
+def _resolve_dingtalk_exe_candidates():
+    """综合正在运行进程、Windows 注册表与常见盘符目录，动态定位 DingTalk.exe 安装路径。"""
+    cands = []
+    for _pid, ppath in _list_dingtalk_processes():
+        if ppath and ppath not in cands:
+            cands.append(ppath)
+    if os.name == "nt":
+        try:
+            import winreg
+            reg_queries = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\DingTalk.exe"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\DingTalk.exe"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\DingDing"),
+            ]
+            for root_k, sub in reg_queries:
+                try:
+                    with winreg.OpenKey(root_k, sub) as k:
+                        val, _ = winreg.QueryValueEx(k, "")
+                        v = str(val or "").strip().strip('"')
+                        if v.lower().endswith(".exe") and v not in cands:
+                            cands.append(v)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    defaults = [
+        r"D:\Program Files (x86)\DingDing\main\current_new\DingTalk.exe",
+        r"C:\Program Files (x86)\DingDing\main\current_new\DingTalk.exe",
+        r"C:\Program Files\DingDing\main\current_new\DingTalk.exe",
+        r"D:\Program Files\DingDing\main\current_new\DingTalk.exe",
+        r"E:\Program Files (x86)\DingDing\main\current_new\DingTalk.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\DingDing\main\current_new\DingTalk.exe"),
+    ]
+    for d in defaults:
+        if d and d not in cands:
+            cands.append(d)
+    return cands
+
+
+def check_dingtalk_privilege_match():
+    """检查当前脚本与钉钉是否同权限运行（同为管理员或同为普通用户），避免 UIPI 静默拦截。"""
+    self_elev = get_process_elevation(None)
+    procs = _list_dingtalk_processes()
+    if not procs:
+        role = "管理员权限" if self_elev else "普通用户权限"
+        return {
+            "self_elevated": self_elev,
+            "ding_running": False,
+            "ding_elevated": None,
+            "matched": True,
+            "message": f"当前程序运行级别：{role}（暂未检测到运行中的 DingTalk.exe，发送时请保持同权限启动钉钉）",
+        }
+    ding_elev = None
+    for pid, _pp in procs:
+        ev = get_process_elevation(pid)
+        if ev is not None:
+            ding_elev = ev
+            if ev is True:
+                break
+    matched = (self_elev is None) or (ding_elev is None) or (self_elev == ding_elev)
+    self_lbl = "管理员权限" if self_elev else "普通用户权限"
+    ding_lbl = "管理员权限" if ding_elev else ("普通用户权限" if ding_elev is False else "未知权限")
+    if matched:
+        msg = f"权限校验通过：当前程序与钉钉均运行在【{self_lbl}】"
+    else:
+        msg = (
+            f"权限不一致警告：本程序为【{self_lbl}】，而钉钉为【{ding_lbl}】！"
+            "两者权限不同会导致点「静音发送」或按键被 Windows 拦截，请关闭后以相同权限重新启动！"
+        )
+    return {
+        "self_elevated": self_elev,
+        "ding_running": True,
+        "ding_elevated": ding_elev,
+        "matched": matched,
+        "message": msg,
+    }
+
+
+def _retry_step(step_name, fn, retries=2, interval=1.0):
+    """按要求为单个操作步骤增加最多 retries 次重试，每次间隔 interval 秒。"""
+    last_err = None
+    for attempt in range(retries + 1):
+        check_stop()
+        try:
+            res = fn()
+            if res is not False:
+                return res
+            last_err = RuntimeError(f"{step_name} 返回未完成")
+        except Exception as e:
+            if "手动停止" in str(e):
+                raise
+            last_err = e
+        if attempt < retries:
+            log(f"  [{step_name}] 第 {attempt + 1} 次未成功，{interval:g} 秒后重试（剩余 {retries - attempt} 次）…")
+            sleep_check(interval)
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"{step_name} 重试耗尽仍失败")
+
+
+def _unwrap_uia(ctrl):
+    """兼容 WindowSpecification 与 UIAWrapper，统一返回底层 UIAWrapper。"""
+    if ctrl is not None and hasattr(ctrl, "wrapper_object"):
+        return ctrl.wrapper_object()
+    return ctrl
+
+
+def _connect_dingtalk_pywinauto(timeout=5.0):
+    """使用 pywinauto(backend='uia') 通过 connect(path='DingTalk.exe') 连接钉钉主窗口（不使用窗口标题）。"""
+    from pywinauto import Application, Desktop  # type: ignore[import-not-found]
+
+    procs = _list_dingtalk_processes()
+    pids = {p for p, _ in procs}
+    target_path = procs[0][1] if (procs and procs[0][1]) else "DingTalk.exe"
+
+    desk = Desktop(backend="uia")
+    ui_win = None
+    for w in desk.windows():
+        try:
+            if pids and w.process_id() not in pids:
+                continue
+            cls = (w.element_info.class_name or "")
+            if cls in ("DtMainFrameView", "Qt51511QWindowIcon"):
+                ui_win = w
+                break
+            if w.is_visible() and w.rectangle().width() >= 560 and w.rectangle().height() >= 380:
+                ui_win = w
+        except Exception:
+            pass
+
+    app = None
+    try:
+        app = Application(backend="uia").connect(path="DingTalk.exe", timeout=min(3.0, timeout))
+        if ui_win is not None and app.process != ui_win.process_id():
+            app = Application(backend="uia").connect(process=ui_win.process_id(), timeout=timeout)
+    except Exception:
+        if ui_win is not None:
+            app = Application(backend="uia").connect(process=ui_win.process_id(), timeout=timeout)
+        else:
+            app = Application(backend="uia").connect(path=target_path, timeout=timeout)
+
+    # 始终返回支持 child_window(...) 的 WindowSpecification（仅按句柄或类，绝不使用窗口标题）
+    if ui_win is not None:
+        win_spec = app.window(handle=ui_win.handle)
+    else:
+        cand = app.window(class_name="DtMainFrameView")
+        win_spec = cand if cand.exists(timeout=1.5) else app.top_window()
+    return app, win_spec, pids
+
+
+def _dump_uia_controls_to_log(uia_win, pids=None, max_depth=16):
+    """UIA 失败时将主窗下半区域与弹出层控件树（control_type / name / automation_id）打印到日志。"""
+    log("  ===== UIA 可用控件树快照（排查参考）=====")
+    lines = []
+    root_wrap = _unwrap_uia(uia_win)
+    try:
+        wrect = root_wrap.rectangle() if root_wrap is not None else None
+    except Exception:
+        wrect = None
+
+    def _walk(ctrl, depth=0):
+        if depth > max_depth or len(lines) >= 140:
+            return
+        try:
+            info = ctrl.element_info
+            ct = info.control_type or ""
+            nm = (info.name or "").replace("\r", " ").replace("\n", " ").strip()
+            aid = info.automation_id or ""
+            cls = info.class_name or ""
+            rr = ctrl.rectangle()
+            if (nm or aid or ct in ("Button", "MenuItem", "SplitButton", "Edit", "Document")) and (
+                wrect is None or depth <= 4 or rr.top >= wrect.top + int((wrect.bottom - wrect.top) * 0.62)
+            ):
+                lines.append(f"{'  '*min(depth, 6)}[{ct}] name={nm!r} auto_id={aid!r} cls={cls!r}")
+        except Exception:
+            return
+        try:
+            for ch in ctrl.children():
+                _walk(ch, depth + 1)
+        except Exception:
+            pass
+
+    if root_wrap is not None:
+        _walk(root_wrap, 0)
+    if pids:
+        try:
+            from pywinauto import Desktop  # type: ignore[import-not-found]
+            root_hwnd = root_wrap.element_info.handle if root_wrap is not None else None
+            for pw in Desktop(backend="uia").windows():
+                try:
+                    if pw.process_id() in pids and (root_hwnd is None or pw.element_info.handle != root_hwnd):
+                        lines.append(f"[弹出层] cls={pw.element_info.class_name!r} name={pw.element_info.name!r}")
+                        _walk(pw, 1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if not lines:
+        log("  （控件树未暴露可识别子节点）")
+    else:
+        for ln in lines[:120]:
+            log(f"  {ln}")
+    log("  ===== 控件树快照结束 =====")
+
+
+def _uia_find_silent_badge(uia_win):
+    """通过 child_window 检测输入区是否已开启「静音发送」。"""
+    try:
+        badge = uia_win.child_window(title_re=r".*静音发送.*", found_index=0)
+        if badge.exists(timeout=0.3):
+            wrect = _unwrap_uia(uia_win).rectangle()
+            brect = _unwrap_uia(badge).rectangle()
+            if brect.width() > 0 and brect.top >= wrect.top + int(wrect.height() * 0.60):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _uia_find_arrow_ctrl(uia_win):
+    """仅用 child_window(auto_id / title_re) 定位发送右侧下拉箭头控件，禁止硬编码坐标。"""
+    wrect = _unwrap_uia(uia_win).rectangle()
+    bottom_min_y = wrect.top + int(wrect.height() * 0.65)
+
+    for kw_spec in (
+        {"auto_id_re": r"(?i).*(send.*arrow|arrow.*send|send.*menu|send.*more|split.*arrow).*", "found_index": 0},
+        {"title_re": r"^(发送选项|发送设置|更多发送方式|下拉|选择发送方式)$", "found_index": 0},
+    ):
+        try:
+            cand = uia_win.child_window(**kw_spec)
+            if cand.exists(timeout=0.25):
+                rr = _unwrap_uia(cand).rectangle()
+                if rr.width() > 0 and rr.top >= bottom_min_y:
+                    return cand
+        except Exception:
+            pass
+
+    send_ctrl = None
+    for spec in (
+        {"title_re": r"^发送(\([A-Za-z]\))?$", "control_type": "Button", "found_index": 0},
+        {"title_re": r"^发送(\([A-Za-z]\))?$", "found_index": 0},
+        {"auto_id_re": r"(?i).*send.*btn.*", "found_index": 0},
+    ):
+        try:
+            cand = uia_win.child_window(**spec)
+            if cand.exists(timeout=0.3):
+                rr = _unwrap_uia(cand).rectangle()
+                if rr.width() >= 20 and rr.top >= bottom_min_y:
+                    send_ctrl = cand
+                    break
+        except Exception:
+            pass
+
+    if send_ctrl is None:
+        return None
+
+    send_wrap = _unwrap_uia(send_ctrl)
+    si = send_wrap.element_info
+    sr = send_wrap.rectangle()
+    log(f"  [静音模式: pywinauto-UIA] 定位发送按钮: type={si.control_type!r} name={si.name!r} auto_id={si.automation_id!r}")
+
+    arrow_types = ("Button", "MenuItem", "SplitButton", "Custom", "Image", "Pane")
+
+    def _scan_arrow_candidates(cands):
+        for sib in cands:
+            try:
+                sbi = sib.element_info
+                if sbi == si:
+                    continue
+                sbr = sib.rectangle()
+                said = (sbi.automation_id or "").lower()
+                sname = (sbi.name or "").strip()
+                if sbi.control_type in arrow_types and sbr.width() > 0 and sbr.height() >= 12:
+                    if (
+                        any(k in said for k in ("arrow", "drop", "more", "menu"))
+                        or any(k in sname for k in ("更多", "设置", "选项", "下拉"))
+                        or (sbr.left >= sr.right - 22 and sbr.width() <= 44 and abs(sbr.mid_point()[1] - sr.mid_point()[1]) <= 12)
+                    ):
+                        return sib
+            except Exception:
+                pass
+        return None
+
+    # 先扫描发送控件内部子控件（兼容 SplitButton 内嵌箭头），再扫描同级兄弟控件
+    try:
+        hit = _scan_arrow_candidates(send_wrap.children())
+        if hit is not None:
+            return hit
+    except Exception:
+        pass
+    try:
+        parent = send_wrap.parent()
+        if parent is not None:
+            hit = _scan_arrow_candidates(parent.children())
+            if hit is not None:
+                return hit
+    except Exception:
+        pass
+    return None
+
+
+def _uia_click_ctrl(ctrl_wrap):
+    """优先物理 click_input 点击控件；若隔离桌面或锁屏拦截 SetCursorPos 且控件支持 invoke() 则回退调用。"""
+    try:
+        ctrl_wrap.click_input()
+        return True
+    except Exception as err:
+        if "setcursorpos" in repr(err).lower() and hasattr(ctrl_wrap, "invoke"):
+            try:
+                ctrl_wrap.invoke()
+                return True
+            except Exception:
+                pass
+        raise
+
+
+def _uia_find_and_click_silent_menu(uia_win, pids, enable_silent=True):
+    """在弹出菜单窗与主窗内使用 child_window 定位并点击「设为静音 / 取消静音」。"""
+    from pywinauto import Application, Desktop, keyboard  # type: ignore[import-not-found]
+
+    search_roots = []
+    main_hwnd = getattr(_unwrap_uia(uia_win), "handle", None)
+    for pw in Desktop(backend="uia").windows():
+        try:
+            if pids and pw.process_id() not in pids:
+                continue
+            if not pw.is_visible():
+                continue
+            if main_hwnd is not None and pw.handle == main_hwnd:
+                continue
+            pw_spec = Application(backend="uia").connect(handle=pw.handle, timeout=1.5).window(handle=pw.handle)
+            search_roots.append(pw_spec)
+        except Exception:
+            pass
+    search_roots.append(uia_win)
+
+    already_re = r".*取消静音.*" if enable_silent else r".*(设为静音|静音发送).*"
+    already_msg = "菜单显示当前已处于静音发送状态" if enable_silent else "菜单显示当前已处于常规提醒状态"
+    target_re = r".*(设为静音|静音发送).*" if enable_silent else r".*取消静音.*"
+    specs = [
+        {"title_re": target_re, "control_type": "MenuItem", "found_index": 0},
+        {"title_re": target_re, "control_type": "Button", "found_index": 0},
+        {"title_re": target_re, "found_index": 0},
+    ]
+    if enable_silent:
+        specs.append({"auto_id_re": r"(?i).*(silent|mute).*", "found_index": 0})
+
+    for root in search_roots:
+        try:
+            already_item = root.child_window(title_re=already_re, found_index=0)
+            if already_item.exists(timeout=0.15):
+                keyboard.send_keys("{ESC}")
+                log(f"  [静音模式: pywinauto-UIA] {already_msg}")
+                return True
+        except Exception:
+            pass
+
+        for spec in specs:
+            try:
+                item = root.child_window(**spec)
+                if item.exists(timeout=0.25):
+                    item_wrap = _unwrap_uia(item)
+                    ir = item_wrap.rectangle()
+                    if ir.width() > 0 and ir.height() > 0:
+                        ii = item_wrap.element_info
+                        log(f"  [静音模式: pywinauto-UIA] 命中菜单项: type={ii.control_type!r} name={ii.name!r} auto_id={ii.automation_id!r}")
+                        _uia_click_ctrl(item_wrap)
+                        return True
+            except Exception:
+                pass
+    return False
+
+
+def _enable_dingtalk_silent_send_uia():
+    """主模式：pywinauto(backend='uia') 通过 connect(path='DingTalk.exe') 定位并点击静音发送。"""
+    state = {"win": None, "pids": set(), "arrow_clicked": False}
+    try:
+        def _step_focus():
+            _app, win, pids = _connect_dingtalk_pywinauto(timeout=5.0)
+            state["win"] = win
+            state["pids"] = pids
+            win.set_focus()
+            return True
+
+        _retry_step("UIA连接钉钉并set_focus", _step_focus, retries=2, interval=1.0)
+        win = state["win"]
+        if _uia_find_silent_badge(win):
+            log("  [静音模式: pywinauto-UIA] 当前已开启「静音发送」")
+            return True
+
+        def _step_arrow():
+            arrow = _uia_find_arrow_ctrl(state["win"])
+            if arrow is None:
+                return False
+            arrow_wrap = _unwrap_uia(arrow)
+            ai = arrow_wrap.element_info
+            log(f"  [静音模式: pywinauto-UIA] 点击下拉箭头: type={ai.control_type!r} name={ai.name!r} auto_id={ai.automation_id!r}")
+            _uia_click_ctrl(arrow_wrap)
+            state["arrow_clicked"] = True
+            return True
+
+        _retry_step("UIA点击发送下拉箭头", _step_arrow, retries=2, interval=1.0)
+        sleep_check(0.5)
+
+        def _step_menu():
+            return _uia_find_and_click_silent_menu(state["win"], state["pids"])
+
+        _retry_step("UIA点击静音发送菜单", _step_menu, retries=2, interval=1.0)
+        sleep_check(0.35)
+        log("  ✅ [静音模式: pywinauto-UIA] 已选择「静音发送」")
+        return True
+    except Exception as e:
+        if "手动停止" in str(e):
+            raise
+        log(f"  ⚠️ [静音模式: pywinauto-UIA] 未能在控件树直接完成点击（{e}）")
+        if state["win"] is not None:
+            _dump_uia_controls_to_log(state["win"], state["pids"])
+        if state["arrow_clicked"]:
+            try:
+                from pywinauto import keyboard  # type: ignore[import-not-found]
+                keyboard.send_keys("{ESC}")
+                time.sleep(0.2)
+            except Exception:
+                pass
+        return False
+
+
+def _locate_template_on_screen(
+    tpl_name,
+    scales=(1.0, 1.875, 1.5, 2.0, 1.25, 1.75, 2.25, 0.85),
+    confidences=(0.82, 0.74),
+    _screen_img=None,
+):
+    """调用 pyautogui.locateOnScreen 及多尺度灰度匹配查找模板位置（不使用任何硬编码坐标）。"""
+    tpl_path = _find_bundle_asset(Path("templates") / tpl_name)
+    if tpl_path is None:
+        raise RuntimeError(f"找不到图像匹配模板文件：templates/{tpl_name}")
+
+    import pyautogui  # type: ignore[import-not-found]
+    from PIL import ImageOps
+    pyautogui.FAILSAFE = False
+
+    if _screen_img is None:
+        for conf in confidences:
+            try:
+                box = pyautogui.locateOnScreen(str(tpl_path), grayscale=True, confidence=conf)
+                if box is not None:
+                    return box
+            except TypeError:
+                try:
+                    box = pyautogui.locateOnScreen(str(tpl_path), grayscale=True)
+                    if box is not None:
+                        return box
+                except Exception:
+                    pass
+                break
+            except Exception:
+                pass
+        screen_gray = pyautogui.screenshot().convert("L")
+    else:
+        screen_gray = _screen_img.convert("L")
+
+    tpl_gray = Image.open(tpl_path).convert("L")
+    tpl_inv = ImageOps.invert(tpl_gray)
+    for base_img in (tpl_gray, tpl_inv):
+        for sc in scales:
+            nw = max(8, int(round(base_img.width * sc)))
+            nh = max(6, int(round(base_img.height * sc)))
+            if nw >= screen_gray.width or nh >= screen_gray.height:
+                continue
+            resized = base_img if abs(sc - 1.0) < 0.02 else base_img.resize((nw, nh), Image.Resampling.LANCZOS)
+            for conf in confidences:
+                try:
+                    box = pyautogui.locate(resized, screen_gray, grayscale=True, confidence=conf)
+                    if box is not None:
+                        return box
+                except TypeError:
+                    try:
+                        box = pyautogui.locate(resized, screen_gray, grayscale=True)
+                        if box is not None:
+                            return box
+                    except Exception:
+                        pass
+                    break
+                except Exception:
+                    pass
+    return None
+
+
+def _enable_dingtalk_silent_send_image():
+    """兜底模式：当 UIA 抓不到控件时，降级为 pyautogui.locateOnScreen 图像匹配。"""
+    import pyautogui  # type: ignore[import-not-found]
+    pyautogui.FAILSAFE = False
+    log("  正在切换为 [静音模式: pyautogui-图像匹配兜底] …")
+
+    if _locate_template_on_screen("badge_silent_on.png", confidences=(0.82, 0.76)) is not None:
+        log("  [静音模式: pyautogui-图像匹配兜底] 检测到屏幕已存在「静音发送」标签")
+        return True
+
+    # 若菜单此刻已处于展开态，直接点击「设为静音」避免二次点击箭头反而收起菜单
+    opened_menu_box = _locate_template_on_screen("menu_set_silent.png", confidences=(0.84, 0.78))
+    if opened_menu_box is not None:
+        cx, cy = pyautogui.center(opened_menu_box)
+        log(f"  [静音模式: pyautogui-图像匹配兜底] 检测到已展开静音菜单，直接点击 ({cx}, {cy})")
+        pyautogui.click(cx, cy)
+        sleep_check(0.35)
+        log("  ✅ [静音模式: pyautogui-图像匹配兜底] 已选择「静音发送」")
+        return True
+
+    def _step_img_arrow():
+        box = _locate_template_on_screen("send_arrow.png")
+        if box is not None:
+            cx, cy = pyautogui.center(box)
+            log(f"  [静音模式: pyautogui-图像匹配兜底] 模板 send_arrow.png 匹配命中 ({cx}, {cy})")
+            pyautogui.click(cx, cy)
+            return True
+        pill_box = _locate_template_on_screen("send_pill.png")
+        if pill_box is not None:
+            cx = int(pill_box.left + pill_box.width * 0.85)
+            cy = int(pill_box.top + pill_box.height / 2)
+            log(f"  [静音模式: pyautogui-图像匹配兜底] 模板 send_pill.png 匹配命中，点击右端箭头 ({cx}, {cy})")
+            pyautogui.click(cx, cy)
+            return True
+        return False
+
+    _retry_step("图像匹配下拉箭头", _step_img_arrow, retries=2, interval=1.0)
+    sleep_check(0.5)
+
+    def _step_img_menu():
+        box = _locate_template_on_screen("menu_set_silent.png")
+        if box is None:
+            return False
+        cx, cy = pyautogui.center(box)
+        log(f"  [静音模式: pyautogui-图像匹配兜底] 模板 menu_set_silent.png 匹配命中 ({cx}, {cy})")
+        pyautogui.click(cx, cy)
+        return True
+
+    _retry_step("图像匹配「设为静音」菜单", _step_img_menu, retries=2, interval=1.0)
+    sleep_check(0.35)
+    log("  ✅ [静音模式: pyautogui-图像匹配兜底] 已选择「静音发送」")
+    return True
+
+
+def _evaluate_compose_focus_ctrl(fc, r):
+    """纯粹判定给定焦点控件 fc 是否位于钉钉底部对话内容输入窗口内（便于单测与生产共用）。"""
+    if fc is None:
+        return False, "未获取到活动焦点控件"
+    try:
+        cname = (fc.Name or "").strip()
+        nlow = cname.lower()
+        ct = (fc.ControlTypeName or "")
+        fr = fc.BoundingRectangle
+        W = max(1, r.right - r.left)
+        H = max(1, r.bottom - r.top)
+        if "搜索" in nlow or "search" in nlow:
+            return False, f"焦点仍在搜索框（{cname}）"
+        if "发送" in nlow or "静音" in nlow or ct in ("ButtonControl", "MenuItemControl", "SplitButtonControl", "MenuControl"):
+            return False, f"焦点停留在按钮/菜单（{ct}:{cname}），尚未回到输入窗口"
+        if fr.bottom <= fr.top or fr.right <= fr.left:
+            return False, f"焦点控件区域无效（{ct}）"
+        if fr.bottom < r.top + H * 0.35:
+            return False, f"焦点仍位于顶部搜索栏区域（{ct}）"
+        if fr.right < r.left + W * 0.24:
+            return False, f"焦点仍位于左侧会话/导航栏区域（{ct}）"
+        if ct in ("EditControl", "DocumentControl") and fr.bottom >= r.top + H * 0.65:
+            return True, f"{ct}（{cname or '对话输入窗口'}）"
+        if fr.top >= r.top + H * 0.45 and fr.left >= r.left + W * 0.22 and (fr.right - fr.left) >= 80:
+            return True, f"{ct}（对话输入区）"
+        if (ct in ("WindowControl", "PaneControl", "CustomControl")
+                and fr.bottom >= r.top + H * 0.75 and fr.right >= r.left + W * 0.60):
+            return True, f"{ct}（钉钉主窗自绘输入区）"
+        return False, f"焦点位于非输入区域（{ct}）"
+    except Exception as ex:
+        return False, f"读取焦点控件失败（{ex}）"
+
+
+def _enable_dingtalk_silent_send():
+    """先校验权限一致性，优先使用 pywinauto(uia) 定位静音按钮，失败自动降级图像匹配。"""
+    priv = check_dingtalk_privilege_match()
+    if not priv["matched"]:
+        log(f"  ⚠️ {priv['message']}")
+    if _enable_dingtalk_silent_send_uia():
+        return True
+    return _enable_dingtalk_silent_send_image()
+
+
+def _disable_dingtalk_silent_send():
+    """当某时间点设置为常规提醒时，检查并清除钉钉输入框可能残留的「静音发送」状态。"""
+    try:
+        _app, win, pids = _connect_dingtalk_pywinauto(timeout=4.0)
+        win.set_focus()
+        if _uia_find_silent_badge(win):
+            arrow = _uia_find_arrow_ctrl(win)
+            if arrow is not None:
+                _uia_click_ctrl(_unwrap_uia(arrow))
+                sleep_check(0.45)
+                if _uia_find_and_click_silent_menu(win, pids, enable_silent=False):
+                    sleep_check(0.3)
+                    log("  [静音模式: pywinauto-UIA] 已关闭残留静音状态，改为常规提醒发送")
+                    return True
+    except Exception:
+        pass
+
+    try:
+        import pyautogui  # type: ignore[import-not-found]
+        pyautogui.FAILSAFE = False
+        box = _locate_template_on_screen("badge_silent_on.png", confidences=(0.84, 0.78))
+        if box is not None:
+            cx = int(box.left + box.width * 0.88)
+            cy = int(box.top + box.height / 2)
+            log(f"  [静音模式: pyautogui-图像匹配兜底] 检测到残留静音标签，点击关闭 ({cx}, {cy})")
+            pyautogui.click(cx, cy)
+            sleep_check(0.3)
+            return True
+    except Exception:
+        pass
+
+    log("  [静音模式] 本次配置为常规提醒（未开启静音发送）")
+    return True
+
+
 def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interactive=True):
-    """把 WPS 复制的表格图片发到指定钉钉会话，再发一条“时间(+分时段后缀)”文字。"""
+    """把 WPS 复制的表格图片依次发到一个或多个指定钉钉会话，并附上时间戳及对应时段后缀。"""
     check_stop()
-    search_name = (cfg.get("dt_search") or "文件小助手").strip()
+    targets = get_enabled_dt_targets(cfg)
+    if not targets:
+        log("  ⚠️ 未勾选任何启用的钉钉目标会话，跳过本轮钉钉发送")
+        return True
+
     suffix, suffix_src = resolve_suffix_for_time(cfg, lt=trigger_lt, hm_override=trigger_hm)
+    do_silent, silent_src = resolve_silent_for_time(cfg, lt=trigger_lt, hm_override=trigger_hm)
+    if "dt_silent_send" in (cfg or {}) and silent_src == "全局默认":
+        do_silent = bool(cfg.get("dt_silent_send", True))
     text_msg = time.strftime("%Y-%m-%d %H:%M") + (" " + suffix if suffix else "")
-    log(f"  消息文案：{text_msg}（后缀来源：{suffix_src}）")
-    search_candidates, search_tokens = _extract_search_keywords(search_name)
+    silent_desc = f"{'静音发送' if do_silent else '常规提醒'}（{silent_src}）"
+    log(f"  消息文案：{text_msg}（后缀来源：{suffix_src}）| {silent_desc} | 目标共 {len(targets)} 个：{'、'.join(targets)}")
 
     try:
         import uiautomation as ua  # type: ignore[import-not-found]
     except Exception as e:
         raise RuntimeError("钉钉发送组件未安装") from e
 
-    log(f"  正在打开钉钉，搜索「{search_name}」…")
+    priv_info = check_dingtalk_privilege_match()
+    if not priv_info["matched"]:
+        log(f"  ⚠️ {priv_info['message']}")
+    else:
+        log(f"  {priv_info['message']}")
     tmp_img = app_dir() / "_sheetmate_tmp.png"
     try:
-        exe_candidates = [
-            r"D:\Program Files (x86)\DingDing\main\current_new\DingTalk.exe",
-            r"C:\Program Files (x86)\DingDing\main\current_new\DingTalk.exe",
-            r"C:\Program Files\DingDing\main\current_new\DingTalk.exe",
-            os.path.expandvars(r"%LOCALAPPDATA%\DingDing\main\current_new\DingTalk.exe"),
-        ]
+        exe_candidates = _resolve_dingtalk_exe_candidates()
         WIN_CLASSES = ("DtMainFrameView", "Qt51511QWindowIcon")
         WIN_TITLES = ("钉钉", "DingTalk")
 
@@ -2173,14 +3143,18 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 time.sleep(0.5)
             return None
 
-        # 0) 搜索前先把 WPS 图片存成文件（失败重试期间保留 tmp_img 绝不丢失）
+        # 0) 搜索前先把 WPS 图片存成文件（失败重试与多群发送期间保留 tmp_img 绝不丢失）
         state0 = save_clipboard_image_if_exists(tmp_img)
         if state0 == "noimage":
             raise RuntimeError("剪贴板里没有图片，已停止钉钉发送")
         if state0 != "saved":
             raise RuntimeError("表格图片暂存失败，已停止钉钉发送")
+        if cfg.get("save_shot_history", True):
+            hist_p = archive_history_shot(tmp_img, keep=20)
+            if hist_p is not None:
+                log(f"  已归档历史截图：{hist_p.name}")
         clear_clipboard_windows()
-        log("  已暂存表格图片（中断重连不会丢失），开始准备钉钉会话")
+        log("  已暂存表格图片（中断重连/多群发送不会丢失），开始投递钉钉会话")
 
         # 2) 强力置前（AttachThreadInput 解除前台锁定）并最大化
         import ctypes
@@ -2391,7 +3365,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                     break
             return found_hist
 
-        def _feature_item(doc):
+        def _feature_item(doc, target_name, target_tokens):
             """解析搜索弹窗文档并精确返回命中的目标行控件矩形或控件。"""
             import unicodedata
 
@@ -2399,8 +3373,8 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 text = unicodedata.normalize("NFKC", text or "").casefold()
                 return "".join(ch for ch in text if ch.isalnum())
 
-            target = norm(search_name)
-            norm_tokens = [norm(t) for t in search_tokens if norm(t)]
+            target = norm(target_name)
+            norm_tokens = [norm(t) for t in target_tokens if norm(t)]
             found = []
             headings = []
             text_items = []
@@ -2525,23 +3499,29 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
             if win is not None:
                 try:
                     target_rect = None
+                    anchor_btn_rect = None
 
                     def _scan_input(ctrl, depth=0):
-                        nonlocal target_rect
-                        if target_rect is not None or depth > 12:
+                        nonlocal target_rect, anchor_btn_rect
+                        if target_rect is not None or depth > 18:
                             return
                         for ch in ctrl.GetChildren():
                             try:
                                 ct = ch.ControlTypeName
                                 rr = ch.BoundingRectangle
+                                nm = (ch.Name or "").strip()
+                                nlow = nm.lower()
                                 if (rr.right - rr.left > 120 and rr.bottom - rr.top > 28
                                         and rr.left >= r.left + W * 0.28
                                         and rr.top >= r.top + H * 0.62):
-                                    nlow = (ch.Name or "").lower()
                                     if "搜索" not in nlow and "search" not in nlow:
                                         if ct in ("EditControl", "DocumentControl"):
                                             target_rect = rr
                                             return
+                                if (anchor_btn_rect is None and rr.top >= r.top + H * 0.62
+                                        and rr.right > rr.left and rr.bottom > rr.top
+                                        and ("发送" in nm or "静音" in nm)):
+                                    anchor_btn_rect = rr
                             except Exception:
                                 pass
                             _scan_input(ch, depth + 1)
@@ -2552,168 +3532,89 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                         cy = int(min(target_rect.bottom - 18, max(target_rect.top + 18, (target_rect.top + target_rect.bottom) / 2)))
                         ua.Click(cx, cy, waitTime=0.4)
                         return
+                    if anchor_btn_rect is not None:
+                        cx = max(int(r.left + W * 0.42), int(anchor_btn_rect.left - 80))
+                        cy = max(int(r.top + H * 0.72), int(anchor_btn_rect.top - 48))
+                        ua.Click(cx, cy, waitTime=0.4)
+                        return
                 except Exception:
                     pass
             in_x = int(r.left + W * 0.56)
             in_y = int(r.top + H * 0.80)
             ua.Click(in_x, in_y, waitTime=0.4)
 
-        def _enable_dingtalk_silent_send(win, r):
-            """确认未挂静音标签时，展开发送右侧下拉箭头并点击「设为静音」。"""
-            W = r.right - r.left
-            H = r.bottom - r.top
-            # 1) 先检查输入框左下角是否已经挂有「静音发送」标签，避免重复切换
-            if win is not None:
-                try:
-                    already = False
-
-                    def _find_silent_badge(ctrl, depth=0):
-                        nonlocal already
-                        if already or depth > 16:
-                            return
-                        for ch in ctrl.GetChildren():
-                            try:
-                                rr = ch.BoundingRectangle
-                                if rr.top >= r.top + H * 0.65 and "静音发送" in (ch.Name or ""):
-                                    already = True
-                                    return
-                            except Exception:
-                                pass
-                            _find_silent_badge(ch, depth + 1)
-
-                    _find_silent_badge(win, 0)
-                    if already:
-                        log("  当前已开启「静音发送」")
-                        return True
-                except Exception:
-                    pass
-
-            # 2) 定位右下角 [ 发送(S) | ▾ ] 组合按钮坐标（像素扫描优先，UIA / 比例兜底）
-            pill_box = None
+        def _is_win_in_menu_mode(hwnd):
+            """调用 Win32 GetGUIThreadInfo 检测目标窗口线程是否仍处于弹出菜单模式。"""
             try:
-                from PIL import ImageGrab
-                bx0 = max(0, int(r.right - W * 0.16))
-                by0 = max(0, int(r.bottom - H * 0.12))
-                bx1 = max(bx0 + 20, int(r.right - 6))
-                by1 = max(by0 + 20, int(r.bottom - 10))
-                shot = ImageGrab.grab(bbox=(bx0, by0, bx1, by1)).convert("RGB")
-                pix = shot.load()
-                sw, sh = shot.size
-                xs, ys = [], []
-                for y in range(sh):
-                    for x in range(sw):
-                        rc, gc, bc = pix[x, y]
-                        is_green = gc > 85 and gc > rc + 18 and gc > bc + 8
-                        is_blue = bc > 140 and bc > rc + 35 and bc > gc + 15
-                        if is_green or is_blue:
-                            xs.append(x)
-                            ys.append(y)
-                if xs and (max(xs) - min(xs) >= 36) and (max(ys) - min(ys) >= 12):
-                    pill_box = (bx0 + min(xs), by0 + min(ys), bx0 + max(xs), by0 + max(ys))
+                class GUITHREADINFO(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", wintypes.DWORD),
+                        ("flags", wintypes.DWORD),
+                        ("hwndActive", wintypes.HWND),
+                        ("hwndFocus", wintypes.HWND),
+                        ("hwndCapture", wintypes.HWND),
+                        ("hwndMenuOwner", wintypes.HWND),
+                        ("hwndMoveSize", wintypes.HWND),
+                        ("hwndCaret", wintypes.HWND),
+                        ("rcCaret", wintypes.RECT),
+                    ]
+
+                user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
+                user32.GetGUIThreadInfo.restype = wintypes.BOOL
+                tid = user32.GetWindowThreadProcessId(int(hwnd), None)
+                if not tid:
+                    return False
+                gti = GUITHREADINFO()
+                gti.cbSize = ctypes.sizeof(GUITHREADINFO)
+                if not user32.GetGUIThreadInfo(tid, ctypes.byref(gti)):
+                    return False
+                # GUI_INMENUMODE=0x4, GUI_POPUPMENUMODE=0x10
+                return bool((gti.flags & 0x00000014) or gti.hwndMenuOwner)
             except Exception:
-                pill_box = None
+                return False
 
-            if pill_box is None and win is not None:
-                try:
-                    found_btn = None
-
-                    def _find_send_btn(ctrl, depth=0):
-                        nonlocal found_btn
-                        if found_btn is not None or depth > 16:
-                            return
-                        for ch in ctrl.GetChildren():
-                            try:
-                                rr = ch.BoundingRectangle
-                                if (rr.left >= r.left + W * 0.78 and rr.top >= r.top + H * 0.85
-                                        and rr.right - rr.left >= 36 and rr.bottom - rr.top >= 12
-                                        and "发送" in (ch.Name or "")):
-                                    found_btn = (rr.left, rr.top, rr.right, rr.bottom)
-                                    return
-                            except Exception:
-                                pass
-                            _find_send_btn(ch, depth + 1)
-
-                    _find_send_btn(win, 0)
-                    if found_btn is not None:
-                        pill_box = found_btn
-                except Exception:
-                    pass
-
-            if pill_box is None:
-                pill_box = (
-                    int(r.right - W * 0.070),
-                    int(r.bottom - H * 0.063),
-                    int(r.right - W * 0.018),
-                    int(r.bottom - H * 0.036),
-                )
-
-            pill_left, pill_top, pill_right, pill_bottom = pill_box
-            pill_w = max(40, pill_right - pill_left)
-            pill_h = max(14, pill_bottom - pill_top)
-            arrow_x = int(pill_right - max(7, pill_w * 0.14))
-            arrow_y = int((pill_top + pill_bottom) / 2)
-
-            ua.Click(arrow_x, arrow_y, waitTime=0.35)
-            time.sleep(0.45)
-
-            # 3) 优先从 UIA 顶层窗口及主窗子树查找「设为静音」/「取消静音」菜单项
-            menu_action = None
-            menu_rect = None
+        def _is_focus_in_chat_compose(ding_now, r):
+            """检查当前焦点控件是否确在钉钉对话内容输入窗口（含前台句柄、菜单状态与控件区域校验）。"""
+            if _is_search_popup_open():
+                return False, "全局搜索弹窗处于打开状态"
             try:
-                roots = []
-                for h, _c, _t in _enum_top_windows():
-                    ctl = ua.ControlFromHandle(h)
-                    if ctl is not None:
-                        roots.append(ctl)
-                if win is not None:
-                    roots.append(win)
-
-                def _scan_menu(ctrl, depth=0):
-                    nonlocal menu_action, menu_rect
-                    if menu_action is not None or depth > 14:
-                        return
-                    for ch in ctrl.GetChildren():
-                        try:
-                            nm = (ch.Name or "").strip()
-                            if "取消静音" in nm:
-                                menu_action = "already"
-                                return
-                            if "设为静音" in nm:
-                                rr = ch.BoundingRectangle
-                                if rr.right > rr.left and rr.bottom > rr.top:
-                                    menu_action = "click"
-                                    menu_rect = rr
-                                    return
-                        except Exception:
-                            pass
-                        _scan_menu(ch, depth + 1)
-
-                for root_ctl in roots:
-                    _scan_menu(root_ctl, 0)
-                    if menu_action is not None:
-                        break
+                ding_hwnd = int(ding_now.NativeWindowHandle)
             except Exception:
-                pass
+                ding_hwnd = 0
+            if ding_hwnd:
+                fg_hwnd = int(user32.GetForegroundWindow() or 0)
+                if fg_hwnd != ding_hwnd:
+                    return False, "当前前台窗口并非钉钉主窗（可能仍有弹出菜单或切换了窗口）"
+                if _is_win_in_menu_mode(ding_hwnd):
+                    return False, "钉钉线程仍处于菜单展开模式，尚未回到输入窗口"
+            try:
+                fc = ua.GetFocusedControl()
+            except Exception:
+                fc = None
+            return _evaluate_compose_focus_ctrl(fc, r)
 
-            if menu_action == "already":
-                try:
-                    ua.SendKeys("{Esc}", waitTime=0.2)
-                except Exception:
-                    pass
-                log("  当前已开启「静音发送」")
-                return True
-            if menu_action == "click" and menu_rect is not None:
-                ua.Click(int((menu_rect.left + menu_rect.right) / 2),
-                         int((menu_rect.top + menu_rect.bottom) / 2), waitTime=0.35)
-                log("  已选择「静音发送」")
-                return True
-
-            # 4) 自绘菜单未暴露 UIA 时按实测几何位置点击「设为静音」（位于按钮正上方第 2 项）
-            menu_x = int(pill_right - pill_w * 0.65)
-            menu_y = int(pill_top - pill_h * 1.9)
-            ua.Click(menu_x, menu_y, waitTime=0.35)
-            log("  已选择「静音发送」")
-            return True
+        def _verify_and_focus_chat_input(retries=2):
+            """点完静音后把光标切回对话内容输入窗口并严格校验，确认后再允许 Enter。"""
+            last_reason = "焦点未确认"
+            for attempt in range(retries + 1):
+                check_stop()
+                ding_now = _fresh_ding()
+                if ding_now is None:
+                    raise RuntimeError("找不到钉钉主窗口，无法校验光标位置")
+                r_now = ding_now.BoundingRectangle
+                _focus_chat_input(ding_now, r_now)
+                sleep_check(0.25)
+                ua.SendKeys("{End}", waitTime=0.15)
+                _ensure_not_in_search_box(r_now)
+                ok_focus, desc = _is_focus_in_chat_compose(ding_now, r_now)
+                if ok_focus:
+                    log(f"  ✅ 已确认光标位于对话输入窗口（{desc}）")
+                    return True
+                last_reason = desc
+                if attempt < retries:
+                    log(f"  [光标校验] 第 {attempt + 1} 次未确认焦点在对话输入框（{desc}），0.5 秒后重新聚焦…")
+                    sleep_check(0.5)
+            raise RuntimeError(f"点完静音后光标未确认进入对话输入窗口（{last_reason}），已安全拦截发送")
 
         def _is_focus_in_search_area(r):
             if _is_search_popup_open():
@@ -2750,9 +3651,6 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
             if bad2:
                 raise RuntimeError(f"检测到焦点仍在钉钉搜索框（{reason2}），已安全拦截粘贴")
 
-        # 3) 全局搜索 + 发送主循环（支持钉钉未登录、未搜到群、焦点受阻时原地暂停恢复）
-        direct_candidates = [search_name] + [c for c in search_candidates if c and c != search_name]
-
         def _wait_search_closed(loops=10, step=0.25):
             for _ in range(loops):
                 check_stop()
@@ -2763,224 +3661,263 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                         return True
             return False
 
-        skip_search = False
-        while True:
-            check_stop()
-            # 1) 唤起钉钉并确认已扫码登录进入主窗
-            ding = _find()
-            if ding is None:
-                for exe in exe_candidates:
-                    if os.path.exists(exe):
-                        try:
-                            subprocess.Popen(exe)
-                            log("  钉钉窗口在托盘或未启动，已尝试唤起，请稍候…")
-                        except Exception:
-                            pass
-                        break
-                for _ in range(18):
-                    sleep_check(1)
-                    ding = _find()
-                    if ding:
-                        break
+        def _send_one_target(idx, total, search_name):
+            if total > 1:
+                set_step(f"正在发送到钉钉 ({idx}/{total})：{search_name}…")
+                log(f"  → 目标 ({idx}/{total})：正在搜索「{search_name}」…")
+            else:
+                log(f"  正在打开钉钉，搜索「{search_name}」…")
 
-            if ding is None or _is_dingtalk_login_window(ding):
-                if not recover_interactive:
-                    raise RuntimeError("没找到已登录的钉钉主窗口，请确认钉钉已打开并扫码登录后再试")
-                issue = diagnose_issue("dingtalk_login")
-                wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
-                skip_search = False
-                continue
-
-            if not skip_search:
-                chat_ready = False
-                for _attempt in range(3):
-                    check_stop()
-                    _force_front()
-                    sleep_check(0.45)
-                    if _link_box() is not None:
-                        _close_link_box()
-                    _open_global_search()
-
-                    opened = False
-                    for _ in range(14):
-                        check_stop()
-                        if _is_search_popup_open():
-                            opened = True
+            search_candidates, search_tokens = _extract_search_keywords(search_name)
+            direct_candidates = [search_name] + [c for c in search_candidates if c and c != search_name]
+            skip_search = False
+            while True:
+                check_stop()
+                # 1) 唤起钉钉并确认已扫码登录进入主窗
+                ding = _find()
+                if ding is None:
+                    for exe in exe_candidates:
+                        if os.path.exists(exe):
+                            try:
+                                subprocess.Popen(exe)
+                                log("  钉钉窗口在托盘或未启动，已尝试唤起，请稍候…")
+                            except Exception:
+                                pass
                             break
-                        time.sleep(0.25)
-                    popup_ctl, doc = (None, None) if opened else _search_doc()
-                    if not opened and doc is None:
-                        log("  搜索窗口没打开，正在重试…")
-                        continue
-                    sleep_check(0.3)
+                    for _ in range(18):
+                        sleep_check(1)
+                        ding = _find()
+                        if ding:
+                            break
 
-                    for kw_idx, kw in enumerate(direct_candidates):
+                if ding is None or _is_dingtalk_login_window(ding):
+                    if not recover_interactive:
+                        raise RuntimeError("没找到已登录的钉钉主窗口，请确认钉钉已打开并扫码登录后再试")
+                    issue = diagnose_issue("dingtalk_login")
+                    wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                    skip_search = False
+                    continue
+
+                if not skip_search:
+                    chat_ready = False
+                    for _attempt in range(3):
                         check_stop()
-                        if kw_idx > 0:
-                            if not _is_search_popup_open():
-                                _open_global_search()
-                                for _ in range(14):
-                                    check_stop()
-                                    if _is_search_popup_open():
-                                        break
-                                    time.sleep(0.25)
-                                sleep_check(0.25)
-                            popup_ctl, doc = _search_doc()
-                            if doc is not None:
-                                _focus_search_input(popup_ctl, doc)
-                                time.sleep(0.15)
+                        _force_front()
+                        sleep_check(0.45)
+                        if _link_box() is not None:
+                            _close_link_box()
+                        _open_global_search()
 
-                        ua.SendKeys("{Ctrl}a", waitTime=0.08)
-                        ua.SendKeys("{Back}", waitTime=0.08)
-                        if not _paste_text(kw, verify=True):
-                            log(f"  关键词「{kw}」写入剪贴板未就绪，跳过重试…")
+                        opened = False
+                        for _ in range(14):
+                            check_stop()
+                            if _is_search_popup_open():
+                                opened = True
+                                break
+                            time.sleep(0.25)
+                        popup_ctl, doc = (None, None) if opened else _search_doc()
+                        if not opened and doc is None:
+                            log("  搜索窗口没打开，正在重试…")
                             continue
-                        sleep_check(0.85)
+                        sleep_check(0.3)
 
-                        # 极端情况下若搜索历史仍未消失，重新聚焦搜索框再贴一遍兜底
-                        popup_ctl, doc = _search_doc()
-                        if doc is not None and _has_search_history(doc):
-                            log(f"  检测到搜索框尚未接收内容，重新聚焦并粘贴「{kw}」…")
-                            _focus_search_input(popup_ctl, doc)
-                            time.sleep(0.15)
+                        for kw_idx, kw in enumerate(direct_candidates):
+                            check_stop()
+                            if kw_idx > 0:
+                                if not _is_search_popup_open():
+                                    _open_global_search()
+                                    for _ in range(14):
+                                        check_stop()
+                                        if _is_search_popup_open():
+                                            break
+                                        time.sleep(0.25)
+                                    sleep_check(0.25)
+                                popup_ctl, doc = _search_doc()
+                                if doc is not None:
+                                    _focus_search_input(popup_ctl, doc)
+                                    time.sleep(0.15)
+
                             ua.SendKeys("{Ctrl}a", waitTime=0.08)
                             ua.SendKeys("{Back}", waitTime=0.08)
-                            if _paste_text(kw, verify=True):
-                                sleep_check(0.85)
+                            if not _paste_text(kw, verify=True):
+                                log(f"  关键词「{kw}」写入剪贴板未就绪，跳过重试…")
+                                continue
+                            sleep_check(0.85)
 
-                        # 直接按 Enter 打开首选/高亮会话
-                        ua.SendKeys("{Enter}", waitTime=0.3)
-                        if _wait_search_closed(loops=10, step=0.25):
-                            chat_ready = True
+                            # 极端情况下若搜索历史仍未消失，重新聚焦搜索框再贴一遍兜底
+                            popup_ctl, doc = _search_doc()
+                            if doc is not None and _has_search_history(doc):
+                                log(f"  检测到搜索框尚未接收内容，重新聚焦并粘贴「{kw}」…")
+                                _focus_search_input(popup_ctl, doc)
+                                time.sleep(0.15)
+                                ua.SendKeys("{Ctrl}a", waitTime=0.08)
+                                ua.SendKeys("{Back}", waitTime=0.08)
+                                if _paste_text(kw, verify=True):
+                                    sleep_check(0.85)
+
+                            # 直接按 Enter 打开首选/高亮会话
+                            ua.SendKeys("{Enter}", waitTime=0.3)
+                            if _wait_search_closed(loops=10, step=0.25):
+                                chat_ready = True
+                                break
+
+                            # 若回车后弹窗未退，且列表已有搜索结果，尝试精准点击命中行兜底
+                            popup_ctl, doc = _search_doc()
+                            if doc is not None and not _has_search_history(doc):
+                                matched = _feature_item(doc, search_name, search_tokens)
+                                if matched is not None:
+                                    _item_ctl, item_rect = matched
+                                    cx = int((item_rect.left + item_rect.right) / 2)
+                                    cy = int((item_rect.top + item_rect.bottom) / 2)
+                                    ua.Click(cx, cy, waitTime=0.3)
+                                    if _wait_search_closed(loops=10, step=0.25):
+                                        chat_ready = True
+                                        break
+                            log(f"  关键词「{kw}」未直接进入会话，尝试下一候选词…")
+
+                        if chat_ready:
                             break
+                        log("  本轮未进入目标会话，关闭搜索框后重试…")
+                        ua.SendKeys("{Esc}", waitTime=0.25)
+                        sleep_check(0.5)
 
-                        # 若回车后弹窗未退，且列表已有搜索结果，尝试精准点击命中行兜底
-                        popup_ctl, doc = _search_doc()
-                        if doc is not None and not _has_search_history(doc):
-                            matched = _feature_item(doc)
-                            if matched is not None:
-                                _item_ctl, item_rect = matched
-                                cx = int((item_rect.left + item_rect.right) / 2)
-                                cy = int((item_rect.top + item_rect.bottom) / 2)
-                                ua.Click(cx, cy, waitTime=0.3)
-                                if _wait_search_closed(loops=10, step=0.25):
-                                    chat_ready = True
-                                    break
-                        log(f"  关键词「{kw}」未直接进入会话，尝试下一候选词…")
+                    if not chat_ready:
+                        if not recover_interactive:
+                            raise RuntimeError(f"没能定位到钉钉会话「{search_name}」，已停止发送")
+                        issue = diagnose_issue(
+                            "dingtalk_search",
+                            extra={"search_name": search_name, "can_skip_target": (total > 1)},
+                        )
+                        choice = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                        if choice == "skip_target":
+                            return "skipped"
+                        if choice == "skip_search":
+                            skip_search = True
+                        else:
+                            skip_search = False
+                            continue
+                else:
+                    log("  用户已手动打开目标群聊，跳过自动搜索，直接定位发送框…")
 
-                    if chat_ready:
-                        break
-                    log("  本轮未进入目标会话，关闭搜索框后重试…")
-                    ua.SendKeys("{Esc}", waitTime=0.25)
+                try:
+                    _force_front()
+                    sleep_check(0.35)
+                    clear_clipboard_windows()
+                    log("  已打开目标会话，准备粘贴图片")
+
+                    # 4) 聚焦底部聊天输入框并先清空残留内容，再把图片写入剪贴板并粘贴
+                    ding_now = _fresh_ding()
+                    if ding_now is None:
+                        raise RuntimeError("找不到钉钉窗口，已停止粘贴")
+                    r = ding_now.BoundingRectangle
+                    _focus_chat_input(ding_now, r)
+                    sleep_check(0.35)
+                    _ensure_not_in_search_box(r)
+
+                    if cfg.get("dt_clear_before_send", True):
+                        ua.SendKeys("{Ctrl}a", waitTime=0.15)
+                        ua.SendKeys("{Back}", waitTime=0.15)
+                        ua.SendKeys("{Delete}", waitTime=0.15)
+                        ua.SendKeys("{Ctrl}a", waitTime=0.1)
+                        ua.SendKeys("{Back}", waitTime=0.2)
+                        log("  已清空发送框内原有内容")
+
+                    if not set_clipboard_image_from_file(tmp_img):
+                        raise RuntimeError("图片恢复失败，已停止粘贴")
+
+                    # 5) 粘贴图片前硬核查焦点，绝不把图片贴入顶部搜索框
+                    _ensure_not_in_search_box(r)
+                    ua.SendKeys("{Ctrl}v", waitTime=0.5)
+
+                    # 6) 弹窗兜底：检查“选择粘贴的形式”，出现就点「转为图片」
+                    converted = False
+                    for _ in range(12):
+                        time.sleep(0.25)
+                        tops = _enum_top_windows(
+                            target_classes=("ddesign::ComplexModal",), target_titles=None)
+                        if tops:
+                            modal = ua.ControlFromHandle(tops[0][0])
+                            if modal is not None:
+                                btn = modal.ButtonControl(searchDepth=12, Name="转为图片")
+                                if btn.Exists(2):
+                                    btn.Click()
+                                    converted = True
+                                    time.sleep(0.6)
+                            break
+                    if converted:
+                        log("  已自动点「转为图片」")
+                    else:
+                        log("  图片已直接粘贴（无需转换）")
+
+                    # 7) 粘贴文字前再次确认焦点在底部编辑区，最后再按当前节点策略开启/关闭静音与发送
+                    ding_now2 = _fresh_ding()
+                    if ding_now2 is None:
+                        raise RuntimeError("钉钉窗口异常，消息尚未发送，请检查后手动发送")
+                    r2 = ding_now2.BoundingRectangle
+                    _focus_chat_input(ding_now2, r2)
+                    sleep_check(0.25)
+                    ua.SendKeys("{End}", waitTime=0.15)
+                    _ensure_not_in_search_box(r2)
+                    if not _paste_text(text_msg, verify=True):
+                        raise RuntimeError("钉钉文字未就绪，已停止自动发送，请检查后手动按 Enter")
                     sleep_check(0.5)
 
-                if not chat_ready:
-                    if not recover_interactive:
-                        raise RuntimeError("没能定位到钉钉会话，已停止发送")
-                    issue = diagnose_issue("dingtalk_search", extra={"search_name": search_name})
+                    if do_silent:
+                        _enable_dingtalk_silent_send()
+                        sleep_check(0.35)
+                    else:
+                        _disable_dingtalk_silent_send()
+                        sleep_check(0.25)
+
+                    # 点完静音/取消静音后强制校验光标是否位于对话输入内容窗口，确认后再按下 Enter
+                    _verify_and_focus_chat_input(retries=2)
+
+                    if cfg.get("dt_auto_send", False):
+                        ua.SendKeys("{Enter}", waitTime=0.4)
+                        silent_word = "静音" if do_silent else "常规"
+                        log(f"  已{silent_word}发送图片和文字到「{search_name}」：{text_msg}")
+                    else:
+                        silent_tip = "并设为「静音发送」" if do_silent else "（常规提醒）"
+                        clear_tip = "已清空旧草稿、" if cfg.get("dt_clear_before_send", True) else ""
+                        log(f"  ✅ {clear_tip}在「{search_name}」贴好图片与「{text_msg}」{silent_tip}，光标已就位，按设置暂不发送，请检查后按 Enter")
+                    return "sent"
+                except Exception as e_paste:
+                    if "手动停止" in str(e_paste) or not recover_interactive:
+                        raise
+                    issue = diagnose_issue(
+                        "dingtalk_paste",
+                        e_paste,
+                        extra={"search_name": search_name, "can_skip_target": (total > 1)},
+                    )
                     choice = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
-                    if choice == "skip_search":
+                    if choice == "skip_target":
+                        return "skipped"
+                    if choice == "retry_paste":
                         skip_search = True
                     else:
                         skip_search = False
-                        continue
+                    continue
+
+        # 3) 多目标依次投递主循环
+        sent_targets = []
+        skipped_targets = []
+        total_targets = len(targets)
+        for idx, tgt in enumerate(targets, 1):
+            res = _send_one_target(idx, total_targets, tgt)
+            if res == "skipped":
+                skipped_targets.append(tgt)
+                log(f"  ⚠️ 已跳过会话「{tgt}」，继续下一个目标")
             else:
-                log("  用户已手动打开目标群聊，跳过自动搜索，直接定位发送框…")
+                sent_targets.append(tgt)
+            if idx < total_targets:
+                sleep_check(0.8)
 
-            try:
-                _force_front()
-                sleep_check(0.35)
-                clear_clipboard_windows()
-                log("  已打开目标会话，准备粘贴图片")
-
-                # 4) 聚焦底部聊天输入框并先清空残留内容，再把图片写入剪贴板并粘贴
-                ding_now = _fresh_ding()
-                if ding_now is None:
-                    raise RuntimeError("找不到钉钉窗口，已停止粘贴")
-                r = ding_now.BoundingRectangle
-                _focus_chat_input(ding_now, r)
-                sleep_check(0.35)
-                _ensure_not_in_search_box(r)
-
-                if cfg.get("dt_clear_before_send", True):
-                    ua.SendKeys("{Ctrl}a", waitTime=0.15)
-                    ua.SendKeys("{Back}", waitTime=0.15)
-                    ua.SendKeys("{Delete}", waitTime=0.15)
-                    ua.SendKeys("{Ctrl}a", waitTime=0.1)
-                    ua.SendKeys("{Back}", waitTime=0.2)
-                    log("  已清空发送框内原有内容")
-
-                if not set_clipboard_image_from_file(tmp_img):
-                    raise RuntimeError("图片恢复失败，已停止粘贴")
-
-                # 5) 粘贴图片前硬核查焦点，绝不把图片贴入顶部搜索框
-                _ensure_not_in_search_box(r)
-                ua.SendKeys("{Ctrl}v", waitTime=0.5)
-
-                # 6) 弹窗兜底：检查“选择粘贴的形式”，出现就点「转为图片」
-                converted = False
-                for _ in range(12):
-                    time.sleep(0.25)
-                    tops = _enum_top_windows(
-                        target_classes=("ddesign::ComplexModal",), target_titles=None)
-                    if tops:
-                        modal = ua.ControlFromHandle(tops[0][0])
-                        if modal is not None:
-                            btn = modal.ButtonControl(searchDepth=12, Name="转为图片")
-                            if btn.Exists(2):
-                                btn.Click()
-                                converted = True
-                                time.sleep(0.6)
-                        break
-                if converted:
-                    log("  已自动点「转为图片」")
-                else:
-                    log("  图片已直接粘贴（无需转换）")
-
-                # 7) 粘贴文字前再次确认焦点在底部编辑区，最后再按设置决定静音与是否发出
-                ding_now2 = _fresh_ding()
-                if ding_now2 is None:
-                    raise RuntimeError("钉钉窗口异常，消息尚未发送，请检查后手动发送")
-                r2 = ding_now2.BoundingRectangle
-                _focus_chat_input(ding_now2, r2)
-                sleep_check(0.25)
-                ua.SendKeys("{End}", waitTime=0.15)
-                _ensure_not_in_search_box(r2)
-                if not _paste_text(text_msg, verify=True):
-                    raise RuntimeError("钉钉文字未就绪，已停止自动发送，请检查后手动按 Enter")
-                sleep_check(0.5)
-
-                if cfg.get("dt_silent_send", True):
-                    ding_now3 = _fresh_ding()
-                    if ding_now3 is not None:
-                        _enable_dingtalk_silent_send(ding_now3, ding_now3.BoundingRectangle)
-                        sleep_check(0.35)
-
-                if cfg.get("dt_auto_send", False):
-                    ding_now4 = _fresh_ding()
-                    if ding_now4 is not None:
-                        r4 = ding_now4.BoundingRectangle
-                        _focus_chat_input(ding_now4, r4)
-                        sleep_check(0.2)
-                        _ensure_not_in_search_box(r4)
-                    ua.SendKeys("{Enter}", waitTime=0.4)
-                    silent_word = "静音" if cfg.get("dt_silent_send", True) else ""
-                    log(f"  已{silent_word}发送图片和文字：{text_msg}")
-                else:
-                    silent_tip = "并设为「静音发送」" if cfg.get("dt_silent_send", True) else ""
-                    clear_tip = "已清空旧草稿、" if cfg.get("dt_clear_before_send", True) else ""
-                    log(f"  ✅ {clear_tip}贴好图片与「{text_msg}」{silent_tip}，按设置暂不发送，请检查后手动发送")
-                return True
-            except Exception as e_paste:
-                if "手动停止" in str(e_paste) or not recover_interactive:
-                    raise
-                issue = diagnose_issue("dingtalk_paste", e_paste, extra={"search_name": search_name})
-                choice = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
-                if choice == "retry_paste":
-                    skip_search = True
-                else:
-                    skip_search = False
-                continue
+        if total_targets > 1:
+            if skipped_targets:
+                log(f"  多会话投递完成：成功 {len(sent_targets)} 个（{'、'.join(sent_targets)}），跳过 {len(skipped_targets)} 个（{'、'.join(skipped_targets)}）")
+            else:
+                log(f"  ✅ 多会话投递完成：全部 {len(sent_targets)} 个目标已处理")
+        return True
     except Exception as e:
         log(f"  钉钉操作失败：{human_error(e)}")
         raise
@@ -3073,8 +4010,36 @@ def _capture_summary_with_recovery(page, temp_dir=None, enable_capture=True, rec
                 return True
 
 
+def _with_keep_awake(cfg, reason, fn):
+    """按配置在任务执行期间持有防休眠状态并在结束或异常退出时安全释放。"""
+    keep_awake = bool((cfg or {}).get("prevent_sleep", True))
+    if keep_awake:
+        set_keep_awake(True, reason=reason)
+    try:
+        return fn()
+    finally:
+        if keep_awake:
+            set_keep_awake(False, reason=reason)
+
+
 def run_once(round_num, cfg=None, trigger_lt=None, trigger_hm=None, recover_interactive=True):
     reset_stop()
+    if cfg is None:
+        cfg = load_config()
+    return _with_keep_awake(
+        cfg,
+        "run_once",
+        lambda: _run_once_impl(
+            round_num,
+            cfg=cfg,
+            trigger_lt=trigger_lt,
+            trigger_hm=trigger_hm,
+            recover_interactive=recover_interactive,
+        ),
+    )
+
+
+def _run_once_impl(round_num, cfg=None, trigger_lt=None, trigger_hm=None, recover_interactive=True):
     start_time = time.time()
     trigger_lt = trigger_lt or time.localtime(start_time)
     start_str = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -3341,6 +4306,16 @@ def run_once(round_num, cfg=None, trigger_lt=None, trigger_hm=None, recover_inte
 def run_capture_only(round_num="截图", cfg=None, recover_interactive=True):
     """独立截图发送：不下载、不写入，只处理 WPS 汇总表和钉钉（支持分步恢复）。"""
     reset_stop()
+    if cfg is None:
+        cfg = load_config()
+    return _with_keep_awake(
+        cfg,
+        "capture_only",
+        lambda: _run_capture_only_impl(round_num=round_num, cfg=cfg, recover_interactive=recover_interactive),
+    )
+
+
+def _run_capture_only_impl(round_num="截图", cfg=None, recover_interactive=True):
     start_time = time.time()
     trigger_lt = time.localtime(start_time)
     if cfg is None:
@@ -4222,6 +5197,11 @@ def show_settings_window():
 if __name__ == "__main__":
     if not acquire_single_instance():
         sys.exit(0)
+    try:
+        priv = check_dingtalk_privilege_match()
+        log(f"⚠️ {priv['message']}" if not priv.get("matched", True) else priv["message"])
+    except Exception:
+        pass
     try:
         import threading
         threading.Thread(target=ensure_browser_installed, daemon=True).start()

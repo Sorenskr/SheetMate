@@ -6,7 +6,7 @@
 
 ## 📥 下载与使用（Windows 免安装版）
 
-### 👉 **[点击直接下载最新版 SheetMate.exe (v2.0.0)](https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe)**
+### 👉 **[点击直接下载最新版 SheetMate.exe (v2.0.1)](https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe)**
 
 > 也可以前往 **[Releases 发布页](https://github.com/Sorenskr/SheetMate/releases)** 查看所有历史版本。
 
@@ -15,6 +15,21 @@
 2. 双击 `SheetMate.exe` 打开 **Apple iOS 18 风格控制中心**（首次运行会在后台自动补齐 Chromium 组件）。
 3. 在控制中心设置好「钉钉目标群聊 / 会话」与运行计划，点击 **「立即跑一次」**。
 4. 首次运行若 WPS 弹出扫码登录页面，请使用手机扫码登录一次，后续即全程全自动执行。
+
+---
+
+## 🚀 v2.0.1 更新亮点
+
+- **无坐标钉钉智能「静音发送」与图像匹配双引擎兜底**
+  - 优先采用 `pywinauto (backend="uia")` 仅按进程 `DingTalk.exe` 定位发送按钮、下拉箭头与「设为静音 / 取消静音」菜单，彻底告别跨电脑分辨率/DPI 错位问题（每步 2 次 @ `1s` 重试，失败自动输出 UIA 控件树快照方便排查）。
+  - UIA 不可用时自动降级 `pyautogui.locateOnScreen` 多尺度灰度模板匹配，并在运行日志明确标注当前所用模式；同时提供独立探测脚本 `probe_dingtalk_silent.py`。
+  - 启动及发送前检测脚本与 `DingTalk.exe` **同权限运行一致性**，静音切换后强制复核键盘光标确在底部聊天输入窗口再按 `Enter`。
+- **每日执行排期每节点精细化管控**
+  - 「每日执行排期全览」每行直接展示该节点实际生效的**时间后缀具体内容**，右侧内嵌行内「静音发送」开关拨杆；点开节点弹窗还可精细配置三态静音策略（`跟随全局` / `静音发送` / `常规提醒`）与单点后缀。
+  - 若某节点关闭静音发送，会自动清理钉钉输入框残留的「静音发送」状态，杜绝误静音。
+- **多群聊 / 多联系人依次自动投递与实用增强**
+  - 「钉钉投递」支持添加多组会话并独立启停；WPS 仅截图一次即可按序自动搜群投递，单群遇阻可选择跳过继续发下一个。
+  - 新增**值守期间防电脑休眠/息屏**（Win32 `SetThreadExecutionState`）、**一键检测钉钉环境与同权限状态**、**最近 20 张汇总截图自动归档**与排期跨日 `下轮` 提示。
 
 ---
 
@@ -64,5 +79,7 @@ pyinstaller SheetMate.spec --noconfirm
 | `neu_ui.py` | Windows 高分屏适配与桌面灵动岛悬浮进度胶囊组件 |
 | `sheetmate_ui.py` | 界面入口兼容转发层 |
 | `SheetMate.spec` | PyInstaller 单文件打包配置文件 |
+| `probe_dingtalk_silent.py` | 本机钉钉主窗与静音菜单 UIA 控件树独立探测脚本 |
+| `templates/` | 图像匹配兜底用的钉钉发送按钮/菜单/徽标干净模板图 |
 | `一键运行.bat` | Windows 一键安装依赖并无黑框启动脚本 |
 | `version.json` | 在线自动检测新版本清单 |

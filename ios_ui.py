@@ -112,7 +112,22 @@ class _SheetMateController:
                 on_cancel=self.stop_current_task,
             )
 
+        self._check_privilege_startup()
         threading.Thread(target=self._check_update_worker, daemon=True).start()
+
+    def _check_privilege_startup(self):
+        try:
+            if hasattr(self.app, "check_dingtalk_privilege_match"):
+                priv = self.app.check_dingtalk_privilege_match()
+                msg = priv.get("message", "")
+                if not priv.get("matched", True):
+                    self._on_log(f"⚠️ {msg}")
+                    with self._lock:
+                        self.error_text = _strip_symbols(msg)
+                elif msg:
+                    self._on_log(msg)
+        except Exception:
+            pass
 
     def _check_update_worker(self):
         try:
@@ -460,74 +475,81 @@ class _SheetMateController:
         WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
         round_num = 1
         fired_keys = set()
-        while not self.stop_flag:
-            cfg = self.get_config()
-            now_ts = time.time()
-            now_lt = time.localtime(now_ts)
-            today_prefix = time.strftime("%Y-%m-%d", now_lt)
-            fired_keys = {k for k in fired_keys if k.startswith(today_prefix)}
+        try:
+            while not self.stop_flag:
+                cfg = self.get_config()
+                if hasattr(self.app, "set_keep_awake"):
+                    self.app.set_keep_awake(bool(cfg.get("prevent_sleep", True)), reason="schedule")
+                now_ts = time.time()
+                now_lt = time.localtime(now_ts)
+                today_prefix = time.strftime("%Y-%m-%d", now_lt)
+                fired_keys = {k for k in fired_keys if k.startswith(today_prefix)}
 
-            found = self._compute_next_point(cfg, now_ts, fired_keys)
-            if found is None:
+                found = self._compute_next_point(cfg, now_ts, fired_keys)
+                if found is None:
+                    with self._lock:
+                        if not self.job_running and not self.capture_running:
+                            self.status_level = "idle"
+                            self.step_text = "未选择任何有效运行日期或时段"
+                        self.next_run_ts = 0.0
+                        self.next_run_str = "—"
+                    for _ in range(5):
+                        if self.stop_flag:
+                            break
+                        time.sleep(1)
+                    continue
+
+                pt_ts, date_key, pt, ready, day_off = found
+                if ready and not self.job_running and not self.capture_running:
+                    if self._task_lock.acquire(blocking=False):
+                        fired_keys.add(date_key)
+                        run_cfg = self.get_config()
+                        run_cfg["enable_capture"] = bool(pt.get("do_capture", True))
+                        run_cfg["enable_dingtalk"] = bool(pt.get("do_dingtalk", False))
+                        run_cfg["dt_silent_send"] = bool(pt.get("do_silent", run_cfg.get("dt_silent_send", True)))
+
+                        nxt_after = self._compute_next_point(cfg, now_ts, fired_keys)
+                        with self._lock:
+                            self.job_running = True
+                            self.status_level = "running"
+                            self.progress = 0.02
+                            self.error_text = ""
+                            if nxt_after:
+                                n_ts, _, n_pt, _, n_off = nxt_after
+                                n_lt = time.localtime(n_ts)
+                                self.next_run_ts = n_ts
+                                self.next_run_str = n_pt["time"] if n_off == 0 else f"{WEEKDAYS[n_lt.tm_wday]} {n_pt['time']}"
+                        self._run_once_worker(
+                            round_num,
+                            owns_lock=True,
+                            run_cfg_override=run_cfg,
+                            trigger_lt=time.localtime(pt_ts),
+                            trigger_hm=pt["time"],
+                        )
+                        round_num += 1
+                        continue
+
+                pt_lt = time.localtime(pt_ts)
+                day_ok = self.app.is_run_day_allowed(cfg, now_lt)
                 with self._lock:
                     if not self.job_running and not self.capture_running:
                         self.status_level = "idle"
-                        self.step_text = "未选择任何有效运行日期或时段"
-                    self.next_run_ts = 0.0
-                    self.next_run_str = "—"
+                        if not day_ok:
+                            self.step_text = "今日不在运行周期，静默休眠中"
+                        elif day_off == 0:
+                            self.step_text = f"自动值守中（下一轮 {pt['time']}）"
+                        else:
+                            self.step_text = f"今日排期已结束（下轮 {WEEKDAYS[pt_lt.tm_wday]} {pt['time']}）"
+                    self.next_run_ts = pt_ts
+                    self.next_run_str = pt["time"] if day_off == 0 else f"{WEEKDAYS[pt_lt.tm_wday]} {pt['time']}"
+
                 for _ in range(5):
                     if self.stop_flag:
                         break
                     time.sleep(1)
-                continue
-
-            pt_ts, date_key, pt, ready, day_off = found
-            if ready and not self.job_running and not self.capture_running:
-                if self._task_lock.acquire(blocking=False):
-                    fired_keys.add(date_key)
-                    run_cfg = self.get_config()
-                    run_cfg["enable_capture"] = bool(pt.get("do_capture", True))
-                    run_cfg["enable_dingtalk"] = bool(pt.get("do_dingtalk", False))
-
-                    nxt_after = self._compute_next_point(cfg, now_ts, fired_keys)
-                    with self._lock:
-                        self.job_running = True
-                        self.status_level = "running"
-                        self.progress = 0.02
-                        self.error_text = ""
-                        if nxt_after:
-                            n_ts, _, n_pt, _, n_off = nxt_after
-                            n_lt = time.localtime(n_ts)
-                            self.next_run_ts = n_ts
-                            self.next_run_str = n_pt["time"] if n_off == 0 else f"{WEEKDAYS[n_lt.tm_wday]} {n_pt['time']}"
-                    self._run_once_worker(
-                        round_num,
-                        owns_lock=True,
-                        run_cfg_override=run_cfg,
-                        trigger_lt=time.localtime(pt_ts),
-                        trigger_hm=pt["time"],
-                    )
-                    round_num += 1
-                    continue
-
-            pt_lt = time.localtime(pt_ts)
-            day_ok = self.app.is_run_day_allowed(cfg, now_lt)
-            with self._lock:
-                if not self.job_running and not self.capture_running:
-                    self.status_level = "idle"
-                    if not day_ok:
-                        self.step_text = "今日不在运行周期，静默休眠中"
-                    elif day_off == 0:
-                        self.step_text = f"自动值守中（下一轮 {pt['time']}）"
-                    else:
-                        self.step_text = f"今日排期已结束（下轮 {WEEKDAYS[pt_lt.tm_wday]} {pt['time']}）"
-                self.next_run_ts = pt_ts
-                self.next_run_str = pt["time"] if day_off == 0 else f"{WEEKDAYS[pt_lt.tm_wday]} {pt['time']}"
-
-            for _ in range(5):
-                if self.stop_flag:
-                    break
-                time.sleep(1)
+        finally:
+            if hasattr(self.app, "set_keep_awake"):
+                self.app.set_keep_awake(False, reason="schedule")
 
         with self._lock:
             self.schedule_running = False
@@ -1708,7 +1730,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     text-align: center;
   }
   .alert-title { font-size: 16px; font-weight: 700; margin-bottom: 5px; }
-  .alert-msg { font-size: 13px; color: var(--text-2); line-height: 1.4; }
+  .alert-msg { font-size: 13px; color: var(--text-2); line-height: 1.48; white-space: pre-line; }
   .alert-actions {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -1832,6 +1854,59 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .ios-switch.sm input:checked + .ios-slider::before {
     transform: translateX(16px);
+  }
+  .ios-switch.xs {
+    width: 34px;
+    height: 20px;
+    flex-shrink: 0;
+  }
+  .ios-switch.xs .ios-slider {
+    border-radius: 20px;
+  }
+  .ios-switch.xs .ios-slider::before {
+    left: 2px;
+    top: 2px;
+    width: 16px;
+    height: 16px;
+  }
+  .ios-switch.xs input:checked + .ios-slider::before {
+    transform: translateX(14px);
+  }
+  .target-item-row {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 14px;
+  }
+  .target-item-row + .target-item-row::before,
+  .target-item-row + .ios-row::before,
+  #dtTargetsList + .ios-row::before {
+    content: "";
+    position: absolute;
+    left: 14px;
+    right: 0;
+    top: 0;
+    height: 0.5px;
+    background: var(--sep);
+  }
+  .target-input-wrap {
+    flex: 1;
+    min-width: 0;
+    background: var(--fill-2);
+    border-radius: 10px;
+    padding: 6px 10px;
+  }
+  .target-input-wrap input {
+    width: 100%;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13.5px;
+    font-weight: 500;
+    user-select: text;
   }
   .rule-card-row {
     position: relative;
@@ -1958,19 +2033,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     padding: 0 5px;
     border-radius: 999px;
   }
+  .tt-next-tag.tomorrow {
+    background: var(--indigo);
+  }
   .tt-badges {
     flex: 1;
+    min-width: 0;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 5px;
+    gap: 4px;
   }
   .tt-pill {
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 600;
-    padding: 2.5px 7px;
+    padding: 2.5px 6.5px;
     border-radius: 7px;
     white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .tt-pill.cap-on { background: rgba(52, 199, 89, 0.14); color: #1E9E43; }
   .tt-pill.dt-on { background: rgba(0, 122, 255, 0.12); color: var(--blue); }
@@ -1978,6 +2060,38 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tt-pill.off { background: var(--fill-2); color: var(--sub); }
   [data-theme="dark"] .tt-pill.cap-on { color: #30D158; }
   [data-theme="dark"] .tt-pill.suf-on { color: #8E8CF8; }
+  .tt-right-ctrl {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .tt-sil-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 6px;
+    border-radius: 999px;
+    background: var(--fill-2);
+    cursor: default;
+  }
+  .tt-sil-wrap.muted-dim {
+    opacity: 0.55;
+  }
+  .tt-sil-lbl {
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--sub);
+    min-width: 22px;
+    text-align: center;
+    white-space: nowrap;
+  }
+  .tt-sil-lbl.sil { color: var(--orange); }
+  .tt-head-tools {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
 
   .sheet-body-pad {
     padding: 14px 16px 6px;
@@ -2054,7 +2168,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="large-title-wrap">
           <img src="/icon.png" class="nav-app-icon" alt="" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.0.0</span>
+          <span class="ver-pill" id="verBadge">v2.0.1</span>
         </div>
         <div class="nav-actions">
           <button class="nav-circle-btn" id="updateBtn" title="检查更新" style="display:none;">
@@ -2206,22 +2320,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <!-- Tab 2: 钉钉投递 -->
       <section class="tab-pane" id="pane-dingtalk">
         <div class="section-wrap">
-          <div class="section-head"><span>目标会话</span></div>
+          <div class="section-head">
+            <span>目标群聊 / 联系人（支持多个）</span>
+            <button class="head-action-btn" id="addTargetBtn" type="button">+ 添加会话</button>
+          </div>
           <div class="ios-group">
-            <div class="ios-row">
+            <div id="dtTargetsList"></div>
+            <div class="ios-row clickable" id="checkDingBtn">
               <div class="sf-badge sf-teal">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="5"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
               </div>
-              <div class="row-title" style="flex-shrink:0;">目标群聊</div>
-              <div class="field-inline">
-                <input type="text" id="dtSearch" placeholder="输入完整群名或联系人" />
-                <button class="clear-circle" id="clearSearchBtn" title="清空">
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/></svg>
-                </button>
+              <div class="row-main">
+                <div class="row-title">检测钉钉环境与同权限状态</div>
+                <div class="row-sub">排查权限不一致、登录主窗与兜底模板</div>
+              </div>
+              <div class="row-right">
+                <span class="row-val" id="dingCheckVal">一键自检</span>
+                <svg class="chevron-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
               </div>
             </div>
           </div>
-          <div class="section-footer" id="kwPreview">打开钉钉后按 Ctrl+Shift+F 粘贴目标名称并按 Enter 直达</div>
+          <div class="section-footer" id="kwPreview">将依次按 Ctrl+Shift+F 打开已勾选会话并完成投递</div>
         </div>
 
         <div class="section-wrap">
@@ -2395,6 +2514,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <button class="ios-pill-btn neutral" id="nightGapBtn">每 30 分钟</button>
               </div>
             </div>
+
+            <div class="ios-row no-icon-sep">
+              <div class="sf-badge sf-green">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">值守期间防休眠息屏</div>
+                <div class="row-sub">阻止电脑自动睡眠，避免夜间断连误抓</div>
+              </div>
+              <label class="ios-switch"><input type="checkbox" id="preventSleep" /><span class="ios-slider"></span></label>
+            </div>
           </div>
           <div class="section-footer warn" id="overlapTip" style="display:none;">
             白天与晚上时段存在重叠，系统已合并去重生成准点排期，不会重复连跑。
@@ -2425,10 +2555,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="section-wrap">
           <div class="section-head">
             <span>每日执行排期全览</span>
-            <span id="ttSummaryText">共 0 轮</span>
+            <div class="tt-head-tools">
+              <button class="head-action-btn" id="resetAllPointsBtn" type="button" style="display:none;color:var(--red);">重置单点</button>
+              <span id="ttSummaryText">共 0 轮</span>
+            </div>
           </div>
           <div class="ios-group" id="timetableList"></div>
-          <div class="section-footer">点击任意时间行可单独覆盖该点是否截图、发钉钉或专属后缀</div>
+          <div class="section-footer">每行可直接切换该点是否「静音发送」；点击该行可调整发群、静音或专属时间后缀</div>
         </div>
       </section>
 
@@ -2481,6 +2614,35 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               <div class="field-inline">
                 <input type="password" id="luyaPass" placeholder="后台登录密码" />
                 <button class="mini-pill" id="togglePassBtn" type="button" style="display:inline-flex;align-items:center;padding:4px 8px;" title="显示或隐藏密码"></button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-wrap">
+          <div class="section-head"><span>历史截图归档</span><span>最多留存最近 20 张</span></div>
+          <div class="ios-group">
+            <div class="ios-row">
+              <div class="sf-badge sf-indigo">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">自动归档每次汇总表截图</div>
+                <div class="row-sub">方便随时回查历史日报，超 20 张自动清理旧图</div>
+              </div>
+              <label class="ios-switch"><input type="checkbox" id="saveShotHistory" /><span class="ios-slider"></span></label>
+            </div>
+
+            <div class="ios-row clickable" id="openShotsBtn">
+              <div class="sf-badge sf-orange">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+              </div>
+              <div class="row-main">
+                <div class="row-title">打开历史截图文件夹</div>
+                <div class="row-sub">查看已保存的历次汇总表图片</div>
+              </div>
+              <div class="row-right">
+                <svg class="chevron-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
               </div>
             </div>
           </div>
@@ -2557,11 +2719,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
         </div>
 
+        <div>
+          <div class="sheet-field-label">
+            <span>静音发送策略</span>
+            <span id="pointSilentDefaultSub" style="font-weight:400;margin-left:6px;font-size:11px;"></span>
+          </div>
+          <div class="segmented segmented-3" id="pointSilentSeg">
+            <div class="seg-thumb" id="pointSilentThumb"></div>
+            <button class="seg-btn" type="button" data-val="default">跟随全局</button>
+            <button class="seg-btn" type="button" data-val="on">静音发送</button>
+            <button class="seg-btn" type="button" data-val="off">常规提醒</button>
+          </div>
+        </div>
+
         <div class="ios-group" style="box-shadow:none;">
           <div class="ios-row" style="min-height:44px;">
             <div class="row-main">
-              <div class="row-title">单独指定该点后缀</div>
-              <div class="row-sub">开启后可覆盖全局/时段规则；留空即强制不加</div>
+              <div class="row-title">单独指定该点时间后缀</div>
+              <div class="row-sub" id="pointSufHint">开启后可覆盖全局/时段规则；留空即强制不加</div>
             </div>
             <label class="ios-switch sm"><input type="checkbox" id="pointCustomSufOn" /><span class="ios-slider"></span></label>
           </div>
@@ -2614,6 +2789,7 @@ let updateUrl = "";
 let pickerState = null;
 let editingPointHm = "";
 let editingPointMode = "default";
+let editingPointSilent = "default";
 let lastRecSignature = "";
 
 function cleanText(s) {
@@ -2692,11 +2868,7 @@ function buildDayModeLabel(c) {
   return "每天运行";
 }
 
-function resolveSuffixLocal(hm) {
-  const ov = cfg.point_overrides && cfg.point_overrides[hm];
-  if (ov && ov.suffix !== undefined && ov.suffix !== null) {
-    return { suf: String(ov.suffix).trim(), src: "单点覆盖" };
-  }
+function resolveSuffixByRulesOnly(hm) {
   const curMin = slotMinutes(hm);
   const rules = Array.isArray(cfg.suffix_rules) ? cfg.suffix_rules : [];
   for (const r of rules) {
@@ -2706,6 +2878,92 @@ function resolveSuffixLocal(hm) {
   }
   const defSuf = ($("dtSuffix").value || "").trim();
   return { suf: defSuf, src: defSuf ? "默认后缀" : "默认不加" };
+}
+
+function resolveSuffixLocal(hm) {
+  const ov = cfg.point_overrides && cfg.point_overrides[hm];
+  if (ov && ov.suffix !== undefined && ov.suffix !== null) {
+    return { suf: String(ov.suffix).trim(), src: "单点覆盖" };
+  }
+  return resolveSuffixByRulesOnly(hm);
+}
+
+function getEnabledTargetsLocal() {
+  const list = Array.isArray(cfg.dt_targets) ? cfg.dt_targets : [];
+  if (list.length > 0) {
+    return list
+      .filter((t) => t && t.enabled !== false && String(t.name || "").trim())
+      .map((t) => String(t.name).trim());
+  }
+  const s = String(cfg.dt_search || "文件小助手").trim();
+  return s ? [s] : ["文件小助手"];
+}
+
+function syncPrimaryDtSearch() {
+  const list = Array.isArray(cfg.dt_targets) ? cfg.dt_targets : [];
+  const enabled = list.find((t) => t && t.enabled !== false && String(t.name || "").trim());
+  const firstNamed = enabled || list.find((t) => t && String(t.name || "").trim());
+  cfg.dt_search = firstNamed ? String(firstNamed.name).trim() : (String(cfg.dt_search || "").trim() || "文件小助手");
+}
+
+function renderDtTargets() {
+  const wrap = $("dtTargetsList");
+  wrap.innerHTML = "";
+  if (!Array.isArray(cfg.dt_targets) || !cfg.dt_targets.length) {
+    cfg.dt_targets = [{ name: String(cfg.dt_search || "文件小助手").trim() || "文件小助手", enabled: true }];
+  }
+
+  cfg.dt_targets.forEach((tgt, idx) => {
+    const row = document.createElement("div");
+    row.className = "target-item-row";
+
+    const sw = document.createElement("label");
+    sw.className = "ios-switch sm";
+    const chk = document.createElement("input");
+    chk.type = "checkbox";
+    chk.checked = tgt.enabled !== false;
+    chk.onchange = () => {
+      cfg.dt_targets[idx].enabled = chk.checked;
+      syncPrimaryDtSearch();
+      scheduleSave(true);
+    };
+    const sl = document.createElement("span");
+    sl.className = "ios-slider";
+    sw.appendChild(chk);
+    sw.appendChild(sl);
+
+    const inpWrap = document.createElement("div");
+    inpWrap.className = "target-input-wrap";
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.placeholder = "输入完整群名或联系人名称";
+    inp.value = tgt.name || "";
+    inp.oninput = () => {
+      cfg.dt_targets[idx].name = inp.value;
+      syncPrimaryDtSearch();
+      scheduleSave(false);
+    };
+    inpWrap.appendChild(inp);
+
+    row.appendChild(sw);
+    row.appendChild(inpWrap);
+
+    if (cfg.dt_targets.length > 1) {
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "clear-circle";
+      del.title = "删除该会话";
+      del.innerHTML = SVG_CLOSE;
+      del.onclick = () => {
+        cfg.dt_targets.splice(idx, 1);
+        syncPrimaryDtSearch();
+        renderDtTargets();
+        scheduleSave(true);
+      };
+      row.appendChild(del);
+    }
+    wrap.appendChild(row);
+  });
 }
 
 function showToast(msg) {
@@ -3114,6 +3372,9 @@ function renderTimetable(tt) {
   const dayOk = isRunDayAllowedLocal(cfg);
   $("ttSummaryText").textContent = `共 ${latestTimetable.length} 轮${dayOk ? " · 今日运行" : " · 今日休眠"}`;
 
+  const hasOv = Boolean(cfg.point_overrides && Object.keys(cfg.point_overrides).length > 0);
+  $("resetAllPointsBtn").style.display = hasOv ? "inline-flex" : "none";
+
   if (!latestTimetable.length) {
     const empty = document.createElement("div");
     empty.className = "empty-rule-tip";
@@ -3124,9 +3385,12 @@ function renderTimetable(tt) {
 
   const now = new Date();
   const nowMin = now.getHours() * 60 + now.getMinutes();
+  const hasAnyFutureDay = (cfg.day_mode || "daily") !== "custom" || (Array.isArray(cfg.custom_days) && cfg.custom_days.length > 0);
+  const hasLaterToday = dayOk && latestTimetable.some((it) => it.min > nowMin);
+  const enabledTargetCount = getEnabledTargetsLocal().length;
   let nextMarked = false;
 
-  for (const item of latestTimetable) {
+  latestTimetable.forEach((item, idx) => {
     const row = document.createElement("div");
     row.className = "tt-row";
 
@@ -3146,6 +3410,12 @@ function renderTimetable(tt) {
       tag.className = "tt-next-tag";
       tag.textContent = "下次";
       perEl.appendChild(tag);
+    } else if (!hasLaterToday && hasAnyFutureDay && idx === 0 && !nextMarked) {
+      nextMarked = true;
+      const tag = document.createElement("span");
+      tag.className = "tt-next-tag tomorrow";
+      tag.textContent = "下轮";
+      perEl.appendChild(tag);
     }
     timeCol.appendChild(hmEl);
     timeCol.appendChild(perEl);
@@ -3159,27 +3429,73 @@ function renderTimetable(tt) {
 
     const dtPill = document.createElement("span");
     dtPill.className = `tt-pill ${item.do_dingtalk ? "dt-on" : "off"}`;
-    dtPill.textContent = item.do_dingtalk ? "发钉钉" : "不发群";
+    dtPill.textContent = item.do_dingtalk ? (enabledTargetCount > 1 ? `发${enabledTargetCount}群` : "发钉钉") : "不发群";
 
+    const sufText = String(item.suffix || "").trim();
     const sufPill = document.createElement("span");
-    sufPill.className = `tt-pill ${item.suffix ? "suf-on" : "off"}`;
-    sufPill.textContent = item.suffix ? item.suffix : "无后缀";
+    sufPill.className = `tt-pill ${sufText ? "suf-on" : "off"}`;
+    sufPill.textContent = sufText ? `后缀：${sufText}${item.has_custom_suffix ? "·点" : ""}` : "后缀：无";
+    sufPill.title = sufText ? `来源：${item.suffix_source || "默认"}` : "该节点不附加后缀";
 
     badges.appendChild(capPill);
     badges.appendChild(dtPill);
     badges.appendChild(sufPill);
+
+    const rightCtrl = document.createElement("div");
+    rightCtrl.className = "tt-right-ctrl";
+
+    const silWrap = document.createElement("div");
+    silWrap.className = "tt-sil-wrap" + (!item.do_dingtalk ? " muted-dim" : "");
+    silWrap.onclick = (e) => e.stopPropagation();
+
+    const silLbl = document.createElement("span");
+    silLbl.className = "tt-sil-lbl" + (item.do_dingtalk && item.do_silent ? " sil" : "");
+    silLbl.textContent = !item.do_dingtalk ? "不发" : (item.do_silent ? "静音" : "常规");
+
+    const silSw = document.createElement("label");
+    silSw.className = "ios-switch xs";
+    silSw.title = "切换该时间节点是否启用静音发送";
+    const silChk = document.createElement("input");
+    silChk.type = "checkbox";
+    silChk.checked = Boolean(item.do_silent);
+    silChk.onchange = () => {
+      if (!cfg.point_overrides) cfg.point_overrides = {};
+      const globalSil = $("dtSilentSend").checked;
+      const curOv = cfg.point_overrides[item.time]
+        ? { ...cfg.point_overrides[item.time] }
+        : { mode: "default", suffix: null, silent: null };
+      const nextSil = silChk.checked === globalSil ? null : silChk.checked;
+      const curSuf = curOv.suffix !== undefined ? curOv.suffix : null;
+      const curMode = curOv.mode || "default";
+      if (curMode === "default" && curSuf === null && nextSil === null) {
+        delete cfg.point_overrides[item.time];
+      } else {
+        cfg.point_overrides[item.time] = { mode: curMode, suffix: curSuf, silent: nextSil };
+      }
+      scheduleSave(true);
+    };
+    const silSlider = document.createElement("span");
+    silSlider.className = "ios-slider";
+    silSw.appendChild(silChk);
+    silSw.appendChild(silSlider);
+
+    silWrap.appendChild(silLbl);
+    silWrap.appendChild(silSw);
 
     const chevWrap = document.createElement("div");
     chevWrap.style.display = "flex";
     chevWrap.style.alignItems = "center";
     chevWrap.innerHTML = SVG_CHEVRON;
 
+    rightCtrl.appendChild(silWrap);
+    rightCtrl.appendChild(chevWrap);
+
     row.appendChild(timeCol);
     row.appendChild(badges);
-    row.appendChild(chevWrap);
+    row.appendChild(rightCtrl);
     row.onclick = () => openPointModal(item);
     list.appendChild(row);
-  }
+  });
 }
 
 function openPointModal(item) {
@@ -3189,6 +3505,15 @@ function openPointModal(item) {
   editingPointMode = ov.mode || "default";
   applySegmented("pointModeSeg", "pointModeThumb", editingPointMode);
 
+  editingPointSilent = ov.silent === true ? "on" : (ov.silent === false ? "off" : "default");
+  applySegmented("pointSilentSeg", "pointSilentThumb", editingPointSilent);
+  $("pointSilentDefaultSub").textContent = "全局默认：" + ($("dtSilentSend").checked ? "静音发送" : "常规提醒");
+
+  const baseRes = resolveSuffixByRulesOnly(item.time);
+  $("pointSufHint").textContent = baseRes.suf
+    ? `不单独指定时将使用：「${baseRes.suf}」（${baseRes.src}）`
+    : "当前全局与时段规则均未给该点配置后缀";
+
   const hasCustom = ov.suffix !== undefined && ov.suffix !== null;
   $("pointCustomSufOn").checked = hasCustom;
   $("pointCustomSufWrap").style.display = hasCustom ? "flex" : "none";
@@ -3197,9 +3522,17 @@ function openPointModal(item) {
 }
 
 function updateSummaries() {
-  const targetName = ($("dtSearch").value || "").trim() || "文件小助手";
-  $("sumTarget").textContent = targetName;
-  $("kwPreview").textContent = `将在钉钉按 Ctrl+Shift+F 直接粘贴「${targetName}」并按 Enter 进入会话`;
+  const enabledTargets = getEnabledTargetsLocal();
+  if (!enabledTargets.length) {
+    $("sumTarget").textContent = "未启用任何会话";
+    $("kwPreview").textContent = "请至少开启或添加一个目标会话，否则本轮将跳过钉钉发送";
+  } else if (enabledTargets.length === 1) {
+    $("sumTarget").textContent = enabledTargets[0];
+    $("kwPreview").textContent = `将在钉钉按 Ctrl+Shift+F 直接粘贴「${enabledTargets[0]}」并按 Enter 进入会话`;
+  } else {
+    $("sumTarget").textContent = `${enabledTargets[0]} 等 ${enabledTargets.length} 个会话`;
+    $("kwPreview").textContent = `将依次投递共 ${enabledTargets.length} 个会话：${enabledTargets.join("、")}`;
+  }
 
   const now = new Date();
   const curHm = hmStr(now.getHours(), now.getMinutes());
@@ -3244,11 +3577,13 @@ function renderConfig() {
   if (!cfg.night) cfg.night = { sh: 18, sm: 0, eh: 23, em: 0, ih: 2, im: 0 };
   if (!Array.isArray(cfg.custom_days)) cfg.custom_days = [0, 1, 2, 3, 4];
   if (!Array.isArray(cfg.suffix_rules)) cfg.suffix_rules = [];
+  if (!Array.isArray(cfg.dt_targets)) cfg.dt_targets = [];
   if (!cfg.point_overrides) cfg.point_overrides = {};
 
   applySegmented("dayModeSeg", "dayModeThumb", cfg.day_mode || "daily");
   renderCustomDays();
   $("nightEnabled").checked = cfg.night_enabled !== false;
+  $("preventSleep").checked = cfg.prevent_sleep !== false;
 
   $("enableCapture").checked = cfg.enable_capture !== false;
   $("enableDingtalk").checked = Boolean(cfg.enable_dingtalk);
@@ -3256,7 +3591,8 @@ function renderConfig() {
   $("dtSilentSend").checked = cfg.dt_silent_send !== false;
   $("dtAutoSend").checked = cfg.dt_auto_send === true;
   $("openWpsAfterRun").checked = cfg.open_wps_after_run === true;
-  $("dtSearch").value = cfg.dt_search || "";
+  $("saveShotHistory").checked = cfg.save_shot_history !== false;
+  renderDtTargets();
   $("dtSuffix").value = cfg.dt_suffix || "";
   renderSuffixRules();
 
@@ -3274,13 +3610,15 @@ function renderConfig() {
 
 function collectConfigFromDOM() {
   cfg.night_enabled = $("nightEnabled").checked;
+  cfg.prevent_sleep = $("preventSleep").checked;
   cfg.enable_capture = $("enableCapture").checked;
   cfg.enable_dingtalk = $("enableDingtalk").checked;
   cfg.dt_clear_before_send = $("dtClearBeforeSend").checked;
   cfg.dt_silent_send = $("dtSilentSend").checked;
   cfg.dt_auto_send = $("dtAutoSend").checked;
   cfg.open_wps_after_run = $("openWpsAfterRun").checked;
-  cfg.dt_search = $("dtSearch").value.trim() || "文件小助手";
+  cfg.save_shot_history = $("saveShotHistory").checked;
+  syncPrimaryDtSearch();
   cfg.dt_suffix = $("dtSuffix").value.trim();
   cfg.wps_url = $("wpsUrl").value.trim();
   cfg.luya_user = $("luyaUser").value.trim();
@@ -3514,6 +3852,42 @@ function bindEvents() {
     };
   }
 
+  $("addTargetBtn").onclick = () => {
+    if (!Array.isArray(cfg.dt_targets)) cfg.dt_targets = [];
+    cfg.dt_targets.push({ name: "", enabled: true });
+    renderDtTargets();
+    const inputs = $("dtTargetsList").querySelectorAll("input[type='text']");
+    if (inputs.length) inputs[inputs.length - 1].focus();
+    updateSummaries();
+  };
+
+  $("checkDingBtn").onclick = async () => {
+    $("dingCheckVal").textContent = "检测中…";
+    try {
+      const r = await api("/api/check-dingtalk", "POST");
+      $("dingCheckVal").textContent = r.ok ? "环境正常" : "需排查";
+      await iosAlert(r.ok ? "钉钉环境检测通过" : "钉钉环境待排查", r.summary || "检测完成");
+    } catch (_e) {
+      $("dingCheckVal").textContent = "检测失败";
+    }
+  };
+
+  $("openShotsBtn").onclick = async () => {
+    const r = await api("/api/open-shots", "POST");
+    showToast(r.message || "已尝试打开文件夹");
+  };
+
+  $("resetAllPointsBtn").onclick = async () => {
+    const ok = await iosAlert(
+      "重置全部单点设置",
+      "将清空排期表中所有时间节点的单独发群、静音与后缀覆盖，恢复跟随全局与时段规则。",
+      { okText: "全部重置", cancelText: "取消", danger: true }
+    );
+    if (!ok) return;
+    cfg.point_overrides = {};
+    scheduleSave(true);
+  };
+
   $("addSuffixRuleBtn").onclick = () => {
     if (!Array.isArray(cfg.suffix_rules)) cfg.suffix_rules = [];
     cfg.suffix_rules.push({ enabled: true, start: "12:00", end: "13:00", suffix: "午间数据" });
@@ -3530,8 +3904,8 @@ function bindEvents() {
   };
 
   for (const id of [
-    "nightEnabled", "enableCapture", "enableDingtalk",
-    "dtClearBeforeSend", "dtSilentSend", "dtAutoSend", "openWpsAfterRun"
+    "nightEnabled", "preventSleep", "enableCapture", "enableDingtalk",
+    "dtClearBeforeSend", "dtSilentSend", "dtAutoSend", "openWpsAfterRun", "saveShotHistory"
   ]) {
     $(id).addEventListener("change", () => scheduleSave(true));
   }
@@ -3541,13 +3915,9 @@ function bindEvents() {
     scheduleSave(true);
   });
 
-  for (const id of ["dtSearch", "dtSuffix", "wpsUrl", "luyaUser", "luyaPass"]) {
+  for (const id of ["dtSuffix", "wpsUrl", "luyaUser", "luyaPass"]) {
     $(id).addEventListener("input", () => scheduleSave(false));
   }
-  $("clearSearchBtn").onclick = () => {
-    $("dtSearch").value = "";
-    scheduleSave(true);
-  };
   $("clearSuffixBtn").onclick = () => {
     $("dtSuffix").value = "";
     scheduleSave(true);
@@ -3600,6 +3970,12 @@ function bindEvents() {
       applySegmented("pointModeSeg", "pointModeThumb", editingPointMode);
     };
   }
+  for (const btn of $("pointSilentSeg").querySelectorAll(".seg-btn")) {
+    btn.onclick = () => {
+      editingPointSilent = btn.dataset.val;
+      applySegmented("pointSilentSeg", "pointSilentThumb", editingPointSilent);
+    };
+  }
   $("pointCustomSufOn").addEventListener("change", () => {
     $("pointCustomSufWrap").style.display = $("pointCustomSufOn").checked ? "flex" : "none";
   });
@@ -3611,12 +3987,15 @@ function bindEvents() {
     if (!editingPointHm) return;
     if (!cfg.point_overrides) cfg.point_overrides = {};
     const hasCustom = $("pointCustomSufOn").checked;
-    if (editingPointMode === "default" && !hasCustom) {
+    const silVal = editingPointSilent === "on" ? true : (editingPointSilent === "off" ? false : null);
+    const sufVal = hasCustom ? $("pointCustomSufInput").value.trim() : null;
+    if (editingPointMode === "default" && silVal === null && sufVal === null) {
       delete cfg.point_overrides[editingPointHm];
     } else {
       cfg.point_overrides[editingPointHm] = {
         mode: editingPointMode,
-        suffix: hasCustom ? $("pointCustomSufInput").value.trim() : null,
+        suffix: sufVal,
+        silent: silVal,
       };
     }
     $("pointMask").classList.remove("show");
@@ -3894,6 +4273,25 @@ def _make_handler(ctrl, token):
             if parsed.path == "/api/clear-logs":
                 ctrl.clear_logs()
                 self._send_json({"ok": True})
+                return
+
+            if parsed.path == "/api/check-dingtalk":
+                if hasattr(ctrl.app, "diagnose_dingtalk_env"):
+                    res = ctrl.app.diagnose_dingtalk_env()
+                    self._send_json({"ok": bool(res.get("ok")), **res})
+                else:
+                    self._send_json({"ok": False, "summary": "当前版本不支持环境自检"})
+                return
+
+            if parsed.path == "/api/open-shots":
+                try:
+                    shots_dir = ctrl.app.app_dir() / "history_shots"
+                    shots_dir.mkdir(parents=True, exist_ok=True)
+                    if os.name == "nt":
+                        os.startfile(str(shots_dir))
+                    self._send_json({"ok": True, "path": str(shots_dir), "message": "已打开历史截图文件夹"})
+                except Exception as exc:
+                    self._send_json({"ok": False, "message": f"打开文件夹失败：{exc}"})
                 return
 
             if parsed.path == "/api/close":

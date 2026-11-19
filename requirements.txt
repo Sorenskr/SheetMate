@@ -3,4 +3,10 @@ openpyxl
 pillow
 uiautomation
 comtypes
+pywinauto
+pywin32
+pyautogui
+pyscreeze
+opencv-python-headless
+numpy
 pyinstaller
