@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.8.4 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.8.5 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -4395,9 +4395,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.8.4" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.8.5" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.8.4</span>
+          <span class="ver-pill" id="verBadge">v2.8.5</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -5710,9 +5710,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button class="mini-pill" id="adminAuthCloseBtn" type="button">取消</button>
       </div>
       <div class="modal-scroll">
-        <div style="font-size:12px;color:var(--sub);">已进入超级管理员入口，请输入口令与密码验证。</div>
-        <input type="password" id="adminPasscodeInput" class="small-input" style="padding:8px 11px;font-size:13px;" placeholder="管理员口令" />
-        <input type="password" id="adminPasswordInput" class="small-input" style="padding:8px 11px;font-size:13px;" placeholder="管理员密码" />
+        <div style="font-size:12px;color:var(--sub);">仅限管理员本人进入，请验证身份信息。</div>
+        <input type="password" id="adminPasscodeInput" class="small-input" style="padding:8px 11px;font-size:13px;" autocomplete="new-password" placeholder="请输入管理员姓名" />
+        <input type="password" id="adminPasswordInput" class="small-input" style="padding:8px 11px;font-size:13px;" autocomplete="new-password" placeholder="请输入管理员密码" />
       </div>
       <div class="modal-foot">
         <button type="button" class="pill-action-btn primary" id="adminLoginBtn">解锁总管后台</button>
@@ -5888,9 +5888,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="admin-box">
             <div class="admin-box-title"><span>密码设置</span></div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
-              <input type="password" id="adminNewPasscodeInput" class="small-input" placeholder="新口令（例如 myadmin）" />
-              <input type="password" id="adminNewPasswordInput" class="small-input" placeholder="新密码" />
-              <button type="button" class="pill-action-btn danger" id="adminSaveCredBtn">修改管理员口令密码</button>
+              <input type="password" id="adminNewPasscodeInput" class="small-input" autocomplete="new-password" placeholder="新管理员姓名" />
+              <input type="password" id="adminNewPasswordInput" class="small-input" autocomplete="new-password" placeholder="新管理员密码" />
+              <button type="button" class="pill-action-btn danger" id="adminSaveCredBtn">保存姓名与密码</button>
             </div>
           </div>
         </div>
@@ -9272,22 +9272,31 @@ function bindTeamCollabAndAdminEvents() {
       openAdminEntry();
     }
   });
-  $("adminAuthCloseBtn").onclick = () => $("adminAuthMask").classList.remove("show");
+  $("adminAuthCloseBtn").onclick = () => {
+    $("adminPasscodeInput").value = "";
+    $("adminPasswordInput").value = "";
+    $("adminAuthMask").classList.remove("show");
+  };
   $("adminLoginBtn").onclick = async () => {
     const r = await api("/api/admin/login", "POST", {
       passcode: $("adminPasscodeInput").value,
       password: $("adminPasswordInput").value,
     });
     if (!r || !r.ok) {
-      showToast((r && r.message) || "口令或密码不正确");
+      showToast((r && r.message) || "管理员姓名或密码不正确");
       return;
     }
+    $("adminPasscodeInput").value = "";
+    $("adminPasswordInput").value = "";
     adminToken = r.admin_token;
     sessionStorage.setItem("sheetmate_admin_tok", adminToken);
     $("adminAuthMask").classList.remove("show");
     $("adminConsoleMask").classList.add("show");
     loadAdminDashboard();
   };
+  $("adminPasscodeInput").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") $("adminPasswordInput").focus();
+  });
   $("adminPasswordInput").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") $("adminLoginBtn").click();
   });
@@ -9417,7 +9426,11 @@ function bindTeamCollabAndAdminEvents() {
       passcode: $("adminNewPasscodeInput").value.trim(),
       password: $("adminNewPasswordInput").value.trim(),
     }, { "X-Admin-Token": adminToken });
-    showToast(r.message || "管理员口令密码已更新");
+    if (r && r.ok) {
+      $("adminNewPasscodeInput").value = "";
+      $("adminNewPasswordInput").value = "";
+    }
+    showToast((r && r.message) || "管理员姓名与密码已更新");
   };
 }
 

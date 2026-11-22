@@ -1559,7 +1559,10 @@ class MobileBridgeManager:
                 if isinstance(data, dict):
                     pw = str(data.get("remote_password") or "").strip()
                     schema_v = _safe_int(data.get("schema_v"), default=1)
-                    if schema_v < 2 and pw == "Qq@112233":
+                    if schema_v < 2 and pw and hashlib.sha256(pw.encode("utf-8")).hexdigest() in (
+                        "d88fb3e6b6700bffa5f040818fa206a698b9c675627f817f11075fb026217015",
+                        "729cd4e8f2872e7c4ad2999b61d30827903c40d8f2de7a2cae5085e369128e3f",
+                    ):
                         self.mobile_pin = DEFAULT_REMOTE_PASSWORD
                         self.cloud_relay_enabled = bool(data.get("cloud_relay_enabled", True))
                         self._save_remote_cfg()

@@ -381,6 +381,19 @@ def _sha256_secret(val):
     return hashlib.sha256(f"SheetMateHub::{val}".encode("utf-8")).hexdigest()
 
 
+_DEFAULT_ADMIN_PASSCODE_HASH = "6ff431d101324476ed36a697cb43b4a46b8c74118d3ad950e8415ec40f36ade9"
+_DEFAULT_ADMIN_PASSWORD_HASH = "41492bcbcf0beda3e0ab90a0db689a19129de809d2cb26f9083e29d314fb80d8"
+_LEGACY_ADMIN_PASSCODE_HASH = "37a491493857d5f0dde3bd6af4520c2bc584cce05ea4bd5647df2640a5ad6eb2"
+_LEGACY_ADMIN_PASSWORD_HASHES = (
+    "1639db4be408463baedd13400614163c8f1399c441c2fe90f950a8ffc43c9e33",
+    "6011f04699646c70fc2b2e861b8ba0a570b8c2f209f900a09a14abfb7951c1b1",
+)
+
+
+def _norm_admin_passcode(val):
+    return " ".join(str(val or "").strip().split())
+
+
 def normalize_nickname_key(name):
     """将昵称按 NFKC 统一并剥离空白后折叠大小写，用于全局唯一性防重比对。"""
     s = unicodedata.normalize("NFKC", str(name or ""))
@@ -756,9 +769,10 @@ class TeamHubManager:
     def _default_state(self):
         return {
             "admin_auth": {
-                "passcode_hash": _sha256_secret("admin"),
-                "password_hash": _sha256_secret("Qq@112233"),
+                "passcode_hash": _DEFAULT_ADMIN_PASSCODE_HASH,
+                "password_hash": _DEFAULT_ADMIN_PASSWORD_HASH,
                 "admin_v2_migrated": True,
+                "admin_v3_migrated": True,
             },
             "global_logic": {
                 "lock_timeout_sec": 180,
@@ -821,10 +835,13 @@ class TeamHubManager:
         for sk, sv in d["admin_auth"].items():
             self._state["admin_auth"].setdefault(sk, sv)
         auth_blk = self._state["admin_auth"]
-        if not auth_blk.get("admin_v2_migrated") or auth_blk.get("password_hash") == _sha256_secret("888888"):
-            if auth_blk.get("password_hash") == _sha256_secret("888888"):
-                auth_blk["password_hash"] = _sha256_secret("Qq@112233")
+        if not auth_blk.get("admin_v3_migrated") or auth_blk.get("password_hash") in _LEGACY_ADMIN_PASSWORD_HASHES:
+            if not auth_blk.get("passcode_hash") or auth_blk.get("passcode_hash") == _LEGACY_ADMIN_PASSCODE_HASH:
+                auth_blk["passcode_hash"] = _DEFAULT_ADMIN_PASSCODE_HASH
+            if not auth_blk.get("password_hash") or auth_blk.get("password_hash") in _LEGACY_ADMIN_PASSWORD_HASHES:
+                auth_blk["password_hash"] = _DEFAULT_ADMIN_PASSWORD_HASH
             auth_blk["admin_v2_migrated"] = True
+            auth_blk["admin_v3_migrated"] = True
             self._save_state_local_and_push(push_remote=False)
         for sk, sv in d["global_logic"].items():
             self._state["global_logic"].setdefault(sk, sv)
@@ -1645,7 +1662,7 @@ class TeamHubManager:
             self._sync_pull_if_needed(force=True)
             auth = self._state.get("admin_auth") or {}
             ok = (
-                hmac.compare_digest(_sha256_secret(str(passcode or "").strip()), str(auth.get("passcode_hash") or ""))
+                hmac.compare_digest(_sha256_secret(_norm_admin_passcode(passcode)), str(auth.get("passcode_hash") or ""))
                 and hmac.compare_digest(_sha256_secret(str(password or "").strip()), str(auth.get("password_hash") or ""))
             )
             if not ok:
@@ -1658,7 +1675,7 @@ class TeamHubManager:
                         "locked": True,
                         "message": f"管理员验证连续失败过多，已锁定 {int(ADMIN_LOCKOUT_SEC)} 秒后再试",
                     }
-                return {"ok": False, "message": "超级管理员口令或密码不正确"}
+                return {"ok": False, "message": "管理员姓名或密码不正确"}
             self._admin_fail_tracker.pop(client_id, None)
             # 清理已过期 Token，防止内存增长
             for k in [tk for tk, exp_t in self._admin_tokens.items() if exp_t <= now]:
@@ -1678,18 +1695,20 @@ class TeamHubManager:
         return True
 
     def update_admin_credentials(self, new_passcode="", new_password=""):
-        pc = str(new_passcode or "").strip()
+        pc = _norm_admin_passcode(new_passcode)
         pw = str(new_password or "").strip()
         if not pc or not pw:
-            return {"ok": False, "message": "口令和密码均不能为空"}
+            return {"ok": False, "message": "管理员姓名和密码均不能为空"}
         with self._lock:
             self._sync_pull_if_needed()
             self._state["admin_auth"] = {
                 "passcode_hash": _sha256_secret(pc),
                 "password_hash": _sha256_secret(pw),
+                "admin_v2_migrated": True,
+                "admin_v3_migrated": True,
             }
             self._save_state_local_and_push()
-            return {"ok": True, "message": "超级管理员口令与密码已更新保存"}
+            return {"ok": True, "message": "管理员姓名与密码已更新保存"}
 
     def get_admin_dashboard(self, start_time="", end_time="", user_id=""):
         with self._lock:
