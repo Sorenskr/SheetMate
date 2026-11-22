@@ -814,8 +814,8 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         </svg>
       </div>
       <div style="min-width:0;">
-        <div class="m-title">暗号表助手 · 手机远程版</div>
-        <div class="m-sub" id="mHeaderSub">连上您的电脑，随时查数据、聊工作、遥控跑表</div>
+        <div class="m-title">暗号表助手 · 云端异地远程版</div>
+        <div class="m-sub" id="mHeaderSub">无论身在何处，云端连上电脑就能查数据、聊工作、遥控跑表</div>
       </div>
     </div>
     <button type="button" class="m-pill" id="mSwitchUserBtn" style="display:none;">切换电脑</button>
@@ -824,9 +824,9 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="m-login-wrap" id="mLoginGate">
     <div class="m-card">
       <div class="m-intro-box">
-        <div class="m-intro-title">怎么连上您的电脑（Soren Drake 设计）</div>
+        <div class="m-intro-title">怎么从外地云端连上您的电脑（Soren Drake 设计）</div>
         <div>
-          填上您在电脑软件右上角起好的<strong>名字</strong>和<strong>远程密码</strong>，点下面按钮就能连上——随时跟它聊、查每天数据、让电脑自己跑表发钉钉，手机和电脑两边的对话会实时同步。
+          无论您在家、出差还是用手机流量，只要填上在电脑右上角起的<strong>名字</strong>和<strong>远程密码</strong>，就能直接从云端连回电脑——随时问数据、遥控自动跑表发钉钉，两边的聊天记录会实时同步。
         </div>
       </div>
 
@@ -836,13 +836,8 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="m-label">2. 远程密码</div>
       <input type="password" class="m-input" id="mLoginPinInput" placeholder="填电脑【远程网站】里设置的密码" autocomplete="current-password" />
 
-      <details id="mBaseDetails" style="font-size:11.5px;color:var(--sub);">
-        <summary style="cursor:pointer;">同 Wi-Fi 备用设置（平时不用填）</summary>
-        <input type="text" class="m-input" id="mServerBaseInput" style="margin-top:8px;font-size:13px;" placeholder="同 Wi-Fi 内网网址（选填，留空自动连）" />
-      </details>
-
       <div id="mLoginErr" style="font-size:12.5px;color:var(--red);display:none;line-height:1.45;"></div>
-      <button type="button" class="m-btn-primary" id="mLoginSubmitBtn">连接我的电脑</button>
+      <button type="button" class="m-btn-primary" id="mLoginSubmitBtn">云端连接我的电脑</button>
     </div>
   </div>
 
@@ -1350,7 +1345,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   $("mLoginSubmitBtn").onclick = async () => {
     const nick = $("mLoginNameInput").value.trim();
     const pin = $("mLoginPinInput").value.trim();
-    const b = $("mServerBaseInput").value.trim();
+    const b = $("mServerBaseInput") ? $("mServerBaseInput").value.trim() : "";
     if (b) {
       serverBase = b;
       localStorage.setItem("sm_mobile_base", b);
@@ -1411,12 +1406,12 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         } catch (_relayErr) {
           closeRelayStream();
           relayCred = null;
-          showLoginView("未能连上目标电脑：请核对「唯一名字」和「访问密码」是否与电脑端一致，并确认电脑正在运行加密暗号表助手。");
+          showLoginView("没连上电脑：请核对【名字】和【远程密码】是否和电脑端一样，并确认电脑软件正开着并连着网。");
         }
       }
     } finally {
       btn.disabled = false;
-      btn.textContent = "密码验证并连接电脑";
+      btn.textContent = "云端连接我的电脑";
     }
   };
 

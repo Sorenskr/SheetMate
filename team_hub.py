@@ -1043,6 +1043,7 @@ class TeamHubManager:
                                 "avatar", "admin_remark", "permissions", "step_text",
                                 "status_level", "last_seen_str", "last_seen_ts",
                                 "last_run_str", "next_run_str", "config_audit",
+                                "ai_api_override", "pending_remote_config",
                             )
                             if k in mem
                         }
@@ -1050,6 +1051,7 @@ class TeamHubManager:
                         "compact": True,
                         "lock": payload_data.get("lock"),
                         "queue": payload_data.get("queue"),
+                        "global_logic": payload_data.get("global_logic"),
                         "members": slim_members,
                         "runs": (payload_data.get("runs") or [])[-15:],
                         "errors": (payload_data.get("errors") or [])[-12:],
@@ -1791,8 +1793,24 @@ class TeamHubManager:
             self._save_state_local_and_push()
             return {"ok": True, "global_logic": dict(gl), "message": "全局软件运行逻辑与 AI 接口已更新并下发"}
 
+    def force_cloud_sync(self):
+        """立即执行一次云端异地数据拉取并同步上传本机快照。"""
+        with self._lock:
+            pulled = bool(self._sync_pull_if_needed(force=True))
+            self._save_state_local_and_push(push_remote=False)
+            mem_cnt = len(self._state.get("members") or {})
+        self.sync_member_snapshot(status_level="idle", step_text="云端同步完成")
+        return {
+            "ok": True,
+            "pulled": pulled,
+            "member_count": mem_cnt,
+            "message": f"已完成云端异地数据双向同步（当前共汇集 {mem_cnt} 位成员）",
+        }
+
     def admin_update_sync_settings(self, patch):
         p = patch if isinstance(patch, dict) else {}
+        if p.get("action") == "cloud_refresh":
+            return self.force_cloud_sync()
         with self._lock:
             sc = self._state.setdefault("sync_settings", {})
             if p.get("mode") in ("local_or_shared", "http_hub", "gist_cloud"):

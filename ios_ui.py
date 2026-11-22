@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.8.2 多端协同控制中心界面、动态昼夜光效与全球远程调度后端。"""
+"""SheetMate v2.8.3 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -1274,7 +1274,7 @@ class _SheetMateController:
             ai_patch = (st.get("global_logic") or {}).get("global_ai_api") or {}
         prov = str(ai_patch.get("provider") or "gemini").strip().lower()
         if prov == "local_only":
-            return {"ok": True, "source": "local_only", "reply": "当前模式已设为【仅使用本地内置智能引擎】，无需外部接口即可稳定提供问答、排障与变化分析。"}
+            return {"ok": True, "source": "local_only", "reply": "当前模式已设为【内置基础模式】，无需外部接口即可稳定提供问答、排障与变化分析。"}
         test_cfg = self.get_config()
         ai_d = dict(test_cfg.get("ai_assistant") or {})
         ai_d["provider"] = prov
@@ -4395,9 +4395,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.8.2" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.8.3" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.8.2</span>
+          <span class="ver-pill" id="verBadge">v2.8.3</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -4760,7 +4760,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
               <div class="remote-guide-strip" id="remoteGuideStrip">
                 <div style="flex:1;min-width:0;">
-                  <strong>手机远程连电脑：</strong>出门用手机打开 <code>https://sorenskr.github.io/SheetMate/</code>，填上您的名字和远程密码，就能跟电脑聊天查数据、遥控自动跑表。
+                  <strong>云端异地连电脑：</strong>无论身在何处，用手机或电脑打开 <code>https://sorenskr.github.io/SheetMate/</code>，填上您的名字和远程密码，就能异地对话查数据、遥控跑表。
                 </div>
                 <div style="display:flex;gap:5px;flex-shrink:0;">
                   <button type="button" class="mini-pill active" id="copyGithubGuideBtn">复制网址</button>
@@ -5560,17 +5560,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- 0. 手机 / 外地远程连这台电脑 -->
+  <!-- 0. 云端异地远程连接这台电脑 -->
   <div class="modal-mask" id="mobileBridgeModalMask">
     <div class="card-modal" style="width:min(680px,95vw);">
       <div class="modal-head">
-        <div class="modal-title">手机或外地远程连这台电脑</div>
+        <div class="modal-title">云端异地远程连这台电脑</div>
         <button class="mini-pill" id="mobileModalCloseBtn" type="button">关闭</button>
       </div>
       <div class="modal-scroll">
         <div style="font-size:12.5px;color:var(--sub);line-height:1.55;background:var(--fill-2);border:0.5px solid var(--sep);border-radius:12px;padding:9px 11px;">
           <strong style="color:var(--text);">大白话使用说明：</strong>
-          出门在外时，用手机扫左边二维码（或直接打开右边网址），填上您在右上角起的<strong>名字</strong>和下方设置的<strong>远程密码</strong>，就能用手机跟这台电脑聊天查数据、遥控跑表发钉钉，两边的消息实时同步。
+          无论身在外地还是路上，用手机扫左边二维码（或直接打开右边网址），填上您在右上角起的<strong>名字</strong>和下方设置的<strong>远程密码</strong>，就能用手机通过云端跟这台电脑聊天查数据、遥控跑表发钉钉，两边的消息实时同步。
         </div>
         <div style="display:grid;grid-template-columns:196px 1fr;gap:14px;align-items:start;">
           <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:16px;padding:10px;display:flex;flex-direction:column;align-items:center;gap:6px;">
@@ -5580,15 +5580,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div style="display:flex;flex-direction:column;gap:10px;">
             <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:13px;padding:10px;display:flex;flex-direction:column;gap:6px;">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
-                <span style="font-size:12px;font-weight:700;">1. 远程网址（手机或外地电脑都能打开）</span>
-                <span class="ver-pill" id="cloudRelayStatusBadge" style="background:rgba(40,205,65,0.14);color:var(--green);">已联网就绪</span>
+                <span style="font-size:12px;font-weight:700;">1. 云端异地访问网址（在任何地方都能打开）</span>
+                <span class="ver-pill" id="cloudRelayStatusBadge" style="background:rgba(40,205,65,0.14);color:var(--green);">已连上云端</span>
               </div>
               <div style="display:flex;gap:6px;align-items:center;">
                 <input type="text" id="mobileGithubUrlInput" class="small-input" style="flex:1;" readonly value="https://sorenskr.github.io/SheetMate/" />
                 <button type="button" class="mini-pill active" id="copyMobileGithubBtn">复制</button>
                 <button type="button" class="mini-pill" id="openMobileGithubBtn">打开</button>
               </div>
-              <div style="font-size:11px;color:var(--sub);" id="mobileCloudRelayTip">电脑连着网就一直在线待命，外地打开就能直接连。</div>
+              <div style="font-size:11px;color:var(--sub);" id="mobileCloudRelayTip">电脑连着网就一直在云端待命，外地打开网址就能直接连。</div>
             </div>
             <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:13px;padding:10px;display:flex;flex-direction:column;gap:6px;">
               <div style="font-size:12px;font-weight:700;">2. 远程密码（默认是 admin，大家可随时自己改）</div>
@@ -5601,22 +5601,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
               <div style="font-size:11px;color:var(--sub);" id="mobilePinHint">为了安全，不管您自己还是别人从网站连这台电脑，都要输对这里设置的密码。</div>
             </div>
-            <details class="collab-collapse">
-              <summary>同办公室 Wi-Fi 备用网址（平时不用管）</summary>
-              <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">
-                <div style="display:flex;gap:6px;align-items:center;">
-                  <input type="text" id="mobileLanUrlInput" class="small-input" style="flex:1;" readonly />
-                  <button type="button" class="mini-pill" id="copyMobileLanBtn">复制</button>
-                  <button type="button" class="mini-pill" id="openMobileWebBtn">预览</button>
-                </div>
-                <div style="display:flex;gap:6px;align-items:center;">
-                  <input type="text" id="mobilePublicUrlInput" class="small-input" style="flex:1;" readonly placeholder="可选：临时外网备用链接" />
-                  <button type="button" class="mini-pill" id="toggleMobileTunnelBtn">开启备用链接</button>
-                  <button type="button" class="mini-pill" id="copyMobilePublicBtn" style="display:none;">复制</button>
-                </div>
-                <div style="font-size:11px;color:var(--sub);" id="mobileTunnelStatusTip">一般直接用上面的全球远程网址就行，不用单独开这个。</div>
-              </div>
-            </details>
           </div>
         </div>
       </div>
@@ -5658,7 +5642,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="avatar-preset-grid" id="avatarPresetsGrid"></div>
         </div>
         <div style="font-size:12px;line-height:1.5;color:var(--green);background:rgba(40,205,65,0.10);border:0.5px solid rgba(40,205,65,0.28);border-radius:12px;padding:9px 11px;">
-          <strong>已开启免配置自动联网防撞保护：</strong>只要电脑正常连接网络，系统会自动识别团队唯一名字并在跑表时错峰排队，无需手工填写任何网络或共享盘设置。
+          <strong>已开启云端异地自动协同：</strong>无论大家在哪个城市或哪里打开软件，都会通过云端自动防重名并在跑表时错峰排队，无需任何手工配置。
         </div>
       </div>
       <div class="modal-foot">
@@ -5793,24 +5777,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
             <div class="admin-box">
               <div class="admin-box-title">
-                <span>多人跨网联机枢纽配置</span>
-                <button type="button" class="pill-action-btn ok" id="adminToggleServerBtn">开启本机联机服务</button>
+                <span>全员云端异地协同状态</span>
+                <button type="button" class="pill-action-btn ok" id="adminCloudSyncNowBtn">立即云端同步</button>
               </div>
-              <div style="font-size:12px;color:var(--sub);" id="adminLanUrlsBox">提示：开启本机服务后，局域网同事填入上方地址，或异地使用 GitHub Gist 即可共享锁与后台。</div>
-              <div class="mini-seg" id="adminSyncModeSeg">
-                <button type="button" class="mini-seg-btn active" data-val="local_or_shared">本机/共享盘</button>
-                <button type="button" class="mini-seg-btn" data-val="http_hub">HTTP 联机 Hub</button>
-                <button type="button" class="mini-seg-btn" data-val="gist_cloud">跨网 GitHub Gist</button>
-              </div>
-              <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
-                <input type="text" id="adminSharedDirInput" class="small-input" placeholder="共享目录路径" />
-                <input type="text" id="adminHubUrlInput" class="small-input" placeholder="同事端填写的 Hub URL" />
-                <input type="text" id="adminGistIdInput" class="small-input" placeholder="Gist ID（留空可自动创建）" />
-                <input type="password" id="adminGistTokenInput" class="small-input" placeholder="GitHub Token（含 gist 权限）" />
-              </div>
-              <div style="display:flex;gap:8px;align-items:center;">
-                <input type="text" id="adminHubPortInput" class="small-input" style="width:90px;" value="18790" placeholder="端口" />
-                <button type="button" class="pill-action-btn primary" id="adminSaveSyncBtn">保存联机设置</button>
+              <div style="font-size:12.5px;line-height:1.55;color:var(--sub);" id="adminCloudStatusTip">
+                已自动启用全云端异地实时协同：无论同事在哪个城市打开软件，都会通过云端自动汇集跑表统计、错误日志、用户反馈、防撞排队与权限指令，无需配置局域网或共享盘。
               </div>
             </div>
           </div>
@@ -5893,7 +5864,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="mini-seg" id="adminGlobalAiProviderSeg">
                   <button type="button" class="mini-seg-btn active" data-val="gemini">标准云端协议</button>
                   <button type="button" class="mini-seg-btn" data-val="openai_compat">兼容中转协议 (Chat Completions)</button>
-                  <button type="button" class="mini-seg-btn" data-val="local_only">仅使用本地智能引擎</button>
+                  <button type="button" class="mini-seg-btn" data-val="local_only">内置基础模式</button>
                 </div>
               </div>
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
@@ -7684,7 +7655,7 @@ function renderAiChatFeed(history, pendingText = null) {
       infoSpan.style.cssText = "display:inline-flex;align-items:center;";
       const srcDesc = (turn.source === "gemini" || turn.source === "ai_cloud" || turn.source === "data_spotlight" || turn.source === "greeting")
         ? "智能小猫伙伴"
-        : (turn.shot_info ? "本地引擎" : "贴士");
+        : (turn.shot_info ? "智能助手" : "贴士");
       infoSpan.innerHTML = `${buildMiniCatSvg()}<span>${escapeHtmlStr([turn.time, srcDesc, turn.shot_info].filter(Boolean).join(" · "))}</span>`;
       const cpBtn = document.createElement("button");
       cpBtn.type = "button";
@@ -8714,21 +8685,10 @@ function renderAdminDashboard(d) {
     $("adminLockDetail").textContent = "当前空闲，无人占用表格锁。";
   }
 
-  const sc = d.sync_settings || {};
-  for (const b of $("adminSyncModeSeg").querySelectorAll(".mini-seg-btn")) {
-    b.classList.toggle("active", b.dataset.val === (sc.mode || "local_or_shared"));
+  if ($("adminCloudStatusTip")) {
+    const cnt = Array.isArray(d.members) ? d.members.length : 0;
+    $("adminCloudStatusTip").textContent = `全员云端异地实时协同已自动开启（当前已汇集 ${cnt} 位成员状态），全国任何角落打开均自动防撞、统计与同步，无需填任何内网设置。`;
   }
-  $("adminSharedDirInput").value = sc.shared_dir || "";
-  $("adminHubUrlInput").value = sc.hub_url || "";
-  $("adminGistIdInput").value = sc.gist_id || "";
-  $("adminGistTokenInput").value = sc.gist_token || "";
-  $("adminHubPortInput").value = String(d.server_port || sc.server_port || 18790);
-  const srvBtn = $("adminToggleServerBtn");
-  srvBtn.textContent = d.server_running ? "联机服务运行中（点击关闭）" : "开启本机联机服务";
-  srvBtn.className = "pill-action-btn " + (d.server_running ? "danger" : "ok");
-  $("adminLanUrlsBox").textContent = d.server_running
-    ? `服务已开启！同事可在「联机地址(Hub URL)」填：${(d.lan_urls || []).join(" 或 ")}`
-    : "提示：开启服务后可给同一公司局域网或内网穿透同事联机；异地跨网推荐使用 GitHub Gist 模式。";
 
   // 成员排行与流水
   const runsWrap = $("adminRunsList");
@@ -8827,7 +8787,7 @@ function renderAdminDashboard(d) {
         <div class="mini-seg js-mem-ai-mode">
           <button type="button" class="mini-seg-btn ${ov.mode !== "custom" && ov.mode !== "local_only" ? "active" : ""}" data-val="default">跟随全员默认</button>
           <button type="button" class="mini-seg-btn ${ov.mode === "custom" ? "active" : ""}" data-val="custom">单独指定 API</button>
-          <button type="button" class="mini-seg-btn ${ov.mode === "local_only" ? "active" : ""}" data-val="local_only">仅用本地引擎</button>
+          <button type="button" class="mini-seg-btn ${ov.mode === "local_only" ? "active" : ""}" data-val="local_only">内置基础模式</button>
         </div>
       </div>
       <div class="js-mem-ai-custom" style="display:${ov.mode === "custom" ? "grid" : "none"};grid-template-columns:1fr 1fr;gap:6px;">
@@ -9383,7 +9343,7 @@ function bindTeamCollabAndAdminEvents() {
     showToast(r.message || "已强制释放锁定");
     loadAdminDashboard();
   };
-  for (const segId of ["adminSyncModeSeg", "logicComposeSeg", "logicSilentSeg", "logicMinimizeSeg", "adminGlobalAiProviderSeg"]) {
+  for (const segId of ["logicComposeSeg", "logicSilentSeg", "logicMinimizeSeg", "adminGlobalAiProviderSeg"]) {
     const seg = $(segId);
     if (!seg) continue;
     for (const b of seg.querySelectorAll(".mini-seg-btn")) {
@@ -9422,26 +9382,20 @@ function bindTeamCollabAndAdminEvents() {
       loadAdminDashboard();
     };
   }
-  $("adminToggleServerBtn").onclick = async () => {
-    const running = Boolean(adminDashData && adminDashData.server_running);
-    const port = parseInt($("adminHubPortInput").value || "18790", 10) || 18790;
-    const r = await api("/api/admin/server", "POST", { enable: !running, port }, { "X-Admin-Token": adminToken });
-    showToast(r.message || "已切换联机服务状态");
-    loadAdminDashboard();
-  };
-  $("adminSaveSyncBtn").onclick = async () => {
-    const act = $("adminSyncModeSeg").querySelector(".mini-seg-btn.active");
-    const r = await api("/api/admin/sync", "POST", {
-      mode: act ? act.dataset.val : "local_or_shared",
-      shared_dir: $("adminSharedDirInput").value.trim(),
-      hub_url: $("adminHubUrlInput").value.trim(),
-      gist_id: $("adminGistIdInput").value.trim(),
-      gist_token: $("adminGistTokenInput").value.trim(),
-      server_port: parseInt($("adminHubPortInput").value || "18790", 10) || 18790,
-    }, { "X-Admin-Token": adminToken });
-    showToast(r.message || "联机配置已保存");
-    loadAdminDashboard();
-  };
+  if ($("adminCloudSyncNowBtn")) {
+    $("adminCloudSyncNowBtn").onclick = async () => {
+      $("adminCloudSyncNowBtn").disabled = true;
+      $("adminCloudSyncNowBtn").textContent = "同步中…";
+      try {
+        const r = await api("/api/admin/sync", "POST", { action: "cloud_refresh" }, { "X-Admin-Token": adminToken });
+        showToast((r && r.message) || "已完成云端异地数据同步");
+        await loadAdminDashboard();
+      } finally {
+        $("adminCloudSyncNowBtn").disabled = false;
+        $("adminCloudSyncNowBtn").textContent = "立即云端同步";
+      }
+    };
+  }
   $("adminSaveLogicBtn").onclick = async () => {
     const comp = $("logicComposeSeg").querySelector(".mini-seg-btn.active");
     const sil = $("logicSilentSeg").querySelector(".mini-seg-btn.active");
@@ -9601,17 +9555,36 @@ function initMascotLifeEngine() {
 }
 
 async function loadStartupGreeting(force = false) {
+  const nextBtn = $("aiGreetingNextBtn");
+  const txtEl = $("aiGreetingText");
+  if (force && nextBtn) {
+    nextBtn.disabled = true;
+    nextBtn.textContent = "换词中…";
+  }
   try {
-    const r = await api(`/api/ai-greeting?force=${force ? "1" : "0"}`);
-    if (r && r.show && r.reply && $("aiMascotGreetingBar") && $("aiGreetingText")) {
+    const r = await api(`/api/ai-greeting?force=${force ? "1" : "0"}&_t=${Date.now()}`);
+    if (r && r.show && r.reply && $("aiMascotGreetingBar") && txtEl) {
       if ($("aiGreetingPeriodBadge")) {
         $("aiGreetingPeriodBadge").textContent = r.period || "小猫开麦";
       }
-      $("aiGreetingText").textContent = cleanText(r.reply) || r.reply;
+      txtEl.style.transition = "opacity 0.14s ease";
+      txtEl.style.opacity = "0.25";
+      setTimeout(() => {
+        txtEl.textContent = cleanText(r.reply) || r.reply;
+        txtEl.style.opacity = "1";
+      }, 60);
       $("aiMascotGreetingBar").classList.add("show");
       if (force) setCatMascotMood("cheer", 4200);
     }
-  } catch (_e) {}
+  } catch (_e) {
+  } finally {
+    if (force && nextBtn) {
+      setTimeout(() => {
+        nextBtn.disabled = false;
+        nextBtn.textContent = "换一句";
+      }, 180);
+    }
+  }
 }
 
 (async function bootstrap() {

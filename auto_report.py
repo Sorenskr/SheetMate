@@ -294,9 +294,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.8.2"
+APP_VERSION = "2.8.3"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.8.2","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.8.3","url":"新版exe的下载直链"}
 DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
 GEMINI_MODEL_CANDIDATES = (
     "gemini-flash-latest",
@@ -1574,7 +1574,7 @@ def _sanitize_ai_reply_brands(text):
     return s
 
 
-def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens=900, timeout_sec=22):
+def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens=900, timeout_sec=22, max_models=None):
     """底层统一云端智能接口调度器（支持管理员切换不同服务接口，对外严格隐藏厂商与模型信息）。"""
     norm = normalize_config(cfg if isinstance(cfg, dict) else {})
     ai_cfg = norm.get("ai_assistant") or {}
@@ -1612,6 +1612,8 @@ def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens
         clean_m = m.replace("models/", "").strip()
         if clean_m and clean_m not in models_to_try:
             models_to_try.append(clean_m)
+    if max_models is not None and int(max_models) > 0:
+        models_to_try = models_to_try[:int(max_models)]
 
     payload = {
         "systemInstruction": {"parts": [{"text": sys_prompt}]},
@@ -1681,7 +1683,7 @@ _SHEETMATE_AI_KNOWLEDGE = """【软件身份与核心功能说明书】
   3) 自然语言直接改排期：用户可直接说“帮我设置每周一到周五 9点到18点每2小时把昨天数据发送到 XX群”，我会自动修改软件设置并列出核对清单让用户确认对不对；
   4) 钉钉稳妥投递：自动探测当前电脑分辨率、DPI 缩放与深色模式适配方案，支持多群顺序投递、防卡顿直通搜索、无坐标静音发送、富文本发送按钮补发，并在粘贴操作期间全屏提示勿动键鼠；
   5) AI 看图自愈与档案记忆：遇错自动弹窗给出 ERR 错误码大白话解决方案，支持「遇错 AI 自动看图自愈」先截屏调整现场并续跑，还能自动对比历次成功/失败原因、调整内部模块顺序并生成改代码指令；同时每轮将表格数字与排行归档到本地 `report_archive.jsonl`，公平对比各团队与个人数据。
-  6) 手机或外地远程网址（https://sorenskr.github.io/SheetMate/）：出门在外打开这个网址，填上电脑上起好的名字和在电脑【远程网站】里设置好的远程密码，就能直接跟电脑对话查数据、让电脑跑表发钉钉，两边的聊天记录会实时同步。
+  6) 云端异地远程网址（https://sorenskr.github.io/SheetMate/）：无论身在何处，用手机或外地电脑打开这个网址，填上电脑上起好的名字和设置好的远程密码，就能直接通过云端跟电脑对话查数据、让电脑跑表发钉钉，两边的聊天记录会实时同步。
 - 常用快捷键：运行中按 【F8】 随时暂停或继续未完成步骤；按 【F9】 在已手动打开的目标群聊窗口直接贴图继续。""" + "\n" + _SHEETMATE_CODE_ARCHITECTURE
 
 _KNOWN_TEAM_NAMES = ("慕杰组", "潘立浩组", "宋磊组", "刘全泉组", "李俊鑫组", "江峰组", "娄慧珍组")
@@ -1999,8 +2001,70 @@ def build_round_change_spotlight(prev_rec, curr_rec, focus_team=""):
     }
 
 
+_greeting_lock = threading.Lock()
+_greeting_prefetch_pool = []
+_greeting_prefetch_busy = False
+
+
+def _is_valid_complete_greeting(txt):
+    """校验问候鼓励语是否完整通顺，严防思考模型消耗配额后出现半句或残片。"""
+    s = str(txt or "").strip()
+    if len(s) < 18 or len(s) > 150:
+        return False
+    if "*   " in s or "\n*" in s or "**" in s or "#" in s:
+        return False
+    low = s.lower()
+    if any(bad in low for bad in ("gemini", "google", "gpt", "openai", "deepseek")):
+        return False
+    tail = s.rstrip(" \"'”’）)")
+    if not tail:
+        return False
+    return tail[-1] in set("！!～~。？?呀哦啦呢吧哇哟呗哒")
+
+
+def _spawn_greeting_prefetch(norm_cfg, sys_g, usr_g, seen_hashes_snap):
+    global _greeting_prefetch_busy
+    ai_cfg = (norm_cfg or {}).get("ai_assistant") or {}
+    if not ai_cfg.get("enabled", True) or str(ai_cfg.get("provider") or "").strip().lower() == "local_only":
+        return
+    if not str(ai_cfg.get("api_key") or DEFAULT_GEMINI_API_KEY).strip():
+        return
+    with _greeting_lock:
+        if _greeting_prefetch_busy or len(_greeting_prefetch_pool) >= 3:
+            return
+        _greeting_prefetch_busy = True
+
+    def _bg():
+        global _greeting_prefetch_busy
+        import hashlib
+        try:
+            g_res = _call_gemini_generate(
+                norm_cfg,
+                sys_g,
+                [{"role": "user", "parts": [{"text": usr_g}]}],
+                temperature=0.95,
+                max_tokens=1024,
+                timeout_sec=6.5,
+                max_models=1,
+            )
+            if g_res.get("ok"):
+                cand = str(g_res.get("reply") or "").strip()
+                if _is_valid_complete_greeting(cand):
+                    h = hashlib.sha256(cand.encode("utf-8")).hexdigest()[:16]
+                    with _greeting_lock:
+                        if h not in seen_hashes_snap and all(x[1] != h for x in _greeting_prefetch_pool):
+                            _greeting_prefetch_pool.append((cand, h))
+        except Exception:
+            pass
+        finally:
+            with _greeting_lock:
+                _greeting_prefetch_busy = False
+
+    threading.Thread(target=_bg, daemon=True, name="SheetMateGreetingPrefetch").start()
+
+
 def generate_unique_startup_greeting(cfg=None, nickname="", force=False):
-    """生成每次完完全全不重样、带真人情绪温度的上班问候与打气对话，并通过本地指纹库保证零重复。"""
+    """生成每次完完全全不重样、带真人情绪温度且句句完整的上班问候对话（支持零等待秒换一句）。"""
     import hashlib
     import random
 
@@ -2010,9 +2074,10 @@ def generate_unique_startup_greeting(cfg=None, nickname="", force=False):
         if seen_path.exists():
             loaded = json.loads(seen_path.read_text(encoding="utf-8", errors="ignore"))
             if isinstance(loaded, dict):
+                clean_recent = [str(t).strip() for t in (loaded.get("recent_texts") or []) if _is_valid_complete_greeting(t)]
                 state.update({
                     "hashes": list(loaded.get("hashes") or [])[-300:],
-                    "recent_texts": list(loaded.get("recent_texts") or [])[-16:],
+                    "recent_texts": clean_recent[-16:],
                     "last_ts": float(loaded.get("last_ts") or 0.0),
                     "last_date": str(loaded.get("last_date") or ""),
                 })
@@ -2134,36 +2199,47 @@ def generate_unique_startup_greeting(cfg=None, nickname="", force=False):
     chosen = ""
     chosen_hash = ""
 
-    # 1) 若云端可用，先尝试由真人感高创意模式生成（严格传历史避重）
+    # 1) 优先取用后台预取的完整云端创意句（点【换一句】瞬间 0ms 响应不卡顿）
     norm_cfg = normalize_config(cfg if isinstance(cfg, dict) else {})
+    avoid_txt = "\n".join(f"- {x}" for x in recent_list[-10:]) or "（暂无）"
+    sys_g = (
+        "你是「暗号表助手」界面里一只充满人情味、性格温暖俏皮的拟人萌宠小助手。"
+        "严禁提起任何外部AI公司/模型名字，严禁使用Markdown符号或列表，不要自称机器程序。"
+        "请像真朋友一样用大白话一次性说 2~3 句完整、有标点结尾的话（总共约 35~85 字），关心和鼓励对方工作。"
+    )
+    usr_g = (
+        f"当前真实时间：{time.strftime('%Y-%m-%d %H:%M', lt)}（{period_tag}，{period_ctx}），星期{['一','二','三','四','五','六','日'][lt.tm_wday]}。\n"
+        f"对方称呼：{call_name}。\n"
+        f"请直接输出一句完整的全新鼓励对话，不要和下面重复：\n{avoid_txt}"
+    )
+
     if (norm_cfg.get("ai_assistant") or {}).get("enabled", True):
-        avoid_txt = "\n".join(f"- {x}" for x in recent_list[-10:]) or "（暂无）"
-        sys_g = (
-            "你是「暗号表助手」界面里一只充满人情味、性格温暖俏皮的拟人萌宠小助手。"
-            "严禁提起任何外部AI公司/模型名字，严禁说官腔套话，不要自称机器程序。"
-            "请像真朋友或贴心搭档一样，用口语自然说 2~3 句不超过 95 字的话，关心和鼓励对方工作。"
-        )
-        usr_g = (
-            f"当前真实时间：{time.strftime('%Y-%m-%d %H:%M', lt)}（{period_tag}，{period_ctx}），星期{['一','二','三','四','五','六','日'][lt.tm_wday]}。\n"
-            f"对方称呼：{call_name}。\n"
-            f"请生成一句完完全全不同于以下历史内容的全新鼓励对话：\n{avoid_txt}"
-        )
-        try:
-            g_res = _call_gemini_generate(
-                norm_cfg,
-                sys_g,
-                [{"role": "user", "parts": [{"text": usr_g}]}],
-                temperature=0.95,
-                max_tokens=160,
-                timeout_sec=5.5,
-            )
-            if g_res.get("ok") and str(g_res.get("reply") or "").strip():
-                cand = str(g_res["reply"]).strip()
-                ok_u, h_u = _is_unique(cand)
-                if ok_u and not any(bad in cand.lower() for bad in ("gemini", "google", "gpt", "openai", "deepseek")):
-                    chosen, chosen_hash = cand, h_u
-        except Exception:
-            pass
+        with _greeting_lock:
+            while _greeting_prefetch_pool:
+                c_cand, c_hash = _greeting_prefetch_pool.pop(0)
+                if c_hash not in seen_set and _is_valid_complete_greeting(c_cand):
+                    chosen, chosen_hash = c_cand, c_hash
+                    break
+        if not chosen and not force:
+            try:
+                g_res = _call_gemini_generate(
+                    norm_cfg,
+                    sys_g,
+                    [{"role": "user", "parts": [{"text": usr_g}]}],
+                    temperature=0.95,
+                    max_tokens=1024,
+                    timeout_sec=3.5,
+                    max_models=1,
+                )
+                if g_res.get("ok"):
+                    cand = str(g_res.get("reply") or "").strip()
+                    if _is_valid_complete_greeting(cand):
+                        ok_u, h_u = _is_unique(cand)
+                        if ok_u:
+                            chosen, chosen_hash = cand, h_u
+            except Exception:
+                pass
+        _spawn_greeting_prefetch(norm_cfg, sys_g, usr_g, seen_set)
 
     # 2) 本地超高维度组合防重兜底（确保万次以上零重复）
     if not chosen:
