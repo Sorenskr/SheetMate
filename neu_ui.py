@@ -877,12 +877,16 @@ class GlassProgress:
         self._rt_state = {
             "paused": False,
             "waiting_recovery": False,
+            "hands_off": False,
+            "hands_off_text": "",
             "prompt": {
                 "mode": "running",
                 "title": "",
                 "detail": "",
                 "hint": "按键提示：临时用电脑可点【暂停】，忙完点【继续】；点【取消】终止本轮",
                 "actions": [],
+                "hands_off": False,
+                "hands_off_text": "",
             },
         }
         self._action_widgets = []
@@ -938,6 +942,15 @@ class GlassProgress:
                         ("p", ctypes.POINTER(ctypes.c_int)),
                         ("sz", ctypes.c_ulong)]
 
+        try:
+            # WS_EX_NOACTIVATE(0x08000000)：允许直接左键点击浮窗「暂停/取消」，同时绝不抢夺钉钉输入焦点
+            GWL_EXSTYLE = -20
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x00000080
+            ex_st = user32.GetWindowLongW(top, GWL_EXSTYLE)
+            user32.SetWindowLongW(top, GWL_EXSTYLE, ex_st | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+        except Exception:
+            pass
         try:
             swca = user32.SetWindowCompositionAttribute
             swca.restype = ctypes.c_int
@@ -1000,13 +1013,18 @@ class GlassProgress:
             w, text="", bg=self.KEY, fg="#ffb340",
             font=("Microsoft YaHei UI", 10, "bold"), anchor="w",
         )
+        self.hands_off_lab = tk.Label(
+            w, text="", bg="#4a2c00", fg="#ffd60a",
+            font=("Microsoft YaHei UI", 9, "bold"), anchor="w", justify="left",
+            padx=8, pady=4, wraplength=self.W - 56,
+        )
         self.detail_lab = tk.Label(
             w, text="", bg=self.KEY, fg="#dce4f0",
             font=("Microsoft YaHei UI", 9), anchor="nw", justify="left",
             wraplength=self.W - 44,
         )
         self.hint_lab = tk.Label(
-            w, text="按键提示：临时用电脑可点【暂停】，忙完点【继续】；点【取消】终止本轮",
+            w, text="按键提示：随时按【F8】或点【暂停】让出电脑，忙完按【F8】/【继续】；【取消】终止",
             bg=self.KEY, fg="#8fb3e8",
             font=("Microsoft YaHei UI", 9), anchor="w", justify="left",
             wraplength=self.W - 44,
@@ -1015,7 +1033,7 @@ class GlassProgress:
 
         # 仅在非按钮展示区绑定拖动，绝不干扰交互按钮点击
         for widget in (w, self.dot_lab, self.title_lab, self.pct_lab, self.step_lab,
-                       self.issue_title_lab, self.detail_lab, self.hint_lab):
+                       self.issue_title_lab, self.hands_off_lab, self.detail_lab, self.hint_lab):
             self._bind_drag(widget)
             if widget is not w:
                 widget.configure(cursor="fleur")
@@ -1051,10 +1069,10 @@ class GlassProgress:
                 specs.append((label, b_n, b_h, f_c, lambda aid=act_id: self._trigger_resume(aid)))
             specs.append(("取消本轮", "#d9382e", "#f0493e", "#ffffff", self._trigger_cancel))
         elif mode == "paused":
-            specs.append(("继续运行", "#28b84d", "#34cf5c", "#ffffff", lambda: self._trigger_resume("continue")))
+            specs.append(("继续运行 (F8)", "#28b84d", "#34cf5c", "#ffffff", lambda: self._trigger_resume("continue")))
             specs.append(("取消本轮", "#d9382e", "#f0493e", "#ffffff", self._trigger_cancel))
         else:
-            specs.append(("暂停", "#e08e0b", "#f5a21d", "#ffffff", self._trigger_pause))
+            specs.append(("暂停 (F8)", "#e08e0b", "#f5a21d", "#ffffff", self._trigger_pause))
             specs.append(("取消", "#d9382e", "#f0493e", "#ffffff", self._trigger_cancel))
 
         avail_w = self.W - 40
@@ -1104,6 +1122,7 @@ class GlassProgress:
         prompt = prompt or {}
         btn_h = self._rebuild_buttons(mode, prompt.get("actions") or [])
         if mode in ("waiting_fix", "login_wps"):
+            self.hands_off_lab.place_forget()
             title_s = self._clean_text(prompt.get("title") or "需要确认后继续")
             detail_s = self._clean_text(prompt.get("detail") or "")
             hint_s = self._clean_text(prompt.get("hint") or "处理完成后点下方恢复按钮继续，或点【取消】终止")
@@ -1128,14 +1147,15 @@ class GlassProgress:
             self.btn_frame.place(x=20, y=btn_y, width=self.W - 40, height=btn_h)
             target_h = btn_y + btn_h + 14
         elif mode == "paused":
+            self.hands_off_lab.place_forget()
             self._bar_color = "#ff9f0a"
             self.title_lab.config(text=f"{self.title_text} · 已暂停", fg="#ffb340")
             self.issue_title_lab.place_forget()
             detail_s = self._clean_text(
-                prompt.get("detail") or "自动键鼠操作已挂起，处理完其他事务后点【继续运行】接着跑。"
+                prompt.get("detail") or "自动键鼠操作已挂起，处理完其他事务后按【F8】或点【继续运行 (F8)】接着跑。"
             )
             hint_s = self._clean_text(
-                prompt.get("hint") or "按键提示：点【继续运行】恢复当前步，点【取消本轮】终止任务。"
+                prompt.get("hint") or "按键提示：按【F8】或点【继续运行 (F8)】恢复未完成步骤，点【取消本轮】终止。"
             )
             self.detail_lab.config(text=detail_s)
             self.hint_lab.config(text=hint_s, fg="#ffd080")
@@ -1149,20 +1169,54 @@ class GlassProgress:
             btn_y = hint_y + req_hint_h + 6
             self.btn_frame.place(x=20, y=btn_y, width=self.W - 40, height=btn_h)
             target_h = btn_y + btn_h + 14
-        else:
-            self.title_lab.config(text=f"{self.title_text} · 运行中", fg="#a5b1c2")
+        elif mode == "stopped":
+            self.hands_off_lab.place_forget()
+            self._bar_color = "#ff3b30"
+            self.title_lab.config(text=f"{self.title_text} · 已取消", fg="#ff6961")
             self.issue_title_lab.place_forget()
             self.detail_lab.place_forget()
-            hint_s = self._clean_text(
-                prompt.get("hint") or "按键提示：临时用电脑可点【暂停】，忙完点【继续】；点【取消】终止本轮"
-            )
-            self.hint_lab.config(text=hint_s, fg="#8fb3e8")
+            self.hint_lab.config(text="任务已安全中止", fg="#ff9b95")
             self.hint_lab.place(x=20, y=82, width=self.W - 40)
-            self.win.update_idletasks()
-            req_hint_h = max(20, self.hint_lab.winfo_reqheight() + 2)
-            btn_y = 82 + req_hint_h + 6
-            self.btn_frame.place(x=20, y=btn_y, width=self.W - 40, height=btn_h)
-            target_h = max(self.H_COMPACT, btn_y + btn_h + 14)
+            self.btn_frame.place_forget()
+            target_h = 122
+        else:
+            hands_off = bool(prompt.get("hands_off") or self._rt_state.get("hands_off"))
+            ho_txt = self._clean_text(prompt.get("hands_off_text") or self._rt_state.get("hands_off_text") or "")
+            self.issue_title_lab.place_forget()
+            self.detail_lab.place_forget()
+            if hands_off and ho_txt:
+                self._bar_color = "#ff9f0a"
+                self.title_lab.config(text=f"{self.title_text} · 勿动键鼠", fg="#ffd60a")
+                self.hands_off_lab.config(text=ho_txt)
+                self.hands_off_lab.place(x=20, y=82, width=self.W - 40)
+                self.win.update_idletasks()
+                ho_h = max(26, self.hands_off_lab.winfo_reqheight() + 4)
+                hint_s = self._clean_text(
+                    prompt.get("hint") or "重要提示：此刻正在自动键鼠粘贴，切勿动鼠标键盘！（急停按 F8）"
+                )
+                self.hint_lab.config(text=hint_s, fg="#ffd080")
+                hint_y = 82 + ho_h + 5
+                self.hint_lab.place(x=20, y=hint_y, width=self.W - 40)
+                self.win.update_idletasks()
+                req_hint_h = max(20, self.hint_lab.winfo_reqheight() + 2)
+                btn_y = hint_y + req_hint_h + 6
+                self.btn_frame.place(x=20, y=btn_y, width=self.W - 40, height=btn_h)
+                target_h = max(self.H_PAUSED - 10, btn_y + btn_h + 14)
+            else:
+                self.hands_off_lab.place_forget()
+                if self._bar_color == "#ff9f0a":
+                    self._bar_color = "#0a84ff"
+                self.title_lab.config(text=f"{self.title_text} · 运行中", fg="#a5b1c2")
+                hint_s = self._clean_text(
+                    prompt.get("hint") or "按键提示：随时按【F8】或点【暂停】让出电脑，忙完按【F8】/【继续】；【取消】终止"
+                )
+                self.hint_lab.config(text=hint_s, fg="#8fb3e8")
+                self.hint_lab.place(x=20, y=82, width=self.W - 40)
+                self.win.update_idletasks()
+                req_hint_h = max(20, self.hint_lab.winfo_reqheight() + 2)
+                btn_y = 82 + req_hint_h + 6
+                self.btn_frame.place(x=20, y=btn_y, width=self.W - 40, height=btn_h)
+                target_h = max(self.H_COMPACT, btn_y + btn_h + 14)
 
         self.H = target_h
         try:

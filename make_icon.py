@@ -1,257 +1,299 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""生成 Apple Liquid Glass 质感多尺寸图标（icon.png + icon.ico）。
+"""生成无外圈蓝边、纯净 Apple Liquid Glass 立体磨砂质感图标（icon.png + icon.ico）。
 
-特性：
-1) 若指定原图或 scratch 艺术底图则自动加载，否则内置高品质无泥灰渐变矢量绘制兜底；
-2) 在 1024×1024 主画布上施加 Apple 连续曲率超椭圆（|x/R|^4.6 + |y/R|^4.6 <= 1）
-   与边界 4×4 子像素超采样抗锯齿遮罩；
-3) 叠加顶部与四周细腻液态玻璃内高光描边 + 轻柔悬浮投影，导出 512px icon.png 与全尺寸 icon.ico。
+设计规范：
+1) 彻底去除外圈大蓝框，将中央通透磨砂冰晶玻璃圆角方牌放大为核心主体（透明底 + Apple 连续曲率超椭圆）；
+2) 采用 numpy 亚像素解析 SDF 抗锯齿与多层折射光影渲染：亚表面冰青极光光晕、顶部弧面高光、
+   双层棱镜晶边（左上冰白 + 右下冰青折射）、微粒磨砂质感与 3 根 3D 发光凝胶玻璃柱状图；
+3) 右上角叠加悬浮冰透蓝液态玻璃钉钉翼标徽章，导出 512px icon.png 与全尺寸 Win32 DIB+PNG icon.ico。
 """
+
 import argparse
 import io
-import math
 import struct
 from pathlib import Path
-from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter  # type: ignore
 
-DEFAULT_SRC = Path(
-    r"C:\Users\OMEN 11\.gemini\antigravity\brain\d1399b42-fa79-40c5-8a81-d64e95737dbe\app_icon_liquid_glass_1795055309553.jpg"
-)
+import numpy as np  # type: ignore
+from PIL import Image, ImageChops, ImageDraw, ImageFilter  # type: ignore
+
 DEFAULT_WING = Path(__file__).resolve().parent / "dingtalk_wing.png"
 ICO_SIZES = [(16, 16), (20, 20), (24, 24), (32, 32), (40, 40), (48, 48), (64, 64), (128, 128), (256, 256)]
 
 
-def build_squircle_mask(size=1024, radius_frac=0.455, power=4.6):
-    """生成带边界 4×4 超采样抗锯齿的 Apple 连续曲率超椭圆 Alpha 遮罩。"""
-    half = size // 2
-    r = size * radius_frac
-    q = Image.new("L", (half, half), 0)
-    pix = q.load()
-
-    inv_p = 1.0 / power
-    for y in range(half):
-        dy = (half - 0.5 - y)
-        ay = dy / r
-        for x in range(half):
-            dx = (half - 0.5 - x)
-            ax = dx / r
-            # 先按欧氏与切比雪夫快捷界剔除内外纯色像素，仅对窄边缘带做 4×4 超采样
-            d_est = (ax ** power + ay ** power) ** inv_p
-            if d_est < 0.96:
-                pix[x, y] = 255
-            elif d_est > 1.04:
-                pix[x, y] = 0
-            else:
-                inside = 0
-                for sy in range(4):
-                    py_sub = (half - 1 - y) + (sy + 0.5) / 4.0
-                    ny = (py_sub / r) ** power
-                    for sx in range(4):
-                        px_sub = (half - 1 - x) + (sx + 0.5) / 4.0
-                        if (px_sub / r) ** power + ny <= 1.0:
-                            inside += 1
-                pix[x, y] = int(round(inside * 255 / 16))
-
-    mask = Image.new("L", (size, size), 0)
-    q_tr = q.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-    q_bl = q.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-    q_br = q_tr.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-    mask.paste(q, (0, 0))
-    mask.paste(q_tr, (half, 0))
-    mask.paste(q_bl, (0, half))
-    mask.paste(q_br, (half, half))
-    return mask
+def _squircle_sdf_alpha(h, w, cx, cy, half_size, power=4.6, aa_px=1.6):
+    """计算连续曲率超椭圆 |(x-cx)/R|^p + |(y-cy)/R|^p <= 1 的亚像素抗锯齿遮罩 (float32 0..1)。"""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    dx = np.abs(xx + 0.5 - cx) / float(half_size)
+    dy = np.abs(yy + 0.5 - cy) / float(half_size)
+    d = (np.power(dx, power) + np.power(dy, power)) ** (1.0 / power)
+    # 按半径近似将 1 归化为像素距离做平滑过渡
+    dist_px = (1.0 - d) * float(half_size)
+    return np.clip(dist_px / float(aa_px) + 0.5, 0.0, 1.0)
 
 
-def _fallback_vector_art(size=1024):
-    """当外部艺术原图不存在时的内置精致深邃蓝紫渐变 + 磨砂柱图兜底绘制。"""
-    img = Image.new("RGBA", (size, size))
-    d = ImageDraw.Draw(img)
-    c_top_l = (0, 102, 255)
-    c_bot_r = (79, 70, 229)
-    for y in range(size):
-        t = y / (size - 1)
-        r = int(c_top_l[0] + (c_bot_r[0] - c_top_l[0]) * t)
-        g = int(c_top_l[1] + (c_bot_r[1] - c_top_l[1]) * t)
-        b = int(c_top_l[2] + (c_bot_r[2] - c_top_l[2]) * t)
-        d.line([(0, y), (size, y)], fill=(r, g, b, 255))
-    return img
+def _rounded_rect_alpha(h, w, x0, y0, x1, y1, r, aa_px=1.5):
+    """计算圆角矩形有符号距离场亚像素平滑遮罩 (float32 0..1)。"""
+    cx = (x0 + x1) * 0.5
+    cy = (y0 + y1) * 0.5
+    bx = (x1 - x0) * 0.5 - r
+    by = (y1 - y0) * 0.5 - r
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    qx = np.abs(xx + 0.5 - cx) - bx
+    qy = np.abs(yy + 0.5 - cy) - by
+    out_dist = np.hypot(np.maximum(qx, 0.0), np.maximum(qy, 0.0))
+    in_dist = np.minimum(np.maximum(qx, qy), 0.0)
+    sdf = out_dist + in_dist - float(r)
+    return np.clip(-sdf / float(aa_px) + 0.5, 0.0, 1.0)
 
 
-def _patch_old_plane_badge(art, cx=709, cy=297, radius=88):
-    """平滑修补底图右上角原纸飞机徽标圆域，确保无任何残留边缘影响新徽章合成。"""
-    blurred = art.crop((cx - radius - 24, cy - radius - 24, cx + radius + 24, cy + radius + 24)).filter(
-        ImageFilter.GaussianBlur(26)
+def _gaussian_blur_np(arr, radius):
+    im = Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8), mode="L")
+    im = im.filter(ImageFilter.GaussianBlur(radius))
+    return np.asarray(im, dtype=np.float32) / 255.0
+
+
+def _alpha_over(dst_rgba, src_rgba):
+    """标准 premultiplied/straight RGBA 混合（输入输出均为 float32 [H,W,4] 0..1）。"""
+    sa = src_rgba[..., 3:4]
+    da = dst_rgba[..., 3:4]
+    out_a = sa + da * (1.0 - sa)
+    safe_a = np.where(out_a > 1e-6, out_a, 1.0)
+    out_rgb = (src_rgba[..., :3] * sa + dst_rgba[..., :3] * da * (1.0 - sa)) / safe_a
+    return np.concatenate([np.clip(out_rgb, 0.0, 1.0), np.clip(out_a, 0.0, 1.0)], axis=-1)
+
+
+def _render_frosted_glass_card(S=1024):
+    """渲染纯净无蓝边的中央 Apple Liquid Glass 立体磨砂方卡 + 三根通透发光柱。"""
+    cx, cy, half_r = 496.0, 532.0, 424.0
+    yy, xx = np.mgrid[0:S, 0:S].astype(np.float32)
+    mask = _squircle_sdf_alpha(S, S, cx, cy, half_r, power=4.6, aa_px=1.6)
+
+    # 归一化卡内局部坐标 u, v ∈ [-1, 1]
+    u = (xx - cx) / half_r
+    v = (yy - cy) / half_r
+
+    # 1) 卡背柔和冷蓝空气悬浮投影（透明外底无任何蓝边框）
+    sh_mask = _squircle_sdf_alpha(S, S, cx, cy + 20.0, half_r * 0.995, power=4.6, aa_px=2.0)
+    sh_blur = _gaussian_blur_np(sh_mask * 0.34, radius=26)
+    canvas = np.zeros((S, S, 4), dtype=np.float32)
+    canvas[..., 0] = 16.0 / 255.0
+    canvas[..., 1] = 44.0 / 255.0
+    canvas[..., 2] = 98.0 / 255.0
+    canvas[..., 3] = sh_blur
+
+    # 2) 磨砂玻璃主基调（左上淡薰衣草冰蓝 -> 中部晴空雾蓝 -> 右下清透晶青，让纯白立体柱跃然而出）
+    diag = np.clip((u * 0.45 + v * 0.55 + 1.0) * 0.5, 0.0, 1.0)
+    base_r = (212.0 * (1.0 - diag) + 148.0 * diag) / 255.0
+    base_g = (224.0 * (1.0 - diag) + 206.0 * diag) / 255.0
+    base_b = (252.0 * (1.0 - diag) + 250.0 * diag) / 255.0
+
+    # 左下柔和冰紫折射韵
+    g_lavender = np.exp(-(((u + 0.56) / 0.78) ** 2 + ((v - 0.46) / 0.85) ** 2))
+    base_r = np.clip(base_r + g_lavender * 0.055, 0.0, 1.0)
+    base_g = np.clip(base_g - g_lavender * 0.025, 0.0, 1.0)
+    base_b = np.clip(base_b + g_lavender * 0.06, 0.0, 1.0)
+
+    # 右中下方清澈天青亚表面极光光晕（衬托柱图立体感）
+    g_cyan = np.exp(-(((u - 0.36) / 0.62) ** 2 + ((v - 0.30) / 0.68) ** 2))
+    base_r = np.clip(base_r - g_cyan * 0.14, 0.0, 1.0)
+    base_g = np.clip(base_g + g_cyan * 0.06, 0.0, 1.0)
+    base_b = np.clip(base_b + g_cyan * 0.09, 0.0, 1.0)
+
+    # 右上角偏光冷蓝折射（呼应右上角悬浮钉钉徽章）
+    g_badge_glow = np.exp(-(((u - 0.62) / 0.52) ** 2 + ((v + 0.60) / 0.52) ** 2))
+    base_r = np.clip(base_r - g_badge_glow * 0.14, 0.0, 1.0)
+    base_g = np.clip(base_g + g_badge_glow * 0.03, 0.0, 1.0)
+    base_b = np.clip(base_b + g_badge_glow * 0.07, 0.0, 1.0)
+
+    # 极细磨砂晶粒感（固定种子确保每次渲染完全确定）
+    rng = np.random.default_rng(20261120)
+    grain = (rng.normal(0.0, 0.0085, (S, S))).astype(np.float32)
+    base_r = np.clip(base_r + grain, 0.0, 1.0)
+    base_g = np.clip(base_g + grain, 0.0, 1.0)
+    base_b = np.clip(base_b + grain, 0.0, 1.0)
+
+    # 3) 玻璃弧面高光折射带（45度左上柔白面光 + 底部微妙内亮散射）
+    arc = np.exp(-(((u + 0.18) / 1.12) ** 2 + ((v + 0.86) / 0.54) ** 2)) * 0.28
+    bot_bounce = np.exp(-(((u - 0.08) / 0.90) ** 2 + ((v - 0.84) / 0.32) ** 2)) * 0.12
+    spec = arc + bot_bounce
+    base_r = np.clip(base_r + spec, 0.0, 1.0)
+    base_g = np.clip(base_g + spec, 0.0, 1.0)
+    base_b = np.clip(base_b + spec, 0.0, 1.0)
+
+    # 卡片中心稍透、边沿棱镜略实（Apple Liquid Glass 厚度感）
+    radial = np.clip((np.abs(u) ** 4.2 + np.abs(v) ** 4.2) ** (1.0 / 4.2), 0.0, 1.0)
+    card_alpha = mask * (0.86 + 0.115 * radial)
+
+    card_layer = np.stack([base_r, base_g, base_b, card_alpha], axis=-1)
+    canvas = _alpha_over(canvas, card_layer)
+
+    # 4) 卡片内三根 3D 磨砂水晶柱状图（高度黄金递进，顶部完全避让右上角钉钉徽章）
+    bars = [
+        # (x0, y0, x1, y1, r, left_col, right_col, glow_col)
+        (216.0, 562.0, 344.0, 798.0, 42.0, (1.00, 1.00, 1.00), (0.88, 0.94, 1.00), (0.65, 0.80, 0.98)),
+        (404.0, 452.0, 532.0, 798.0, 42.0, (1.00, 1.00, 1.00), (0.76, 0.95, 1.00), (0.35, 0.78, 0.98)),
+        (592.0, 342.0, 720.0, 798.0, 42.0, (0.98, 1.00, 1.00), (0.62, 0.95, 1.00), (0.18, 0.78, 0.98)),
+    ]
+
+    for x0, y0, x1, y1, br, lcol, rcol, gcol in bars:
+        bm = _rounded_rect_alpha(S, S, x0, y0, x1, y1, br, aa_px=1.4)
+        # 柱底柔和蓝色扩散投影
+        sh_bm = _rounded_rect_alpha(S, S, x0 + 5, y0 + 16, x1 + 5, y1 + 20, br, aa_px=2.0)
+        sh_bm = _gaussian_blur_np(sh_bm * 0.28, radius=18) * mask
+        sh_layer = np.stack([
+            np.full((S, S), gcol[0] * 0.18, np.float32),
+            np.full((S, S), gcol[1] * 0.36, np.float32),
+            np.full((S, S), gcol[2] * 0.68, np.float32),
+            sh_bm,
+        ], axis=-1)
+        canvas = _alpha_over(canvas, sh_layer)
+
+        bw = max(1.0, x1 - x0)
+        bh = max(1.0, y1 - y0)
+        bx_t = np.clip((xx - x0) / bw, 0.0, 1.0)
+        by_t = np.clip((yy - y0) / bh, 0.0, 1.0)
+
+        cyl_shine = np.exp(-((bx_t - 0.24) / 0.22) ** 2) * 0.28 + (1.0 - by_t) * 0.10
+        grad_t = np.clip(bx_t * 0.65 + by_t * 0.35, 0.0, 1.0)
+        cr = np.clip(lcol[0] * (1.0 - grad_t) + rcol[0] * grad_t + cyl_shine, 0.0, 1.0)
+        cg = np.clip(lcol[1] * (1.0 - grad_t) + rcol[1] * grad_t + cyl_shine, 0.0, 1.0)
+        cb = np.clip(lcol[2] * (1.0 - grad_t) + rcol[2] * grad_t + cyl_shine * 0.9, 0.0, 1.0)
+
+        bm_in = _rounded_rect_alpha(S, S, x0 + 3.0, y0 + 3.0, x1 - 3.0, y1 - 3.0, max(1.0, br - 3.0), aa_px=1.4)
+        bar_rim = np.clip(bm - bm_in, 0.0, 1.0) * (0.90 - 0.40 * bx_t)
+        cr = np.clip(cr + bar_rim * 0.38, 0.0, 1.0)
+        cg = np.clip(cg + bar_rim * 0.38, 0.0, 1.0)
+        cb = np.clip(cb + bar_rim * 0.38, 0.0, 1.0)
+
+        bar_layer = np.stack([cr, cg, cb, bm * mask * 0.96], axis=-1)
+        canvas = _alpha_over(canvas, bar_layer)
+
+    # 5) 主毛玻璃卡片外层双色液态棱镜高光边（完全替换外围蓝框，靠自身晶亮折射轮廓立住）
+    outer_in = _squircle_sdf_alpha(S, S, cx, cy, half_r - 6.0, power=4.6, aa_px=1.5)
+    outer_rim = np.clip(mask - outer_in, 0.0, 1.0)
+    rim_top = np.clip(1.0 - (u * 0.35 + v * 0.50 + 0.5) * 0.50, 0.42, 1.0)
+    rim_r = np.clip(1.0 - 0.14 * np.maximum(0.0, diag - 0.3), 0.80, 1.0)
+    rim_g = np.clip(1.0 - 0.04 * np.maximum(0.0, diag - 0.3), 0.92, 1.0)
+    rim_b = np.ones((S, S), dtype=np.float32)
+    rim_layer = np.stack([rim_r, rim_g, rim_b, outer_rim * rim_top * 0.95], axis=-1)
+    canvas = _alpha_over(canvas, rim_layer)
+
+    edge_band = np.clip(
+        mask - _squircle_sdf_alpha(S, S, cx, cy, half_r - 2.4, power=4.6, aa_px=1.2),
+        0.0,
+        1.0,
     )
-    patch = Image.new("RGBA", art.size, (0, 0, 0, 0))
-    patch.paste(blurred, (cx - radius - 24, cy - radius - 24))
+    contour = np.stack([
+        np.full((S, S), 116.0 / 255.0, np.float32),
+        np.full((S, S), 174.0 / 255.0, np.float32),
+        np.full((S, S), 240.0 / 255.0, np.float32),
+        edge_band * (0.38 + 0.38 * diag),
+    ], axis=-1)
+    canvas = _alpha_over(canvas, contour)
 
-    mask = Image.new("L", art.size, 0)
-    md = ImageDraw.Draw(mask)
-    md.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=255)
-    mask = mask.filter(ImageFilter.GaussianBlur(12))
-    out = art.copy()
-    out.paste(patch, (0, 0), mask)
-    return out
+    return Image.fromarray(np.clip(canvas * 255.0, 0, 255).astype(np.uint8), mode="RGBA")
 
 
-def _build_dingtalk_liquid_badge(wing_path, size=214):
-    """以 4× 超采样生成带液态玻璃高光、晶体描边与悬浮阴影的钉钉翼标超椭圆徽章。"""
-    pad = 24
-    hi_pad = pad * 4
-    hi_s = size * 4
-    hi_canvas_s = hi_s + hi_pad * 2
+def _build_dingtalk_liquid_badge(wing_path, size=310):
+    """以超采样生成带冰透天青玻璃折射、纯白翼标与柔和投影的右上角悬浮徽章。"""
+    pad = 36
+    W = size + pad * 2
+    cx = cy = W * 0.5
+    half_r = size * 0.455
+    yy, xx = np.mgrid[0:W, 0:W].astype(np.float32)
 
-    # 1) 天青至宝石蓝对角渐变底色 + 内部高光折射光晕
-    bg = Image.new("RGBA", (hi_s, hi_s), (0, 0, 0, 0))
-    px = bg.load()
-    for y in range(hi_s):
-        ty = y / (hi_s - 1)
-        for x in range(hi_s):
-            tx = x / (hi_s - 1)
-            t = 0.56 * ty + 0.44 * tx
-            r = int(34 * (1 - t) + 0 * t)
-            g = int(214 * (1 - t) + 84 * t)
-            b = int(255 * (1 - t) + 242 * t)
-            # 左上角内部水润青白折射光斑
-            dx = (x - hi_s * 0.28) / (hi_s * 0.65)
-            dy = (y - hi_s * 0.22) / (hi_s * 0.65)
-            glow = max(0.0, 1.0 - math.sqrt(dx * dx + dy * dy)) ** 1.8
-            r = min(255, int(r + glow * 45))
-            g = min(255, int(g + glow * 32))
-            px[x, y] = (r, g, b, 255)
+    mask = _squircle_sdf_alpha(W, W, cx, cy, half_r, power=4.5, aa_px=1.5)
+    u = (xx - cx) / half_r
+    v = (yy - cy) / half_r
 
-    # 2) 顶部弧面玻璃反光
-    sheen = Image.new("RGBA", (hi_s, hi_s), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(sheen)
-    sd.ellipse([-hi_s * 0.15, -hi_s * 0.35, hi_s * 1.15, hi_s * 0.48], fill=(255, 255, 255, 72))
-    sheen = sheen.filter(ImageFilter.GaussianBlur(28))
-    bg = Image.alpha_composite(bg, sheen)
+    # 1) 柔和环境投影
+    sh_mask = _squircle_sdf_alpha(W, W, cx, cy + 12.0, half_r, power=4.5, aa_px=2.0)
+    sh_blur = _gaussian_blur_np(sh_mask * 0.42, radius=18)
+    canvas = np.zeros((W, W, 4), dtype=np.float32)
+    canvas[..., 0] = 12.0 / 255.0
+    canvas[..., 1] = 68.0 / 255.0
+    canvas[..., 2] = 160.0 / 255.0
+    canvas[..., 3] = sh_blur
 
-    sq_mask = build_squircle_mask(hi_s, radius_frac=0.455, power=4.5)
+    # 2) 通透晴空冰青 -> 宝石蔚蓝液态渐变
+    t = np.clip(0.50 * (v + 1.0) * 0.62 + 0.50 * (u + 1.0) * 0.38, 0.0, 1.0)
+    br = (46.0 * (1.0 - t) + 10.0 * t) / 255.0
+    bg = (218.0 * (1.0 - t) + 122.0 * t) / 255.0
+    bb = (255.0 * (1.0 - t) + 255.0 * t) / 255.0
 
-    # 3) 超椭圆裁剪 + 双层玻璃内高光环带
-    badge_body = Image.new("RGBA", (hi_s, hi_s), (0, 0, 0, 0))
-    badge_body.paste(bg, (0, 0), sq_mask)
+    # 左上顶部水润玻璃光斑
+    sheen = np.exp(-(((u + 0.25) / 0.90) ** 2 + ((v + 0.75) / 0.55) ** 2)) * 0.34
+    br = np.clip(br + sheen, 0.0, 1.0)
+    bg = np.clip(bg + sheen, 0.0, 1.0)
+    bb = np.clip(bb + sheen * 0.6, 0.0, 1.0)
 
-    eroded = sq_mask.filter(ImageFilter.MinFilter(13))
-    rim_ring = ImageChops.subtract(sq_mask, eroded)
-    rim_grad = Image.new("L", (hi_s, hi_s), 0)
-    rgd = ImageDraw.Draw(rim_grad)
-    for y in range(hi_s):
-        av = int(225 * (1.0 - (y / (hi_s - 1)) * 0.62))
-        rgd.line([(0, y), (hi_s, y)], fill=av)
-    rim = Image.new("RGBA", (hi_s, hi_s), (255, 255, 255, 255))
-    rim.putalpha(ImageChops.multiply(rim_ring, rim_grad))
-    badge_body = Image.alpha_composite(badge_body, rim)
+    badge_body = np.stack([br, bg, bb, mask * 0.94], axis=-1)
+    canvas = _alpha_over(canvas, badge_body)
+
+    # 3) 徽章冰白玻璃内边框
+    rim_in = _squircle_sdf_alpha(W, W, cx, cy, half_r - 3.6, power=4.5, aa_px=1.4)
+    rim_ring = np.clip(mask - rim_in, 0.0, 1.0) * np.clip(1.0 - t * 0.45, 0.4, 1.0)
+    rim_layer = np.stack([
+        np.ones((W, W), np.float32),
+        np.ones((W, W), np.float32),
+        np.ones((W, W), np.float32),
+        rim_ring * 0.85,
+    ], axis=-1)
+    canvas = _alpha_over(canvas, rim_layer)
+
+    out_im = Image.fromarray(np.clip(canvas * 255.0, 0, 255).astype(np.uint8), mode="RGBA")
 
     # 4) 嵌入居中钉钉纯白立体翼标
     if wing_path and Path(wing_path).exists():
         wing = Image.open(wing_path).convert("RGBA")
-        target_w = int(hi_s * 0.72)
+        target_w = int(size * 0.72)
         wing = wing.resize((target_w, target_w), Image.Resampling.LANCZOS)
-        wx = (hi_s - target_w) // 2 + int(hi_s * 0.01)
-        wy = (hi_s - target_w) // 2 + int(hi_s * 0.01)
+        wx = (W - target_w) // 2 + int(size * 0.015)
+        wy = (W - target_w) // 2 + int(size * 0.015)
 
         w_alpha = wing.getchannel("A")
-        w_shadow_layer = Image.new("RGBA", (hi_s, hi_s), (0, 38, 138, 0))
-        w_shadow_alpha = Image.new("L", (hi_s, hi_s), 0)
-        w_shadow_alpha.paste(ImageChops.multiply(w_alpha, Image.new("L", wing.size, 115)), (wx, wy + 12))
-        w_shadow_alpha = w_shadow_alpha.filter(ImageFilter.GaussianBlur(14))
-        w_shadow_fill = Image.new("RGBA", (hi_s, hi_s), (0, 38, 138, 255))
+        w_shadow_alpha = Image.new("L", (W, W), 0)
+        w_shadow_alpha.paste(ImageChops.multiply(w_alpha, Image.new("L", wing.size, 110)), (wx, wy + 5))
+        w_shadow_alpha = w_shadow_alpha.filter(ImageFilter.GaussianBlur(5))
+        w_shadow_fill = Image.new("RGBA", (W, W), (6, 48, 146, 255))
         w_shadow_fill.putalpha(w_shadow_alpha)
-        badge_body = Image.alpha_composite(badge_body, w_shadow_fill)
+        out_im = Image.alpha_composite(out_im, w_shadow_fill)
 
-        wing_layer = Image.new("RGBA", (hi_s, hi_s), (0, 0, 0, 0))
+        wing_layer = Image.new("RGBA", (W, W), (0, 0, 0, 0))
         wing_layer.paste(wing, (wx, wy), wing)
-        badge_body = Image.alpha_composite(badge_body, wing_layer)
+        out_im = Image.alpha_composite(out_im, wing_layer)
 
-    # 5) 柔和深海蓝悬浮外投影
-    canvas = Image.new("RGBA", (hi_canvas_s, hi_canvas_s), (0, 0, 0, 0))
-    sh_alpha = Image.new("L", (hi_canvas_s, hi_canvas_s), 0)
-    sh_alpha.paste(ImageChops.multiply(sq_mask, Image.new("L", (hi_s, hi_s), 150)), (hi_pad, hi_pad + 18))
-    sh_alpha = sh_alpha.filter(ImageFilter.GaussianBlur(30))
-    sh_fill = Image.new("RGBA", (hi_canvas_s, hi_canvas_s), (4, 34, 116, 255))
-    sh_fill.putalpha(sh_alpha)
-    canvas = Image.alpha_composite(canvas, sh_fill)
-    canvas.paste(badge_body, (hi_pad, hi_pad), badge_body)
-
-    out_s = size + pad * 2
-    return canvas.resize((out_s, out_s), Image.Resampling.LANCZOS)
+    return out_im
 
 
-def render_icons(src_path, out_dir, wing_path=None):
+def render_icons(src_path="", out_dir=".", wing_path=None):
+    """生成 1024 主图与 icon.png (512x512) / icon.ico（彻底无蓝边）。"""
     out_dir = Path(out_dir)
     wing_p = Path(wing_path) if wing_path else DEFAULT_WING
     S = 1024
 
-    if src_path and Path(src_path).exists():
-        art = Image.open(src_path).convert("RGBA")
-        min_dim = min(art.width, art.height)
-        left = (art.width - min_dim) // 2
-        top = (art.height - min_dim) // 2
-        art = art.crop((left, top, left + min_dim, top + min_dim))
-        art = art.resize((S, S), Image.Resampling.LANCZOS)
-        # 抹除原右上角小飞机，增强整体玻璃色彩清透度与对比度
-        art = _patch_old_plane_badge(art, cx=709, cy=297, radius=88)
-        art = ImageEnhance.Color(art).enhance(1.09)
-        art = ImageEnhance.Contrast(art).enhance(1.04)
+    master = _render_frosted_glass_card(S)
+    badge = _build_dingtalk_liquid_badge(wing_p, size=278)
+    # 放置在毛玻璃主体右上角，微微破框而出，增强悬浮层叠感
+    bx = 812 - badge.width // 2
+    by = 216 - badge.height // 2
+    master = Image.alpha_composite(master, Image.new("RGBA", (S, S), (0, 0, 0, 0)))
+    badge_canvas = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    badge_canvas.paste(badge, (bx, by), badge)
+    master = Image.alpha_composite(master, badge_canvas)
+
+    # 针对 16/20/24/32 小尺寸，紧裁去外圈纯阴影留白并保留主体饱满度
+    bbox = master.getbbox()
+    if bbox:
+        tight_src = master.crop((max(0, bbox[0] + 18), max(0, bbox[1] + 10), min(S, bbox[2] - 18), min(S, bbox[3] - 24)))
     else:
-        art = _fallback_vector_art(S)
+        tight_src = master
 
-    # 合成右上角 Apple Liquid Glass 立体钉钉翼标徽章
-    badge = _build_dingtalk_liquid_badge(wing_p, size=214)
-    bx = 704 - badge.width // 2
-    by = 294 - badge.height // 2
-    art.paste(badge, (bx, by), badge)
-
-    # 1) 生成 Apple Squircle 遮罩
-    mask = build_squircle_mask(S, radius_frac=0.455, power=4.6)
-
-    # 2) 外侧极轻环境悬浮投影（保持清晰 4.5% 安全边距内）
-    shadow_alpha = ImageChops.multiply(
-        mask,
-        Image.new("L", (S, S), 96),
-    )
-    shadow = Image.new("RGBA", (S, S), (8, 22, 54, 0))
-    shadow_layer = Image.new("RGBA", (S, S), (8, 22, 54, 255))
-    shadow_layer.putalpha(shadow_alpha)
-    shadow.paste(shadow_layer, (0, 14), shadow_alpha)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(18))
-
-    # 3) 裁剪主体 + 添加细腻双层液态玻璃内高光与顶部微泛光
-    body = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    body.paste(art, (0, 0), mask)
-
-    top_sheen = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    tsd = ImageDraw.Draw(top_sheen)
-    tsd.ellipse([S * 0.08, -S * 0.25, S * 0.92, S * 0.36], fill=(255, 255, 255, 22))
-    top_sheen = top_sheen.filter(ImageFilter.GaussianBlur(24))
-    body.paste(Image.alpha_composite(body, top_sheen), (0, 0), mask)
-
-    eroded = mask.filter(ImageFilter.MinFilter(5))
-    rim_ring = ImageChops.subtract(mask, eroded)
-    rim_grad = Image.new("L", (S, S), 0)
-    rgd = ImageDraw.Draw(rim_grad)
-    for y in range(S):
-        alpha_v = int(152 * (1.0 - (y / (S - 1)) * 0.70))
-        rgd.line([(0, y), (S, y)], fill=alpha_v)
-    rim_alpha = ImageChops.multiply(rim_ring, rim_grad)
-    rim = Image.new("RGBA", (S, S), (255, 255, 255, 255))
-    rim.putalpha(rim_alpha)
-    body = Image.alpha_composite(body, rim)
-
-    master = Image.alpha_composite(shadow, body)
-    # 针对 16/20/24/32 小尺寸列表视图，裁去外阴影透明空白区，让超椭圆主体饱满填满视野
-    tight_pad = int(S * (0.5 - 0.455))
-    body_tight = body.crop((tight_pad, tight_pad, S - tight_pad, S - tight_pad))
-
-    # 4) 导出高清 icon.png (512×512) 与全尺寸标准 Win32 DIB+PNG 混合 icon.ico
     png_path = out_dir / "icon.png"
     ico_path = out_dir / "icon.ico"
     master.resize((512, 512), Image.Resampling.LANCZOS).save(png_path, "PNG", optimize=True)
-    _write_win32_ico(ico_path, master, body_tight, ICO_SIZES)
+    _write_win32_ico(ico_path, master, tight_src, ICO_SIZES)
     print(f"ICON_SAVED_OK: {png_path} & {ico_path}")
     return master
 
@@ -261,7 +303,6 @@ def _encode_ico_dib(im):
     w, h = im.size
     rgba = im.convert("RGBA")
     rows_bgra = []
-    # Win32 DIB 像素自底向上存储
     for y in range(h - 1, -1, -1):
         for x in range(w):
             r, g, b, a = rgba.getpixel((x, y))
@@ -271,14 +312,7 @@ def _encode_ico_dib(im):
     and_data = b"\x00" * (and_stride * h)
     bmi = struct.pack(
         "<IIIHHIIIIII",
-        40,             # biSize
-        w,              # biWidth
-        h * 2,          # biHeight (XOR + AND)
-        1,              # biPlanes
-        32,             # biBitCount
-        0,              # biCompression = BI_RGB
-        len(xor_data),  # biSizeImage
-        0, 0, 0, 0,
+        40, w, h * 2, 1, 32, 0, len(xor_data), 0, 0, 0, 0,
     )
     return bmi + xor_data + and_data
 
@@ -289,6 +323,11 @@ def _write_win32_ico(ico_path, master_img, tight_img, sizes):
     payloads = []
     for w, h in sizes:
         src = tight_img if w <= 32 else master_img
+        if src.width != src.height:
+            side = max(src.width, src.height)
+            sq = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+            sq.paste(src, ((side - src.width) // 2, (side - src.height) // 2), src)
+            src = sq
         frame = src.resize((w, h), Image.Resampling.LANCZOS)
         if w >= 256:
             buf = io.BytesIO()
@@ -314,12 +353,11 @@ def _write_win32_ico(ico_path, master_img, tight_img, sizes):
 def make_showcase(master, dest_path):
     """生成浅色/深色双背景的多尺寸图标预览对照图。"""
     W, H = 960, 480
-    canvas = Image.new("RGBA", (W, H), (242, 242, 247, 255))
+    canvas = Image.new("RGBA", (W, H), (242, 244, 248, 255))
     draw = ImageDraw.Draw(canvas)
-    # 右半为深色背景对比
-    draw.rectangle([W // 2, 0, W, H], fill=(28, 28, 30, 255))
+    draw.rectangle([W // 2, 0, W, H], fill=(24, 26, 32, 255))
 
-    for side, x_base in enumerate((0, W // 2)):
+    for _side, x_base in enumerate((0, W // 2)):
         big = master.resize((220, 220), Image.Resampling.LANCZOS)
         canvas.paste(big, (x_base + 130, 66), big)
 
@@ -336,7 +374,7 @@ def make_showcase(master, dest_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--src", default=str(DEFAULT_SRC if DEFAULT_SRC.exists() else ""))
+    parser.add_argument("--src", default="")
     parser.add_argument("--out", default=str(Path(__file__).resolve().parent))
     parser.add_argument("--showcase", default="")
     args = parser.parse_args()

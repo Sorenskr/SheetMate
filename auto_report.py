@@ -25,16 +25,59 @@ import urllib.error
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+import json
+import ssl
 from PIL import Image
 
 # 固定浏览器目录（必须在 import playwright 之前设置）
-# 打包成 exe 后默认会指向每次清空的临时解压目录，这里强制用固定的用户目录
-_browsers_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "ms-playwright"
+# 优先使用程序同级或上级目录中的 ms-playwright（随项目放在 E 盘不占 C 盘），其次才回退环境变量或系统目录
+def _early_app_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _resolve_playwright_browsers_dir():
+    base = _early_app_dir()
+    for cand in (base / "ms-playwright", base.parent / "ms-playwright"):
+        try:
+            if cand.exists() and any(cand.glob("chromium-*")):
+                return cand
+        except Exception:
+            pass
+    env_dir = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if env_dir and Path(env_dir).exists():
+        return Path(env_dir)
+    return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "ms-playwright"
+
+
+_browsers_dir = _resolve_playwright_browsers_dir()
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_browsers_dir)
 
-from playwright.sync_api import sync_playwright
-import openpyxl
+def sync_playwright():
+    from playwright.sync_api import sync_playwright as _sp
+    return _sp()
+
+
+class _LazyModuleProxy:
+    """延迟加载重型第三方库，避免双击打开程序首屏时阻塞数秒。"""
+
+    def __init__(self, mod_name):
+        self._mod_name = mod_name
+        self._mod = None
+
+    def _load(self):
+        if self._mod is None:
+            import importlib
+            self._mod = importlib.import_module(self._mod_name)
+        return self._mod
+
+    def __getattr__(self, item):
+        return getattr(self._load(), item)
+
+
+openpyxl = _LazyModuleProxy("openpyxl")
 from tkinter import messagebox
 
 # ==================== 配置 ====================
@@ -59,12 +102,29 @@ def app_dir():
     return Path(__file__).parent
 
 
+def get_local_runtime_dir():
+    """将 UI 壳体等本地运行缓存固定保存在程序所在目录内（E 盘），避免持续占用 C 盘空间。"""
+    base = app_dir()
+    try:
+        rt = base / "runtime_data"
+        rt.mkdir(parents=True, exist_ok=True)
+        return rt
+    except Exception:
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SheetMate"
+
+
 def get_browser_user_data_dir():
-    """若程序同目录已存在 browser_data 则继续沿用（保留已有登录态）；否则放在 LocalAppData 避免污染桌面。"""
-    local_dir = app_dir() / "browser_data"
-    if local_dir.exists():
-        return local_dir
-    return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SheetMate" / "browser_data"
+    """优先沿用程序同目录或上级已有的 browser_data（无缝保留 WPS 登录态），新建时也留在程序目录内不占 C 盘。"""
+    base = app_dir()
+    for cand in (base / "browser_data", base.parent / "browser_data"):
+        if cand.exists():
+            return cand
+    try:
+        target = base / "browser_data"
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    except Exception:
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SheetMate" / "browser_data"
 
 
 BROWSER_USER_DATA = get_browser_user_data_dir()
@@ -187,11 +247,32 @@ def ensure_browser_installed():
     return _chromium_installed()
 
 
+_active_pw_lock = threading.Lock()
+_active_pw_context = None
+
+
+def _set_active_pw_context(ctx):
+    global _active_pw_context
+    with _active_pw_lock:
+        _active_pw_context = ctx
+
+
+def _force_close_active_pw_context():
+    with _active_pw_lock:
+        ctx = _active_pw_context
+    if ctx is None:
+        return
+    try:
+        ctx.close()
+    except Exception:
+        pass
+
+
 def _launch_context(p, retried=False):
     """启动持久化浏览器上下文；若报内核缺失，先自动补装一次再重试。"""
     BROWSER_USER_DATA.mkdir(parents=True, exist_ok=True)
     try:
-        return p.chromium.launch_persistent_context(
+        ctx = p.chromium.launch_persistent_context(
             user_data_dir=str(BROWSER_USER_DATA),
             headless=False,
             viewport={"width": 1920, "height": 1080},
@@ -201,6 +282,8 @@ def _launch_context(p, retried=False):
             accept_downloads=True,
             permissions=["clipboard-read", "clipboard-write"],
         )
+        _set_active_pw_context(ctx)
+        return ctx
     except Exception as e:
         msg = str(e)
         if not retried and "Executable doesn't exist" in msg:
@@ -211,31 +294,87 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.8.0"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.0.1","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.8.0","url":"新版exe的下载直链"}
+DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
+GEMINI_MODEL_CANDIDATES = (
+    "gemini-flash-latest",
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-pro-preview",
+)
 UPDATE_CHECK_URL = "https://raw.githubusercontent.com/Sorenskr/SheetMate/main/version.json"
 
-_DEFAULT_RUNNING_HINT = "按键提示：临时用电脑可点【暂停】，忙完点【继续】；点【取消】终止本轮"
+_DEFAULT_RUNNING_HINT = "按键提示：随时按【F8】或点【暂停】让出电脑，忙完按【F8】或点【继续】；点【取消】终止"
 _runtime_lock = threading.RLock()
+_runtime_cond = threading.Condition(_runtime_lock)
+_active_operator_name = "当前成员"
 _stop_requested = False
 _pause_requested = False
 _waiting_recovery = False
 _recovery_choice = None
 _runtime_callback = None
+_spotlight_callback = None
+_latest_round_spotlight = None
+_last_diagnosed_detail = None
 _runtime_prompt = {
     "mode": "running",
     "title": "",
     "detail": "",
     "hint": _DEFAULT_RUNNING_HINT,
     "actions": [],
+    "error_detail": None,
+    "hands_off": False,
+    "hands_off_text": "",
 }
+
+
+class DingTalkInterrupted(RuntimeError):
+    """发送钉钉过程中检测到用户关闭、最小化或主动切走窗口时抛出的可恢复中断异常。"""
+
+
+def get_user_idle_seconds():
+    """读取用户最后一次键鼠输入距今的秒数（失败时返回较大值以免误判忙碌）。"""
+    if os.name != "nt":
+        return 999.0
+    try:
+        class _LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
+        user32.GetLastInputInfo.restype = wintypes.BOOL
+        kernel32.GetTickCount.argtypes = []
+        kernel32.GetTickCount.restype = wintypes.DWORD
+
+        lii = _LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+        if not user32.GetLastInputInfo(ctypes.byref(lii)):
+            return 999.0
+        elapsed_ms = (int(kernel32.GetTickCount()) - int(lii.dwTime)) & 0xFFFFFFFF
+        return max(0.0, elapsed_ms / 1000.0)
+    except Exception:
+        return 999.0
 
 
 def set_runtime_callback(fn):
     global _runtime_callback
     with _runtime_lock:
         _runtime_callback = fn
+
+
+def set_spotlight_callback(fn):
+    """注册数据变化播报回调：每轮粘贴或汇总截图更新后实时推送数据增减播报。"""
+    global _spotlight_callback
+    with _runtime_lock:
+        _spotlight_callback = fn
+
+
+def get_latest_round_spotlight():
+    with _runtime_lock:
+        return dict(_latest_round_spotlight) if isinstance(_latest_round_spotlight, dict) else None
 
 
 def _default_running_prompt():
@@ -245,23 +384,41 @@ def _default_running_prompt():
         "detail": "",
         "hint": _DEFAULT_RUNNING_HINT,
         "actions": [],
+        "error_detail": None,
+        "hands_off": False,
+        "hands_off_text": "",
     }
 
 
+def set_active_operator_name(name):
+    """设置当前操作者昵称，用于在粘贴表格或发钉钉期间醒目提示防误触。"""
+    global _active_operator_name
+    clean = str(name or "").strip()
+    with _runtime_lock:
+        _active_operator_name = clean or "当前成员"
+
+
 def get_runtime_state():
-    """返回线程安全的运行时暂停、恢复与操作指引状态快照。"""
+    """返回线程安全的运行时暂停、恢复、防误触提醒与操作指引状态快照。"""
     with _runtime_lock:
         p = _runtime_prompt or _default_running_prompt()
+        ed = p.get("error_detail")
         return {
             "paused": bool(_pause_requested),
             "stop_requested": bool(_stop_requested),
             "waiting_recovery": bool(_waiting_recovery),
+            "hands_off": bool(p.get("hands_off")),
+            "hands_off_text": str(p.get("hands_off_text") or ""),
+            "operator_name": _active_operator_name,
             "prompt": {
                 "mode": p.get("mode", "running"),
                 "title": p.get("title", ""),
                 "detail": p.get("detail", ""),
                 "hint": p.get("hint", _DEFAULT_RUNNING_HINT),
                 "actions": [dict(a) for a in (p.get("actions") or [])],
+                "error_detail": dict(ed) if isinstance(ed, dict) else None,
+                "hands_off": bool(p.get("hands_off")),
+                "hands_off_text": str(p.get("hands_off_text") or ""),
             },
         }
 
@@ -276,23 +433,73 @@ def _notify_runtime_state():
             pass
 
 
+def hands_off_guard(action_desc):
+    """键鼠敏感粘贴/操作上下文守卫：全程展示『目前XX正在操作，请勿动键鼠』醒目提示。"""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _cm():
+        with _runtime_lock:
+            op = (_active_operator_name or "当前成员").strip() or "当前成员"
+            msg = f"目前【{op}】正在{action_desc}，请勿触碰鼠标或键盘！（急停按 F8）"
+            _runtime_prompt["hands_off"] = True
+            _runtime_prompt["hands_off_text"] = msg
+        _notify_runtime_state()
+        try:
+            yield
+        finally:
+            with _runtime_lock:
+                _runtime_prompt["hands_off"] = False
+                _runtime_prompt["hands_off_text"] = ""
+            _notify_runtime_state()
+
+    return _cm()
+
+
+def _dismiss_dt_popup_nonblocking():
+    """取消任务时在后台瞬间清理残留搜索框或弹出菜单，避免卡住桌面。"""
+    if os.name != "nt":
+        return
+    try:
+        hwnd = int(_active_dt_hwnd or 0)
+        if hwnd:
+            u32 = ctypes.windll.user32
+            u32.PostMessageW(hwnd, 0x0100, 0x1B, 0)  # WM_KEYDOWN VK_ESCAPE
+            u32.PostMessageW(hwnd, 0x0101, 0x1B, 0)  # WM_KEYUP VK_ESCAPE
+    except Exception:
+        pass
+
+
 def request_stop():
-    """请求立即取消/停止当前任务（可立即打断暂停与等待排障状态）。"""
-    global _stop_requested, _pause_requested, _recovery_choice
-    with _runtime_lock:
+    """请求立即取消/停止当前任务（毫秒级唤醒所有休眠/暂停/等待，绝不转圈拖延）。"""
+    global _stop_requested, _pause_requested, _recovery_choice, _runtime_prompt
+    with _runtime_cond:
         _stop_requested = True
         _pause_requested = False
         if _waiting_recovery:
             _recovery_choice = "cancel"
+        _runtime_prompt = {
+            "mode": "stopped",
+            "title": "已取消本轮任务",
+            "detail": "",
+            "hint": "任务已终止",
+            "actions": [],
+            "error_detail": None,
+            "hands_off": False,
+            "hands_off_text": "",
+        }
+        _runtime_cond.notify_all()
+    threading.Thread(target=_force_close_active_pw_context, daemon=True).start()
+    threading.Thread(target=_dismiss_dt_popup_nonblocking, daemon=True).start()
     _notify_runtime_state()
 
 
 def request_pause():
-    """请求暂停当前执行，保持浏览器、已下载表格与已截图片完好。"""
+    """请求暂停当前执行，毫秒级挂起可中断点并保持浏览器与图片完好。"""
     global _pause_requested, _runtime_prompt
-    with _runtime_lock:
+    with _runtime_cond:
         if _stop_requested:
-            return False, "任务正在取消中"
+            return False, "任务已取消"
         if _waiting_recovery:
             return False, "当前已在等待排障，请按提示处理后点击恢复按钮"
         if _pause_requested:
@@ -302,14 +509,17 @@ def request_pause():
             "mode": "paused",
             "title": "任务已暂停",
             "detail": "自动键鼠与浏览器操作已安全挂起，您可先处理其他工作；\n已下载或已截取的内容均会保留，无需重头开始。",
-            "hint": "按键提示：处理完后点【继续】接着跑当前步骤；点【取消】结束本轮。",
+            "hint": "按键提示：忙完后按键盘【F8】或点【继续运行 (F8)】接着跑未完成步骤；点【取消】结束本轮。",
             "actions": [
-                {"id": "continue", "label": "继续运行", "style": "primary"},
+                {"id": "continue", "label": "继续运行 (F8)", "style": "primary"},
             ],
+            "hands_off": False,
+            "hands_off_text": "",
         }
+        _runtime_cond.notify_all()
     _notify_runtime_state()
-    log("⏸ 已暂停执行（进度已保留，点【继续】可接着运行）")
-    return True, "已暂停，可点击继续恢复"
+    log("⏸ 已暂停执行（进度已保留，按【F8】或点【继续】可接着运行）")
+    return True, "已暂停，按【F8】或点击继续恢复"
 
 
 def request_resume(action="continue"):
@@ -318,10 +528,10 @@ def request_resume(action="continue"):
     act = str(action or "continue").strip() or "continue"
     if act == "cancel":
         request_stop()
-        return True, "已发送取消指令"
+        return True, "已取消任务"
     msg = "已发送继续指令"
     need_log = False
-    with _runtime_lock:
+    with _runtime_cond:
         if _waiting_recovery:
             _recovery_choice = act
             msg = "已收到恢复操作，正在继续当前流程…"
@@ -333,52 +543,226 @@ def request_resume(action="continue"):
         elif _runtime_prompt.get("mode") == "login_wps":
             _recovery_choice = "check_now"
             msg = "正在立即检测 WPS 登录状态…"
+        _runtime_cond.notify_all()
     _notify_runtime_state()
     if need_log:
-        log("▶ 已点击【继续】，恢复执行…")
+        log("▶ 已恢复运行，继续执行未完成步骤…")
     return True, msg
 
 
-def reset_stop():
-    global _stop_requested, _pause_requested, _waiting_recovery, _recovery_choice, _runtime_prompt
+def trigger_hotkey_action(slot="f8"):
+    """响应全局快捷键（F8=暂停或继续未完成步骤；F9=已开群直接粘贴；cancel=取消）。"""
+    key = str(slot or "f8").strip().lower()
+    if key == "cancel":
+        request_stop()
+        return True, "已发送取消指令"
+
+    if key == "f9":
+        with _runtime_lock:
+            if not _waiting_recovery:
+                return False, "当前未处于等待直接粘贴排障状态"
+            actions = list(_runtime_prompt.get("actions") or [])
+        preferred = ("skip_search", "retry_paste", "manual_copied", "continue")
+        chosen = None
+        for pid in preferred:
+            if any(a.get("id") == pid for a in actions):
+                chosen = pid
+                break
+        if chosen is None and len(actions) >= 2:
+            chosen = actions[1].get("id")
+        elif chosen is None and actions:
+            chosen = actions[0].get("id")
+        if not chosen:
+            return False, "当前暂无可执行快捷键动作"
+        log(f"⌨️ 快捷键【F9】触发快速恢复：{chosen}")
+        return request_resume(chosen)
+
+    # 默认 F8：运行中 -> 暂停；暂停中/排障等待 -> 继续或执行主恢复动作
     with _runtime_lock:
+        if _stop_requested:
+            return False, "任务正在取消中"
+        in_rec = _waiting_recovery or (_runtime_prompt.get("mode") == "login_wps")
+        actions = list(_runtime_prompt.get("actions") or [])
+        is_paused = _pause_requested
+    if in_rec:
+        act_id = (actions[0].get("id") if actions else None) or "retry"
+        log(f"⌨️ 快捷键【F8】触发继续未完成步骤（{act_id}）")
+        return request_resume(act_id)
+    if is_paused:
+        log("⌨️ 快捷键【F8】触发恢复执行")
+        return request_resume("continue")
+    log("⌨️ 快捷键【F8】触发暂停任务")
+    return request_pause()
+
+
+class _RuntimeHotkeyManager:
+    """任务运行期间按需注册系统级快捷键（F8/F9），任务结束立即卸载避免干扰日常软件。"""
+
+    _ID_F8 = 0x5101
+    _ID_F9 = 0x5102
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._ref_count = 0
+        self._stop_evt = None
+        self._thread = None
+        self._f8_label = "F8"
+        self._f9_label = "F9"
+
+    def active_labels(self):
+        with self._lock:
+            return self._f8_label, self._f9_label
+
+    def start(self):
+        if os.name != "nt":
+            return
+        with self._lock:
+            self._ref_count += 1
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_evt = threading.Event()
+            ev = self._stop_evt
+            t = threading.Thread(target=self._loop, args=(ev,), daemon=True, name="SheetMateHotkeys")
+            self._thread = t
+            t.start()
+
+    def stop(self):
+        if os.name != "nt":
+            return
+        t_join = None
+        with self._lock:
+            self._ref_count = max(0, self._ref_count - 1)
+            if self._ref_count > 0:
+                return
+            if self._stop_evt is not None:
+                self._stop_evt.set()
+            t_join = self._thread
+            self._thread = None
+            self._f8_label = "F8"
+            self._f9_label = "F9"
+        if t_join is not None and t_join is not threading.current_thread():
+            t_join.join(timeout=0.8)
+
+    def _loop(self, stop_evt):
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+            user32.RegisterHotKey.restype = wintypes.BOOL
+            user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.UnregisterHotKey.restype = wintypes.BOOL
+            user32.PeekMessageW.argtypes = [
+                ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT,
+            ]
+            user32.PeekMessageW.restype = wintypes.BOOL
+
+            MOD_NOREPEAT = 0x4000
+            MOD_CTRL_SHIFT = 0x0002 | 0x0004
+            VK_F8, VK_F9 = 0x77, 0x78
+            WM_HOTKEY = 0x0312
+            PM_REMOVE = 0x0001
+
+            msg = wintypes.MSG()
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+
+            registered = []
+            f8_lbl = "F8"
+            if (user32.RegisterHotKey(None, self._ID_F8, MOD_NOREPEAT, VK_F8)
+                    or user32.RegisterHotKey(None, self._ID_F8, 0, VK_F8)):
+                registered.append(self._ID_F8)
+            elif user32.RegisterHotKey(None, self._ID_F8, MOD_CTRL_SHIFT | MOD_NOREPEAT, VK_F8):
+                registered.append(self._ID_F8)
+                f8_lbl = "Ctrl+Shift+F8"
+            else:
+                f8_lbl = ""
+
+            f9_lbl = "F9"
+            if (user32.RegisterHotKey(None, self._ID_F9, MOD_NOREPEAT, VK_F9)
+                    or user32.RegisterHotKey(None, self._ID_F9, 0, VK_F9)):
+                registered.append(self._ID_F9)
+            elif user32.RegisterHotKey(None, self._ID_F9, MOD_CTRL_SHIFT | MOD_NOREPEAT, VK_F9):
+                registered.append(self._ID_F9)
+                f9_lbl = "Ctrl+Shift+F9"
+            else:
+                f9_lbl = ""
+
+            with self._lock:
+                if f8_lbl:
+                    self._f8_label = f8_lbl
+                if f9_lbl:
+                    self._f9_label = f9_lbl
+
+            try:
+                while not stop_evt.is_set():
+                    while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+                        if msg.message == WM_HOTKEY:
+                            hid = int(msg.wParam)
+                            if hid == self._ID_F8:
+                                trigger_hotkey_action("f8")
+                            elif hid == self._ID_F9:
+                                trigger_hotkey_action("f9")
+                    stop_evt.wait(0.08)
+            finally:
+                for hid in registered:
+                    try:
+                        user32.UnregisterHotKey(None, hid)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
+_HOTKEY_MGR = _RuntimeHotkeyManager()
+
+
+def reset_stop():
+    global _stop_requested, _pause_requested, _waiting_recovery, _recovery_choice, _runtime_prompt, _last_diagnosed_detail
+    with _runtime_cond:
         _stop_requested = False
         _pause_requested = False
         _waiting_recovery = False
         _recovery_choice = None
+        _last_diagnosed_detail = None
         _runtime_prompt = _default_running_prompt()
+        _runtime_cond.notify_all()
     _notify_runtime_state()
 
 
 def check_stop():
-    """在任何可安全中断点检查取消信号与暂停信号（暂停期间自动挂起等待）。"""
+    """在任何可安全中断点检查取消信号与暂停信号（通过 Condition 毫秒级唤醒，绝不卡顿）。"""
     was_paused = False
-    while True:
-        with _runtime_lock:
+    with _runtime_cond:
+        while True:
             if _stop_requested:
                 raise RuntimeError("用户手动停止了任务")
-            paused = _pause_requested
-        if not paused:
-            if was_paused:
-                _notify_runtime_state()
-            return
-        was_paused = True
-        time.sleep(0.15)
+            if not _pause_requested:
+                break
+            was_paused = True
+            _runtime_cond.wait(timeout=0.5)
+    if was_paused:
+        _notify_runtime_state()
 
 
 def sleep_check(seconds):
-    """可随时响应暂停/继续/取消的分段休眠（暂停期间不扣减等待时长）。"""
+    """可毫秒级瞬时响应暂停/继续/取消的分段休眠（暂停期间不扣减等待时长）。"""
     remaining = max(0.0, float(seconds))
-    while True:
-        check_stop()
-        if remaining <= 0:
-            break
-        step = min(0.25, remaining)
-        t0 = time.monotonic()
-        time.sleep(step)
-        with _runtime_lock:
-            if not _pause_requested:
+    was_paused = False
+    with _runtime_cond:
+        while True:
+            if _stop_requested:
+                raise RuntimeError("用户手动停止了任务")
+            if _pause_requested:
+                was_paused = True
+                _runtime_cond.wait(timeout=0.5)
+                continue
+            if remaining <= 0:
+                break
+            step = min(0.25, remaining)
+            t0 = time.monotonic()
+            _runtime_cond.wait(timeout=step)
+            if not _pause_requested and not _stop_requested:
                 remaining -= (time.monotonic() - t0)
+    if was_paused:
+        _notify_runtime_state()
 
 
 def probe_network(timeout=2.4):
@@ -413,8 +797,3019 @@ def probe_network(timeout=2.4):
     }
 
 
+def classify_error_detail(exc=None, stage="", extra=None):
+    """将异常与运行阶段映射为结构化报错代码、大白话原因、自助解决步骤与给开发者的修改指令。"""
+    import traceback
+    extra = extra or {}
+    err_s = str(exc or "").strip()
+    low = err_s.lower()
+    st = str(stage or "").strip().lower()
+
+    tb_loc = ""
+    if isinstance(exc, BaseException) and getattr(exc, "__traceback__", None) is not None:
+        try:
+            frames = traceback.extract_tb(exc.__traceback__)
+            if frames:
+                last_f = frames[-1]
+                tb_loc = f"{Path(last_f.filename).name}:{last_f.lineno} ({last_f.name})"
+        except Exception:
+            tb_loc = ""
+
+    def _pack(code, title, plain_reason, self_fix, tell_dev_goal):
+        loc_part = f"（定位：{tb_loc}）" if tb_loc else ""
+        raw_short = err_s[:160] if err_s else title
+        tell_dev = (
+            f"我的暗号表助手 v{APP_VERSION} 报错了，错误代码是【{code}】（{title}）。"
+            f"系统提示是：「{raw_short}」{loc_part}。请你帮我{tell_dev_goal}，改好后打包新版本给我。"
+        )
+        return {
+            "code": code,
+            "title": title,
+            "plain_reason": plain_reason,
+            "self_fix": self_fix,
+            "tell_dev": tell_dev,
+            "raw_error": raw_short,
+            "location": tb_loc,
+        }
+
+    # 1. 网络与 VPN
+    if ("err_internet_disconnected" in low or "err_name_not_resolved" in low
+            or st == "net_offline" or extra.get("internet_ok") is False):
+        return _pack(
+            "ERR-NET-101",
+            "电脑没有连上网",
+            "电脑当前断网或 DNS 没连上，后台和在线表格都打不开。",
+            "1. 检查右下角 Wi-Fi 或网线图标，先确保浏览器能打开百度；\n2. 连上网后点【已连网·重试当前步】直接接着跑。",
+            "增强断网重连的等待时间和自动重试次数",
+        )
+
+    if (st == "vpn_blocked"
+            or (st in ("luya_open", "luya_login", "luya_download")
+                and any(k in low for k in ("vpn", "proxy", "tunnel", "err_timed_out", "err_connection", "timeout", "net::err")))
+            or extra.get("luya_ok") is False):
+        return _pack(
+            "ERR-VPN-102",
+            "能上网，但没开 VPN 或后台连不通",
+            "电脑外网通着，但打不开 Luya 数据后台（bb.luyaapp.live），通常是忘了开梯子/VPN。",
+            "1. 打开您电脑上的 VPN 软件，确认节点已连上且系统代理打开；\n2. 点【已开VPN·重试当前步】就会从这一步继续往下抓。",
+            "检查 Luya 后台域名连通与代理超时策略",
+        )
+
+    # 2. 浏览器内核
+    if "executable doesn't exist" in low or "chromium" in low or "browser" in low or "launch" in low:
+        return _pack(
+            "ERR-BRW-105",
+            "内置浏览器打不开或组件缺损",
+            "自动跑表用的内置浏览器没找到文件，或者旧浏览器进程卡住占用了目录。",
+            "1. 先在任务管理器确认没有残留卡死的 chrome.exe 后重新运行；\n2. 确保联网后再打开软件，让它自动补齐浏览器组件。",
+            "优化内置浏览器启动失败与残余进程自动清理逻辑",
+        )
+
+    # 3. Luya 后台登录 / 下载
+    if st == "luya_login" or extra.get("luya_need_login") or ("luya" in low and ("login" in low or "登录" in err_s)):
+        return _pack(
+            "ERR-LUYA-103",
+            "Luya 数据后台需要重新登录",
+            "后台账号密码过期了，或者网页弹了验证码需要手动点一下。",
+            "1. 在弹出的浏览器窗口里手动完成登录，进入数据页面；\n2. 点【我已登录·继续】；也可以在「记录账号」页核对 Luya 账号密码。",
+            "适配 Luya 后台最新的登录页表单结构或密码填充逻辑",
+        )
+
+    if st == "luya_download" or "download" in low or "数据表" in err_s or "下载" in err_s:
+        tbl = extra.get("name") or "数据表"
+        return _pack(
+            "ERR-LUYA-104",
+            f"下载【{tbl}】超时或没找到下载按钮",
+            f"后台网页加载太慢或按钮位置变了，导致【{tbl}】没有按时下到本地。",
+            "1. 先看下 VPN 节点是不是掉线或卡顿，看浏览器里数据出来没；\n2. 点击【重试下载当前表】，已经下完的其他表会自动保留不重抓。",
+            f"排查 Luya 后台【{tbl}】页面下载按钮或表格渲染等待逻辑",
+        )
+
+    # 4. 钉钉相关错误码（需先于通用 WPS/timeout 判断）
+    if "权限不一致" in err_s or "ui.pi" in low or "uipi" in low:
+        return _pack(
+            "ERR-DT-302",
+            "软件和钉钉的权限高低不一样，点击被系统拦截",
+            "一个用了管理员权限运行，另一个是普通权限，Windows 安全机制禁止软件帮您点钉钉。",
+            "1. 把钉钉和暗号表助手都关闭；\n2. 两个软件都按普通双击打开（或都右键“以管理员身份运行”）。",
+            "增强钉钉与软件权限一致性校验及弹窗引导",
+        )
+
+    if st == "dingtalk_login" or "钉钉主窗口" in err_s or "扫码" in err_s and "钉钉" in err_s:
+        return _pack(
+            "ERR-DT-301",
+            "钉钉还没打开或停留在扫码登录界面",
+            "程序找不到已经登录进聊天主界面的钉钉窗口。",
+            "1. 在电脑上点开钉钉并扫码登录，看到聊天列表主界面；\n2. 按键盘【F8】或点【已登录钉钉·继续发送】，刚截好的图片会直接发出。",
+            "优化钉钉托盘唤起与登录主窗口的识别类名",
+        )
+
+    if st == "dingtalk_search" or "未能自动搜到" in err_s or "没能定位到钉钉会话" in err_s:
+        tgt = extra.get("search_name") or "目标群聊"
+        return _pack(
+            "ERR-DT-303",
+            f"钉钉里没搜到「{tgt}」",
+            f"按 Ctrl+Shift+F 搜索「{tgt}」时没有直接进入聊天框，可能是群名有特殊符号或搜索被遮挡。",
+            "1. 去「钉钉投递」页核对目标群名是不是一字不差；\n2. 或者您直接在钉钉手动点开这个群窗口，再按【F9】直接贴图发送。",
+            f"优化钉钉搜索会话「{tgt}」时的焦点激活和群聊名称模糊匹配",
+        )
+
+    if (
+        st == "dingtalk_interrupted"
+        or isinstance(exc, DingTalkInterrupted)
+        or "自动暂停" in err_s
+        or "主动切换" in err_s
+        or "最小化" in err_s
+        or "关闭" in err_s
+        or "隐藏" in err_s
+        or "托盘" in err_s
+    ):
+        return _pack(
+            "ERR-DT-305",
+            "检测到您正在操作或已中途收起钉钉，已自动暂停避让",
+            "发送中途检测到您手动切换了其他窗口或收起了钉钉，软件先暂停以免误点错发；图片都安全保留着。",
+            "1. 忙完后无需手动找窗口，直接按键盘【F8】或点【继续未完成步骤 (F8)】，软件会自动唤醒钉钉接着发；\n2. 若您已手动点开要发的群，按【F9】可直接贴图继续。",
+            "调整钉钉前台窗口占用的检测灵敏度，避免最大化或重绘时误触发暂停",
+        )
+
+    if (st == "dingtalk_paste" or "钉钉" in err_s or "静音" in err_s or "搜索框" in err_s
+            or "光标" in err_s or "uia" in low):
+        return _pack(
+            "ERR-DT-304",
+            "钉钉粘贴图片、切输入焦点或点静音菜单卡住了",
+            "钉钉窗口最大化切换、焦点停在搜索框或弹出菜单层级变化，导致下一步动作没接上。",
+            "1. 点开钉钉里要发送的目标群聊天窗口，关闭遮挡小浮窗，点一下打字输入框；\n2. 按【F9】或点【直接粘贴重试】把已保存的图片直接贴进去继续；\n3. 如果每次最大化都报这个错，请点下方【复制修改指令】发给我处理。",
+            "检查钉钉窗口最大化后 send_dingtalk_image 与设为静音的定位和焦点校验逻辑",
+        )
+
+    # 5. WPS 相关错误码
+    if st == "wps_open" or "wps" in low and ("登录" in err_s or "超时" in err_s or "open" in low):
+        return _pack(
+            "ERR-WPS-201",
+            "WPS 在线表格打不开或扫码登录超时",
+            "金山文档链接没打开、网络卡顿或者需要重新扫码登录 WPS。",
+            "1. 去「记录账号」里核对 WPS 链接是不是最新地址；\n2. 在弹出的浏览器窗口里扫码登录后点【我已扫码·继续】。",
+            "延长 WPS 在线表格打开等待时间或兼容新版登录页面元素",
+        )
+
+    if st == "wps_paste" or "工作表" in err_s or "写入" in err_s:
+        tbl = extra.get("name") or "工作表"
+        return _pack(
+            "ERR-WPS-202",
+            f"往 WPS 的【{tbl}】写入数据时失败",
+            f"在表格底部没找到【{tbl}】标签页，或者表格当前只读/被弹窗挡住了。",
+            f"1. 打开 WPS 表格看底部是否有【{tbl}】标签、自己账号是否有编辑权限；\n2. 点开表格关闭弹窗后点【重试写入当前表】。",
+            f"检查切换 WPS【{tbl}】工作表标签或粘贴写入的稳定性",
+        )
+
+    if "预设" in err_s or "名称框" in err_s or "edit-box" in low:
+        return _pack(
+            "ERR-WPS-203",
+            "汇总表自动校准单元格（如 D2/L3/L4）没成功",
+            "往左上角名称框输入位置并写入固定值或日期时没有生效。",
+            "1. 检查「钉钉投递 -> 汇总表筛选预设校准」里填写的单元格位置（例如 D2/L3/L4）对不对；\n2. 确认您对数据汇总表有编辑权限（没有被锁定保护）。",
+            "优化 WPS 左上角名称框校准单元格及公式编辑栏写入回读逻辑",
+        )
+
+    if st == "wps_capture" or "截图" in err_s or "选区" in err_s or "复制为图片" in err_s or "画布" in err_s:
+        return _pack(
+            "ERR-WPS-204",
+            "WPS 汇总表选区截图或「复制为图片」失败",
+            "选中 C6:AK 后右键菜单没弹出“复制为图片”，或图表还没加载完。",
+            "1. 点【重试自动截图】再试一次；\n2. 也可以自己在弹出的表格里框选后右键「复制为图片」，再点【我已手动复制·发钉钉】。",
+            "优化汇总表选区定位、右键「复制为图片」与剪贴板等图超时阈值",
+        )
+
+    if "剪贴板" in err_s or "clipboard" in low or "uapg" in low:
+        return _pack(
+            "ERR-CLIP-205",
+            "系统剪贴板写入/读取被其他软件占用或编码异常",
+            "电脑上的剪贴板历史、翻译或录屏工具抢占了剪贴板，导致贴图/贴字没成功。",
+            "1. 暂时关掉抢占剪贴板的工具（如微信截图、剪贴板工具）后点重试；\n2. 如出现乱码（例如慕杰组变奇怪字母），请复制下方报错代码让我立即修复。",
+            "排查剪贴板写入竞争与 Win32 Unicode 编码传输问题",
+        )
+
+    # 6. Python 内部未预期代码异常（如 TypeError / AttributeError 等）
+    if ("nonetype" in low or "typeerror" in low or "attributeerror" in low
+            or "keyerror" in low or "indexerror" in low or isinstance(exc, (TypeError, AttributeError, KeyError, IndexError))):
+        return _pack(
+            "ERR-SYS-500",
+            "程序内部代码遇到空值或逻辑小漏洞",
+            f"这不是您操作的问题，是程序内部代码遇到了意外空值（原报错：{err_s[:80]}）。",
+            "1. 先点【重试】或重新打开软件看能否绕过；\n2. 强烈建议点击下方【复制给开发者的话】直接发给我，我可以对照位置一分钟帮您修好！",
+            f"修复【{err_s[:100]}】导致的内部逻辑异常",
+        )
+
+    return _pack(
+        "ERR-RUN-900",
+        "运行步骤中遇到意外阻断",
+        f"当前步骤执行没成功（原因：{err_s[:100] or '未知提示'}）。",
+        "1. 查看右侧/日志页红字提示，确认网络、WPS 和钉钉都在正常登录状态后重试；\n2. 搞不定可点【让 AI 分析】或【复制给开发者的话】发给我。",
+        f"排查并修复运行时异常「{err_s[:100]}」",
+    )
+
+
+_SHEETMATE_CODE_ARCHITECTURE = """【软件源码模块地图（E:\\cord\\SheetMate）】
+- 抓数与填表（auto_report.py）：run_once -> _run_once_impl -> download_xlsx -> xlsx_to_tsv -> _open_and_login_wps -> paste_to_wps
+- 汇总表校准与截图（auto_report.py）：_capture_summary_with_recovery -> switch_wps_sheet -> apply_wps_summary_presets -> apply_wps_update_timestamp -> 等待 wps_refresh_wait_sec -> capture_wps_region
+- 钉钉投递模块（auto_report.py）：send_dingtalk_image -> _send_one_target -> _enum_dingtalk_im_windows（过滤钉钉-文档）-> _restore_and_activate_hwnd（唤醒）-> 全局搜索（Ctrl+Shift+F）-> 等待 dt_paste_delay_sec -> 默认/防卡顿执行顺序（_do_paste_image_step / _do_paste_text_step / _do_toggle_silent_step）-> _enable_dingtalk_silent_send（_enable_dingtalk_silent_send_uia / _enable_dingtalk_silent_send_image）-> _commit_dingtalk_send（富文本补点发送按钮）
+- 智能复盘与前端联动（auto_report.py + ios_ui.py）：classify_error_detail -> build_historical_failure_diff_context -> recommend_pipeline_tuning_for_error -> build_antigravity_prompt -> ask_gemini_assistant / ios_ui._SheetMateController._on_runtime_state / apply_ai_tuning"""
+
+
+def _run_journal_path():
+    return app_dir() / "run_journal.jsonl"
+
+
+def _extract_log_traits(logs_lines):
+    """从单轮运行日志提取关键环境与行为特征，便于自动比较两次运行为何一次成功一次失败。"""
+    txt = "\n".join(str(x) for x in (logs_lines or []))
+    return {
+        "woke_from_min": ("最小化状态" in txt or "隐藏在后台托盘" in txt),
+        "minimized_at_end": ("已自动最小化钉钉窗口" in txt),
+        "used_uia_silent": ("已选择「静音发送」" in txt and "pywinauto-UIA" in txt),
+        "used_img_silent": ("pyautogui-图像匹配兜底" in txt),
+        "paste_retried": ("自动补粘" in txt),
+        "search_retried": ("搜索窗口没打开" in txt),
+    }
+
+
+def record_run_journal(cfg, status, mode="full", round_label="", error_detail=None, duration_sec=0, logs_tail=None):
+    """追加记录每次成功或受阻/失败的运行快照至 run_journal.jsonl（保留最近 100 条）。"""
+    try:
+        c = normalize_config(cfg if isinstance(cfg, dict) else {})
+        pt = c.get("pipeline_tuning") or {}
+        tail = list(logs_tail) if logs_tail is not None else _get_recent_logs_tail(45)
+        ed = error_detail if isinstance(error_detail, dict) else {}
+        entry = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": str(status or "ok"),
+            "mode": str(mode or "full"),
+            "round": str(round_label or ""),
+            "err_code": str(ed.get("code") or ""),
+            "err_title": str(ed.get("title") or ""),
+            "raw_error": str(ed.get("raw_error") or "")[:180],
+            "duration_sec": int(duration_sec or 0),
+            "traits": _extract_log_traits(tail),
+            "pipeline_cfg": {
+                "dt_paste_delay_sec": c.get("dt_paste_delay_sec", 3),
+                "dt_minimize_after_send": bool(c.get("dt_minimize_after_send", True)),
+                "compose_step_order": pt.get("compose_step_order", "image_text_silent"),
+                "silent_step_order": pt.get("silent_step_order", "uia_first"),
+                "wps_refresh_wait_sec": pt.get("wps_refresh_wait_sec", 5),
+            },
+            "log_excerpt": [str(x) for x in tail[-12:]],
+        }
+        p = _run_journal_path()
+        lines = []
+        if p.exists():
+            lines = [ln for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+        lines.append(json.dumps(entry, ensure_ascii=False))
+        lines = lines[-100:]
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return entry
+    except Exception:
+        return None
+
+
+def load_run_journal(limit=30):
+    """读取最近 N 条结构化运行日记（按时间由旧到新排序）。"""
+    p = _run_journal_path()
+    if not p.exists():
+        return []
+    out = []
+    try:
+        for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    out.append(obj)
+            except Exception:
+                pass
+    except Exception:
+        return []
+    return out[-max(1, int(limit)):]
+
+
+def parse_run_log_sessions(log_path=None, max_sessions=12):
+    """解析 run.log 尾部（最多 600 行），按轮次提取每轮成功/失败状态、错误码与关键特征。"""
+    p = Path(log_path) if log_path is not None else (app_dir() / "run.log")
+    if not p.exists():
+        return []
+    try:
+        raw_lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return []
+    lines = raw_lines[-600:]
+    sessions = []
+    cur = None
+
+    for ln in lines:
+        if "📊 开始第 " in ln or "📸 开始独立截图发送" in ln:
+            if cur is not None:
+                sessions.append(cur)
+            m_dt = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", ln)
+            m_tm = re.search(r"\[(\d{2}:\d{2}:\d{2})\]", ln)
+            start_t = m_dt.group(1) if m_dt else (m_tm.group(1) if m_tm else "")
+            m_rnd = re.search(r"开始(第\s*\S+\s*轮)", ln)
+            r_lbl = m_rnd.group(1) if m_rnd else ("独立截图" if "独立截图" in ln else "运行轮")
+            cur = {"start_time": start_t, "round": r_lbl, "lines": [ln]}
+        elif cur is not None:
+            cur["lines"].append(ln)
+
+    if cur is not None:
+        sessions.append(cur)
+
+    parsed = []
+    for s in sessions[-max(1, int(max_sessions)):]:
+        slines = s["lines"]
+        joined = "\n".join(slines)
+        errs = []
+        for c in re.findall(r"ERR-[A-Z]+-\d+", joined):
+            if c not in errs:
+                errs.append(c)
+        if "本轮全部完成" in joined or "截图发送已完成" in joined:
+            st = "ok"
+        elif errs or any(k in joined for k in ("失败", "受阻", "自动暂停", "手动停止")):
+            st = "err"
+        else:
+            st = "running"
+        parsed.append({
+            "start_time": s["start_time"],
+            "round": s["round"],
+            "status": st,
+            "err_codes": errs,
+            "traits": _extract_log_traits(slines),
+            "tail": slines[-8:],
+        })
+    return parsed
+
+
+def build_historical_failure_diff_context(cfg, error_detail=None, recent_logs=None):
+    """对比最近一次成功轮与本次/最近失败轮，自动提炼“为何上次能成、这次失败”的因果依据。"""
+    from collections import Counter
+
+    c = normalize_config(cfg if isinstance(cfg, dict) else {})
+    ed = error_detail if isinstance(error_detail, dict) else {}
+    cur_code = str(ed.get("code") or "")
+    journal = load_run_journal(30)
+    sessions = parse_run_log_sessions(max_sessions=12)
+
+    err_counts = Counter()
+    for s in sessions:
+        for ec in (s.get("err_codes") or []):
+            err_counts[ec] += 1
+    for j in journal:
+        ec = j.get("err_code")
+        if ec and not any(ec in (s.get("err_codes") or []) for s in sessions):
+            err_counts[ec] += 1
+    if cur_code and err_counts[cur_code] == 0:
+        err_counts[cur_code] = 1
+
+    ok_candidates = [
+        {"when": s.get("start_time") or s.get("round"), "traits": s.get("traits") or {}, "label": s.get("round") or "成功轮"}
+        for s in sessions if s.get("status") == "ok"
+    ]
+    if not ok_candidates:
+        ok_candidates = [
+            {"when": j.get("ts") or j.get("round"), "traits": j.get("traits") or {}, "label": j.get("round") or "成功轮"}
+            for j in journal if j.get("status") == "ok"
+        ]
+    latest_ok = ok_candidates[-1] if ok_candidates else None
+
+    curr_lines = list(recent_logs) if recent_logs else _get_recent_logs_tail(30)
+    curr_traits = _extract_log_traits(curr_lines)
+    curr_err_session = next((s for s in reversed(sessions) if s.get("status") == "err"), None)
+    if not curr_lines and curr_err_session:
+        curr_traits = curr_err_session.get("traits") or {}
+
+    parts = []
+    if latest_ok:
+        ok_t = latest_ok["traits"]
+        ok_desc = []
+        if ok_t.get("used_uia_silent"):
+            ok_desc.append("走 UIA 控件树顺利点了「设为静音」")
+        if ok_t.get("minimized_at_end"):
+            ok_desc.append("发完后执行了「自动最小化钉钉」")
+        if ok_t.get("woke_from_min"):
+            ok_desc.append("开头经历过最小化唤醒")
+        parts.append(
+            f"• 最近一次成功记录（{latest_ok['when']}）：{('；'.join(ok_desc)) if ok_desc else '全流程顺利发完'}。"
+        )
+    else:
+        parts.append("• 暂未检索到历史完整成功记录（本次为首次或较早日志已被滚动清理）。")
+
+    fail_desc = []
+    if curr_traits.get("woke_from_min"):
+        fail_desc.append("从最小化/托盘刚唤醒钉钉")
+    if curr_traits.get("search_retried"):
+        fail_desc.append("打开搜索窗重试过")
+    if curr_traits.get("paste_retried"):
+        fail_desc.append("贴图触发过画面无变化补粘")
+    if curr_traits.get("used_img_silent"):
+        fail_desc.append("UIA 没点到菜单后退到了图像兜底")
+    fail_tail_str = "；".join(fail_desc) if fail_desc else (ed.get("title") or "卡在当前投递/执行步")
+    parts.append(f"• 当前/最近失败特征（{cur_code or '运行受阻'}）：{fail_tail_str}。")
+
+    causal = []
+    ok_min_end = bool(latest_ok and (latest_ok.get("traits") or {}).get("minimized_at_end"))
+    if ok_min_end and (curr_traits.get("woke_from_min") or cur_code in ("ERR-DT-303", "ERR-DT-304", "ERR-DT-305")):
+        causal.append(
+            "因果链对比：第1次成功时钉钉处于可用态，但第1次结束触发了『发送后自动最小化钉钉』，"
+            "导致第2次必须从最小化唤醒、聊天框和菜单层级还在重绘加载时就紧接着搜索/贴图，因而卡住！"
+        )
+    elif curr_traits.get("woke_from_min") and c.get("dt_minimize_after_send", True):
+        causal.append(
+            "因果链对比：当前开启了『发送后最小化钉钉』，每次从最小化拉起后易导致搜索焦点或控件树延迟。"
+        )
+
+    if latest_ok and (latest_ok.get("traits") or {}).get("used_uia_silent") and (curr_traits.get("used_img_silent") or cur_code == "ERR-DT-304"):
+        causal.append(
+            "路径差异：上次成功时 UIA 直接命中了静音菜单第 2 项；这次控件树层级变化或菜单受焦点干扰未弹出，"
+            "退到图像匹配时又受 4K/深色模式影响没认出文字。"
+        )
+    if err_counts:
+        top_errs = ", ".join(f"{k}({v}次)" for k, v in err_counts.most_common(4))
+        causal.append(f"近期历史错误统计：{top_errs}。")
+
+    if causal:
+        parts.append("• " + " ".join(causal))
+    return "\n".join(parts)
+
+
+def recommend_pipeline_tuning_for_error(cfg, error_detail=None, hist_diff_text=""):
+    """根据当前错误码与历史对比，自动给出软件内部可直接切换的模块顺序与等待参数建议。"""
+    c = normalize_config(cfg if isinstance(cfg, dict) else {})
+    pt = c.get("pipeline_tuning") or {}
+    ed = error_detail if isinstance(error_detail, dict) else {}
+    code = str(ed.get("code") or "")
+    raw_low = f"{ed.get('raw_error') or ''} {hist_diff_text or ''}".lower()
+
+    patch = {}
+    reasons = []
+
+    if code == "ERR-DT-304":
+        if pt.get("compose_step_order") != "text_silent_image":
+            patch["compose_step_order"] = "text_silent_image"
+            reasons.append("改内部顺序：先把短文字贴进输入框激活底栏与「设为静音」，最后再贴大图防卡顿吞图")
+        cur_delay = int(c.get("dt_paste_delay_sec", 3))
+        if cur_delay < 5:
+            patch["dt_paste_delay_sec"] = min(20, max(5, cur_delay + 2))
+            reasons.append(f"粘贴前等待从 {cur_delay} 秒提高到 {patch['dt_paste_delay_sec']} 秒")
+        if any(k in raw_low for k in ("静音", "菜单", "send_arrow", "uia", "图像兜底", "qui")) and pt.get("silent_step_order") != "arrow_img_then_uia":
+            patch["silent_step_order"] = "arrow_img_then_uia"
+            reasons.append("改静音方式：直接用图像点开右下角箭头，再走控件树命中「设为静音」第 2 项")
+        if c.get("dt_minimize_after_send", True):
+            patch["dt_minimize_after_send"] = False
+            reasons.append("关闭「发送后最小化钉钉」，避免下轮冷唤醒重复卡住")
+    elif code in ("ERR-DT-305", "ERR-DT-303"):
+        if c.get("dt_minimize_after_send", True):
+            patch["dt_minimize_after_send"] = False
+            reasons.append("关闭「发送后最小化钉钉」，让钉钉保持就绪不再反复最小化还原")
+        cur_delay = int(c.get("dt_paste_delay_sec", 3))
+        if cur_delay < 4:
+            patch["dt_paste_delay_sec"] = 4
+            reasons.append("粘贴前等待提高到 4 秒，留足切换与搜索加载时间")
+    elif code in ("ERR-WPS-203", "ERR-WPS-204"):
+        cur_wps = int(pt.get("wps_refresh_wait_sec", 5))
+        if cur_wps < 8:
+            patch["wps_refresh_wait_sec"] = min(15, max(8, cur_wps + 3))
+            reasons.append(f"汇总表刷新等待从 {cur_wps} 秒提高到 {patch['wps_refresh_wait_sec']} 秒")
+
+    return {
+        "has_tuning": bool(patch),
+        "patch": patch,
+        "summary": "；".join(reasons) if reasons else "当前配置已是稳妥顺序，暂无需改动",
+        "reasons": reasons,
+    }
+
+
+def apply_recommended_tuning(cfg, patch):
+    """将推荐的模块顺序或等待秒数补丁安全合并写入配置并返回规范化后的最新配置。"""
+    import copy
+    base = normalize_config(cfg if isinstance(cfg, dict) else {})
+    p = copy.deepcopy(patch) if isinstance(patch, dict) else {}
+    pt = dict(base.get("pipeline_tuning") or {})
+    for k in ("compose_step_order", "silent_step_order", "paste_key_order", "wps_refresh_wait_sec"):
+        if k in p:
+            pt[k] = p[k]
+    base["pipeline_tuning"] = pt
+    if "dt_paste_delay_sec" in p:
+        base["dt_paste_delay_sec"] = p["dt_paste_delay_sec"]
+    if "dt_minimize_after_send" in p:
+        base["dt_minimize_after_send"] = bool(p["dt_minimize_after_send"])
+    return normalize_config(base)
+
+
+def build_antigravity_prompt(cfg, error_detail=None, hist_ctx_text="", recent_logs=None, ai_code_advice=""):
+    """自动整理可直接发给 Antigravity 改代码/调模块顺序的一体化精准提示词。"""
+    c = normalize_config(cfg if isinstance(cfg, dict) else {})
+    pt = c.get("pipeline_tuning") or {}
+    ed = error_detail if isinstance(error_detail, dict) and error_detail.get("code") else classify_error_detail(RuntimeError("运行异常"))
+    hist_txt = hist_ctx_text or build_historical_failure_diff_context(c, ed, recent_logs=recent_logs)
+    rec = recommend_pipeline_tuning_for_error(c, ed, hist_txt)
+    logs_excerpt = "\n".join(str(x) for x in (recent_logs or _get_recent_logs_tail(10))[-10:])
+    loc_str = ed.get("location") or "请结合报错步自查"
+    adv_line = f"\n- AI 补充结构建议：{ai_code_advice.strip()}" if str(ai_code_advice or "").strip() else ""
+
+    prompt_lines = [
+        f"我的「暗号表助手 v{APP_VERSION}」（目录：E:\\cord\\SheetMate）运行失败了，请你帮我对照代码和日志优化修复并重新打包：",
+        "",
+        "【1. 本次报错与位置】",
+        f"- 错误代码：{ed.get('code')}（{ed.get('title')}）",
+        f"- 报错原文：{ed.get('raw_error') or ed.get('plain_reason')}",
+        f"- 报错位置：{loc_str}",
+        f"- 当前投递顺序：{pt.get('compose_step_order')}｜静音顺序：{pt.get('silent_step_order')}｜粘贴前等待：{c.get('dt_paste_delay_sec', 3)}秒｜发后最小化：{'开' if c.get('dt_minimize_after_send', True) else '关'}",
+        "",
+        "【2. 历次成败对比（为什么以前能成、这次失败）】",
+        hist_txt,
+        "",
+        "【3. 相关源码模块与建议调整方向】",
+        "- 重点排查文件：E:\\cord\\SheetMate\\auto_report.py、E:\\cord\\SheetMate\\ios_ui.py",
+        "- 关键流程顺序：_capture_summary_with_recovery -> send_dingtalk_image -> _send_one_target -> _restore_and_activate_hwnd -> 搜索会话 -> _do_paste_image_step / _do_paste_text_step / _do_toggle_silent_step -> _enable_dingtalk_silent_send -> _commit_dingtalk_send",
+        f"- 软件自检调优建议：{rec.get('summary')}{adv_line}",
+    ]
+    if logs_excerpt:
+        prompt_lines.extend(["", "【4. 最近关键运行日志】", logs_excerpt])
+    prompt_lines.extend([
+        "",
+        "【5. 请 Antigravity 帮我做的事】",
+        "1) 分析上面“为什么上一轮成功而这一轮失败”的根本原因，直接帮我优化或调整相关函数模块的顺序和等待机制；",
+        "2) 改完后只运行无弹窗语法与静态检查，再用 --onedir 模式重新打包到 E:\\cord\\SheetMate\\dist（完整保留 config.json）；",
+        "3) 全程用通俗大白话告诉我改了哪几个模块、为什么这样调。",
+    ])
+    return "\n".join(prompt_lines)
+
+
+def _safe_ai_cfg_snapshot(cfg):
+    """提取脱敏配置摘要供 AI 诊断与优化建议（隐藏密码与 API Key）。"""
+    c = normalize_config(cfg if isinstance(cfg, dict) else {})
+    sp = c.get("summary_presets") or {}
+    return {
+        "version": APP_VERSION,
+        "day_mode": c.get("day_mode"),
+        "day": c.get("day"),
+        "night_enabled": c.get("night_enabled"),
+        "night": c.get("night"),
+        "enable_capture": c.get("enable_capture"),
+        "enable_dingtalk": c.get("enable_dingtalk"),
+        "dt_silent_send": c.get("dt_silent_send"),
+        "dt_auto_send": c.get("dt_auto_send"),
+        "dt_minimize_after_send": c.get("dt_minimize_after_send"),
+        "dt_paste_delay_sec": c.get("dt_paste_delay_sec", 3),
+        "pipeline_tuning": c.get("pipeline_tuning"),
+        "dt_targets_count": len([t for t in (c.get("dt_targets") or []) if t.get("enabled", True)]),
+        "dt_time_mode": c.get("dt_time_mode"),
+        "dt_date_fmt": c.get("dt_date_fmt"),
+        "dt_day_offset": c.get("dt_day_offset"),
+        "dt_cutoff": {
+            "enabled": c.get("dt_cutoff_enabled"),
+            "hm": c.get("dt_cutoff_hm"),
+            "before_offset": c.get("dt_before_cutoff_offset"),
+        },
+        "summary_presets_enabled": sp.get("enabled"),
+        "summary_presets_cells": [
+            {k: it.get(k) for k in ("cell", "label", "action", "day_offset", "cutoff_enabled", "cutoff_hm", "before_cutoff_offset", "enabled")}
+            for it in (sp.get("items") or [])
+        ],
+        "update_time_cell": c.get("update_time_cell"),
+        "ai_auto_heal": bool((c.get("ai_assistant") or {}).get("auto_heal", True)),
+        "point_overrides_count": len(c.get("point_overrides") or {}),
+    }
+
+
+def _local_ai_fallback_reply(mode, err_detail, cfg_snap, question="", hist_ctx="", ag_prompt="", tuning_rec=None):
+    """本地内置分析兜底：给出结合历史成败对比与排障思路的大白话诊断。"""
+    if mode == "suggest":
+        tips = []
+        if not cfg_snap.get("enable_dingtalk"):
+            tips.append("• 当前「自动发送到钉钉」开关是关闭的，正式自动值守前记得去【钉钉投递】打开它。")
+        if cfg_snap.get("enable_dingtalk") and not cfg_snap.get("dt_auto_send"):
+            tips.append("• 「粘贴后自动按 Enter 发送」目前关闭，脚本会在贴好截图后停下等您手动敲回车；若要无人值守全自动发送，记得打开它。")
+        if cfg_snap.get("dt_minimize_after_send", True):
+            tips.append("• 当前开启了「发送后最小化钉钉」，第1次发完收起后第2次唤醒最容易因为聊天框未加载完而卡住，建议关闭它。")
+        d2 = next((x for x in (cfg_snap.get("summary_presets_cells") or []) if x.get("cell") == "D2"), None)
+        if d2 and not d2.get("cutoff_enabled"):
+            tips.append("• 如果您有凌晨班次（比如早上 9 点前要发昨天数据），建议在 D2 的「自动日期」下打开【跨天凌晨分界点】，设定时间点前自动减 1 天。")
+        if not tips:
+            tips.append("• 当前时段排期、汇总表预设校准与静音设置搭配很合理！")
+        return (
+            "（当前处于本地内置分析模式）\n"
+            "【配置体检建议】\n" + "\n".join(tips)
+        )
+
+    ed = err_detail if isinstance(err_detail, dict) and err_detail.get("code") else classify_error_detail(Exception(question or "运行检查"))
+    hist_show = hist_ctx or "暂未检索到足够的历次成功/失败对比日志。"
+    tune_line = (tuning_rec or {}).get("summary") or "您可以先按上方卡片步骤检查窗口焦点再重试。"
+    ag_tip = "下方已自动生成好发给开发协作的完整参考说明，直接点【复制指令】即可。"
+    return (
+        f"（内置智能分析｜状态码 {ed.get('code')}）\n"
+        f"### ① 这次到底为什么卡住了？\n{ed.get('plain_reason')}\n\n"
+        f"### ② 为什么之前能成功，这次却失败了？（历史对比）\n{hist_show}\n\n"
+        f"### ③ 软件自己怎么调执行顺序马上好？\n{tune_line}\n（可直接点上面「一键按 AI 建议自调顺序并重试」立即生效）\n\n"
+        f"### ④ 怎么跟 Antigravity 沟通改源码？\n{ag_tip}\n{ed.get('self_fix')}"
+    )
+
+
+def build_ai_summary_styles(focus_team=""):
+    """按用户当前指定的关注组名动态构建 AI 总结风格模板（留空则公平横向总结全部团队，不再硬编码单一组名）。"""
+    ft = str(focus_team or "").strip()
+    if ft:
+        brief_desc = f"80字内3~4行：总数据 + 前三名 + {ft}情况，最适合随图发群"
+        brief_prompt = f"请只输出 3~4 行极简战报，总字数控制在 80 字以内：1) 总数据与当前时间段盘面；2) 排名前三人员及核心数值；3) 【{ft}】整体数据及简短一句冲刺提示。不要多余客套话，适合直接附在钉钉截图下方。"
+        team_name = f"{ft}专项点评"
+        team_desc = f"重点对比【{ft}】与其他小组占总比及组内成员高低产出点评"
+        team_prompt = f"请重点聚焦【{ft}】复盘点评：1) 【{ft}】的总暗号/注册数据、名次与占总盘比例，以及和前一名组的差距；2) 点名该组或盘面内高产出人员与待冲刺跟进人员；3) 给出 1 条接地气的提升建议。"
+        boss_team = f"（重点含【{ft}】）"
+    else:
+        brief_desc = "80字内3~4行：总数据 + 个人前三 + 团队榜首情况，最适合随图发群"
+        brief_prompt = "请只输出 3~4 行极简战报，总字数控制在 80 字以内：1) 总数据与当前时间段盘面；2) 个人排名前三及核心数值；3) 领跑小组与中后段组分布及简短冲刺提示。不要多余客套话，适合直接附在钉钉截图下方。"
+        team_name = "各团队横向点评"
+        team_desc = "公平对比所有参与计算小组的总产出、名次差距及各组亮点"
+        team_prompt = "请对【所有参与计算的团队】进行横向复盘点评：1) 列出各组总暗号/注册数据、排名次序及占总盘比例；2) 点出表现最亮眼的小组与待追赶小组的关键差距；3) 给出 1~2 条可落地的整体提升建议。"
+        boss_team = "与各团队"
+    return {
+        "brief": {
+            "name": "群极简战报",
+            "desc": brief_desc,
+            "prompt": brief_prompt,
+        },
+        "mujie": {
+            "name": team_name,
+            "desc": team_desc,
+            "prompt": team_prompt,
+        },
+        "funnel": {
+            "name": "转化率排查版",
+            "desc": "看搜索量/暗链/注册比例，揪出高曝光低转化项与素材异常",
+            "prompt": "请做运营转化率与异常排查总结：重点对比「搜索人数 -> 暗链/暗号 -> 注册数据」的转化比率，挑出搜索较高但注册偏低的 2~3 位成员或素材类别，给出一条可落地的调整建议。",
+        },
+        "delta": {
+            "name": "较上轮增量对比",
+            "desc": "对比当前最新图与上一张历史图，算出这两小时谁涨得最快",
+            "prompt": "请对比最新这张汇总表截图与前面一张历史截图的差异：重点写出 1) 总盘数据增加了多少；2) 这段时间内涨幅最快的前三名人员与增量；3) 近一轮几乎无新增需要提醒的小伙伴。",
+        },
+        "boss": {
+            "name": "领导一分钟汇报",
+            "desc": "规范三段式：整体盘面 / 核心亮点与各组表现 / 下一步重点",
+            "prompt": f"请按规范简洁的三段式输出管理汇报：【一、整体盘面】概括总数据与注册/短链整体表现；【二、核心亮点与团队】列明前三名{boss_team}表现；【三、下一步动作】写出 1~2 条具体跟进安排。",
+        },
+    }
+
+
+def get_candidate_teams(cfg=None):
+    """综合当前表格配置小组名单与历次存档榜单，提取全部不重复组名供筛选与骰子随机抽取。"""
+    c = normalize_config(cfg if isinstance(cfg, dict) else {})
+    teams = []
+
+    def _add(raw):
+        for part in re.split(r"[,，、;；\n]+", str(raw or "")):
+            s = part.strip()
+            if s and s not in teams and ("组" in s or len(s) >= 2):
+                teams.append(s)
+
+    for it in ((c.get("summary_presets") or {}).get("items") or []):
+        if isinstance(it, dict) and str(it.get("cell") or "").upper() in ("L3", "L4"):
+            _add(it.get("value"))
+    try:
+        for rec in load_report_archive(limit=10):
+            for t in (rec.get("teams") or []):
+                _add(t.get("team"))
+    except Exception:
+        pass
+    for k in _KNOWN_TEAM_NAMES:
+        _add(k)
+    return teams
+
+
+AI_SUMMARY_STYLES = build_ai_summary_styles("")
+
+
+def _call_openai_compat_generate(api_base, api_key, model_name, sys_prompt, contents, temperature=0.4, max_tokens=900, timeout_sec=24):
+    """OpenAI 兼容格式通用调度器（支持多模态图片与纯文本，对外彻底隐藏底层供应商信息）。"""
+    base = str(api_base or "").strip().rstrip("/")
+    if not base:
+        return {"ok": False, "source": "no_base", "model": "", "error": "未填兼容接口地址"}
+    url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+    key = str(api_key or "").strip()
+    if not key:
+        return {"ok": False, "source": "no_key", "model": "", "error": "接口密钥未配置"}
+    mdl = str(model_name or "gpt-4o-mini").strip()
+
+    msgs = [{"role": "system", "content": sys_prompt}]
+    for item in (contents or []):
+        role = "assistant" if item.get("role") == "model" else "user"
+        parts = item.get("parts") or []
+        has_img = any(isinstance(p, dict) and p.get("inlineData") for p in parts)
+        if has_img:
+            o_parts = []
+            for p in parts:
+                if not isinstance(p, dict):
+                    continue
+                if p.get("text"):
+                    o_parts.append({"type": "text", "text": str(p["text"])})
+                elif isinstance(p.get("inlineData"), dict):
+                    mime = p["inlineData"].get("mimeType") or "image/png"
+                    b64 = p["inlineData"].get("data") or ""
+                    if b64:
+                        o_parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            msgs.append({"role": role, "content": o_parts})
+        else:
+            txt = "\n".join(str(p.get("text") or "") for p in parts if isinstance(p, dict) and p.get("text")).strip()
+            if txt:
+                msgs.append({"role": role, "content": txt})
+
+    payload = {
+        "model": mdl,
+        "messages": msgs,
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+    }
+    body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ssl_ctx = ssl.create_default_context()
+    req = urllib.request.Request(
+        url,
+        data=body_bytes,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}",
+            "User-Agent": f"SheetMate/{APP_VERSION}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl_ctx) as resp:
+            raw = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        choices = raw.get("choices") or []
+        if not choices:
+            return {"ok": False, "source": "network_error", "model": "", "error": "云端返回结果为空"}
+        content = ((choices[0].get("message") or {}).get("content")) or ""
+        if isinstance(content, list):
+            content = "".join(str(x.get("text") or "") for x in content if isinstance(x, dict))
+        answer = str(content).strip()
+        if answer:
+            return {"ok": True, "source": "ai_cloud", "model": "", "reply": answer}
+        return {"ok": False, "source": "network_error", "model": "", "error": "云端返回内容为空"}
+    except urllib.error.HTTPError as he:
+        err_body = he.read().decode("utf-8", errors="ignore")[:180]
+        return {"ok": False, "source": "network_error", "model": "", "error": f"HTTP {he.code}: {err_body}"}
+    except Exception as exc:
+        return {"ok": False, "source": "network_error", "model": "", "error": str(exc)[:180]}
+
+
+def _sanitize_ai_reply_brands(text):
+    """兜底清洗云端模型回复中偶发复述的外部厂商/大模型名称。"""
+    s = str(text or "")
+    for pat, rep in (
+        (r"https?://generativelanguage\.googleapis\.com\S*", "内置专属服务通道"),
+        (r"\bGoogle\s*Gemini(?:\s*[A-Za-z0-9.\-]+)?\b", "外部通用大模型"),
+        (r"\bGoogle\b", "外部服务商"),
+        (r"\bGemini(?:\s*[A-Za-z0-9.\-]+)?\b", "外部通用模型"),
+        (r"\bChatGPT\b|\bGPT-[0-9A-Za-z.\-]+\b|\bGPT\b|\bOpenAI\b", "外部大模型"),
+        (r"\bDeepSeek\b|\bClaude\b", "外部模型"),
+        (r"谷歌", "外部"),
+    ):
+        s = re.sub(pat, rep, s, flags=re.IGNORECASE)
+    return s
+
+
+def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens=900, timeout_sec=22):
+    """底层统一云端智能接口调度器（支持管理员切换不同服务接口，对外严格隐藏厂商与模型信息）。"""
+    norm = normalize_config(cfg if isinstance(cfg, dict) else {})
+    ai_cfg = norm.get("ai_assistant") or {}
+    if not ai_cfg.get("enabled", True):
+        return {"ok": False, "source": "disabled", "model": "", "error": "智能助手开关当前已关闭"}
+
+    provider = str(ai_cfg.get("provider") or "gemini").strip().lower()
+    if provider == "local_only":
+        return {"ok": False, "source": "local_only", "model": "", "error": "当前设置为仅使用内置本地分析引擎"}
+
+    api_base = str(ai_cfg.get("api_base") or "").strip().rstrip("/")
+    api_key = str(ai_cfg.get("api_key") or DEFAULT_GEMINI_API_KEY).strip()
+    pref_m = str(ai_cfg.get("model") or GEMINI_MODEL_CANDIDATES[0]).strip()
+
+    if provider == "openai_compat" or (api_base and "googleapis.com" not in api_base.lower()):
+        res_oc = _call_openai_compat_generate(
+            api_base=api_base or "https://api.openai.com/v1",
+            api_key=api_key,
+            model_name=pref_m,
+            sys_prompt=sys_prompt,
+            contents=contents,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+        )
+        if res_oc.get("ok") and res_oc.get("reply"):
+            res_oc["reply"] = _sanitize_ai_reply_brands(res_oc["reply"])
+        return res_oc
+
+    if not api_key:
+        return {"ok": False, "source": "no_key", "model": "", "error": "云端接口暂未配置"}
+
+    models_to_try = []
+    for m in (pref_m, *GEMINI_MODEL_CANDIDATES):
+        clean_m = m.replace("models/", "").strip()
+        if clean_m and clean_m not in models_to_try:
+            models_to_try.append(clean_m)
+
+    payload = {
+        "systemInstruction": {"parts": [{"text": sys_prompt}]},
+        "contents": contents,
+        "generationConfig": {"temperature": float(temperature), "maxOutputTokens": int(max_tokens)},
+    }
+    body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ssl_ctx = ssl.create_default_context()
+    last_err = ""
+    base_host = api_base or "https://generativelanguage.googleapis.com"
+
+    for model_name in models_to_try:
+        url = f"{base_host}/v1beta/models/{model_name}:generateContent?key={api_key}"
+        req = urllib.request.Request(
+            url,
+            data=body_bytes,
+            headers={"Content-Type": "application/json", "User-Agent": f"SheetMate/{APP_VERSION}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl_ctx) as resp:
+                raw = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            cands = raw.get("candidates") or []
+            if not cands:
+                last_err = "云端返回候选结果为空"
+                continue
+            parts = ((cands[0].get("content") or {}).get("parts")) or []
+            texts = [str(p.get("text") or "") for p in parts if isinstance(p, dict) and not p.get("thought") and p.get("text")]
+            answer = "".join(texts).strip()
+            if answer:
+                return {"ok": True, "source": "ai_cloud", "model": "", "reply": _sanitize_ai_reply_brands(answer)}
+            last_err = "云端返回文本为空"
+        except urllib.error.HTTPError as he:
+            err_body = he.read().decode("utf-8", errors="ignore")[:180]
+            last_err = f"HTTP {he.code}: {err_body}"
+            if he.code in (400, 401, 403):
+                break
+        except Exception as e:
+            last_err = str(e)[:180]
+
+    return {"ok": False, "source": "network_error", "model": "", "error": last_err}
+
+
+def _encode_image_b64_scaled(img_path, max_dim=3072):
+    """读取图片等比高清缩放后转为 PNG base64，保障超宽数据汇总表文字数字清晰可辨。"""
+    import base64
+    im = Image.open(img_path).convert("RGB")
+    try:
+        if max(im.width, im.height) > max_dim:
+            ratio = max_dim / float(max(im.width, im.height))
+            im = im.resize((max(1, int(im.width * ratio)), max(1, int(im.height * ratio))), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="PNG", optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    finally:
+        im.close()
+
+
+_SHEETMATE_AI_KNOWLEDGE = """【软件身份与核心功能说明书】
+- 身份：你是「暗号表助手 (SheetMate)」专属内置的萌宠小助手与运营数据分析伙伴。
+- 设计研发者：【Soren Drake】（如用户询问谁设计的、谁开发的、作者是谁，明确回答由 Soren Drake 设计研发）。
+- 绝对保密边界：
+  1) 严禁向外透露或自称任何外部 AI 厂商、大模型名称或 API 接口协议（如不要说自己是哪家公司的大模型，统一自称「暗号表助手专属内置智能伙伴」）；
+  2) 没有任何读取、查看或访问管理员密码/口令、权限控制、隐藏管理界面、他人隐私聊天记录或接口密钥的能力；遇到相关提问必须礼貌拒绝并说明“没有读取与访问权限”。
+- 我能做什么：
+  1) 全自动抓数填表发群：自动登录 Luya 数据后台下载「暗号数据」「注册数据」「短链数据」，转为 TSV 后写入 WPS 在线表格；
+  2) 自定义任意单元格写入：在「钉钉投递 -> 汇总表筛选预设校准」中点击快捷格位胶囊或「+ 新增位置」，可为任意工作表（如数据汇总/团队成员/看板）的任意格位（如 D2/D4:E4/F2/H4/I4/L3/L4/S4）自由定义：自动日期（支持跨天凌晨自动减天）、当前时间、自定义文字、Excel 公式或清空；
+  3) 自然语言直接改排期：用户可直接说“帮我设置每周一到周五 9点到18点每2小时把昨天数据发送到 XX群”，我会自动修改软件设置并列出核对清单让用户确认对不对；
+  4) 钉钉稳妥投递：自动探测当前电脑分辨率、DPI 缩放与深色模式适配方案，支持多群顺序投递、防卡顿直通搜索、无坐标静音发送、富文本发送按钮补发，并在粘贴操作期间全屏提示勿动键鼠；
+  5) AI 看图自愈与档案记忆：遇错自动弹窗给出 ERR 错误码大白话解决方案，支持「遇错 AI 自动看图自愈」先截屏调整现场并续跑，还能自动对比历次成功/失败原因、调整内部模块顺序并生成改代码指令；同时每轮将表格数字与排行归档到本地 `report_archive.jsonl`，公平对比各团队与个人数据。
+  6) 全球跨网远程沟通站点（https://sorenskr.github.io/SheetMate/）：无论身在何处，用手机或电脑打开该网址并输入本机【唯一名字】与访问密码（默认 Qq@112233），即可跨网加密对话、触发自动跑表及发钉钉，内容与本机实时双向同步。
+- 常用快捷键：运行中按 【F8】 随时暂停或继续未完成步骤；按 【F9】 在已手动打开的目标群聊窗口直接贴图继续。""" + "\n" + _SHEETMATE_CODE_ARCHITECTURE
+
+_KNOWN_TEAM_NAMES = ("慕杰组", "潘立浩组", "宋磊组", "刘全泉组", "李俊鑫组", "江峰组", "娄慧珍组")
+_last_captured_summary_tsv = ""
+_last_archive_sig = ""
+
+
+def _archive_file_path():
+    return app_dir() / "report_archive.jsonl"
+
+
+def _to_float_safe(raw):
+    try:
+        s = re.sub(r"[^0-9.\-]", "", str(raw or "").strip())
+        return float(s) if s not in ("", "-", ".") else None
+    except Exception:
+        return None
+
+
+def parse_summary_tsv_snapshot(summary_tsv="", report_dir=None):
+    """从 WPS 数据汇总表选区 TSV 与桌面三份明细表中提取结构化个人/团队/素材指标。"""
+    rep_dir = Path(report_dir) if report_dir is not None else (Path.home() / "Desktop" / "数据日报")
+    personal_map = {}
+    teams_map = {}
+    summary_totals = []
+
+    def _clean_cell(c):
+        return str(c or "").replace("\r", "").replace("\n", " ").strip()
+
+    for raw_ln in str(summary_tsv or "").splitlines():
+        cols = [_clean_cell(c) for c in raw_ln.split("\t")]
+        if not any(cols):
+            continue
+
+        # 1) 提取左侧「数据明细」个人行：名次(数字) | 姓名 | 明细 | 暗号数量 | 暗号+短链 | 注册 | 占总比
+        if len(cols) >= 6 and re.fullmatch(r"\d{1,3}", cols[0]) and re.fullmatch(r"[\u4e00-\u9fff]{2,5}", cols[1]):
+            nm = cols[1]
+            entry = personal_map.setdefault(nm, {"name": nm})
+            entry["rank_detail"] = int(cols[0])
+            if cols[2]:
+                entry["detail"] = cols[2][:90]
+            if len(cols) > 4 and cols[4]:
+                v = _to_float_safe(cols[4])
+                if v is not None:
+                    entry["cipher_link_total"] = v
+            if len(cols) > 5 and cols[5]:
+                v = _to_float_safe(cols[5])
+                if v is not None:
+                    entry["reg_total"] = v
+            if len(cols) > 6 and "%" in cols[6]:
+                entry["share"] = cols[6]
+
+        # 2) 提取「团队全部暗号数据情况」以及「注册数据排行」区块（列偏移兼容动态合并列）
+        for ci, cell in enumerate(cols):
+            if not cell:
+                continue
+            # 识别团队行：独立团队名，且不带逗号名单，后面紧跟数字指标
+            if (
+                "," not in cell
+                and "、" not in cell
+                and (cell in _KNOWN_TEAM_NAMES or re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9]{1,8}组", cell))
+            ):
+                tail = [c for c in cols[ci + 1:ci + 7] if c]
+                nums = [_to_float_safe(t) for t in tail[:3]]
+                if any(v is not None for v in nums[:2]):
+                    t_item = teams_map.setdefault(cell, {"team": cell})
+                    if ci >= 1 and re.fullmatch(r"\d{1,2}", cols[ci - 1]):
+                        t_item["rank"] = int(cols[ci - 1])
+                    if nums[0] is not None:
+                        t_item["cipher_score"] = nums[0]
+                    if len(nums) > 1 and nums[1] is not None:
+                        t_item["reg_total"] = nums[1]
+                    if len(tail) > 2:
+                        t_item["detail"] = " | ".join(tail[2:5])[:120]
+
+            # 识别注册排行区块：名次 + 中文姓名 + 明细 + 搜索人数 + 暗链/暗号 + 华人注册
+            if (
+                ci >= 6
+                and re.fullmatch(r"\d{1,3}", cell)
+                and ci + 1 < len(cols)
+                and re.fullmatch(r"[\u4e00-\u9fff]{2,5}", cols[ci + 1])
+                and "名次" not in cell
+            ):
+                nm = cols[ci + 1]
+                entry = personal_map.setdefault(nm, {"name": nm})
+                entry["rank_reg"] = int(cell)
+                sub = cols[ci + 2:ci + 7]
+                if len(sub) >= 1 and sub[0]:
+                    entry.setdefault("top_code", sub[0][:40])
+                if len(sub) >= 2 and _to_float_safe(sub[1]) is not None:
+                    entry["search_users"] = _to_float_safe(sub[1])
+                if len(sub) >= 3 and _to_float_safe(sub[2]) is not None:
+                    entry["cipher_link_rank_val"] = _to_float_safe(sub[2])
+                if len(sub) >= 4 and _to_float_safe(sub[3]) is not None:
+                    entry["cn_reg"] = _to_float_safe(sub[3])
+
+        if any(k in raw_ln for k in ("总计", "单日所有数据", "各团队不同素材折算")):
+            compact_row = " | ".join(c for c in cols if c)[:160]
+            if compact_row and compact_row not in summary_totals:
+                summary_totals.append(compact_row)
+
+    personal_list = sorted(
+        personal_map.values(),
+        key=lambda x: (
+            int(x.get("rank_reg", 9999)),
+            int(x.get("rank_detail", 9999)),
+            -(float(x.get("cn_reg") or x.get("reg_total") or 0)),
+        ),
+    )
+    teams_list = sorted(
+        teams_map.values(),
+        key=lambda x: (int(x.get("rank", 999)), -(float(x.get("cipher_score") or 0))),
+    )
+
+    daily_reg = []
+    top_keywords = []
+    top_channels = []
+    if rep_dir.exists():
+        reg_p = rep_dir / "注册数据.tsv"
+        if reg_p.exists():
+            try:
+                lines = [ln for ln in reg_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+                for ln in lines[1:9]:
+                    ps = ln.split("\t")
+                    if len(ps) >= 4:
+                        daily_reg.append({
+                            "date": ps[0][:10].strip(),
+                            "total": _to_float_safe(ps[1]),
+                            "cn": _to_float_safe(ps[2]),
+                            "ratio": _to_float_safe(ps[3]),
+                        })
+            except Exception:
+                pass
+        kw_p = rep_dir / "暗号数据.tsv"
+        if kw_p.exists():
+            try:
+                lines = [ln for ln in kw_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+                latest_d = lines[1].split("\t")[0].strip() if len(lines) > 1 else ""
+                for ln in lines[1:]:
+                    ps = ln.split("\t")
+                    if len(ps) >= 4 and (not latest_d or ps[0].strip() == latest_d):
+                        top_keywords.append({
+                            "keyword": ps[1].strip(),
+                            "search": _to_float_safe(ps[2]),
+                            "cn_search": _to_float_safe(ps[3]),
+                        })
+                        if len(top_keywords) >= 15:
+                            break
+            except Exception:
+                pass
+        ch_p = rep_dir / "短链数据.tsv"
+        if ch_p.exists():
+            try:
+                lines = [ln for ln in ch_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+                latest_d = lines[1].split("\t")[0].strip() if len(lines) > 1 else ""
+                for ln in lines[1:]:
+                    ps = ln.split("\t")
+                    if len(ps) >= 4 and (not latest_d or ps[0].strip() == latest_d):
+                        top_channels.append({
+                            "channel": ps[1].strip() or "(直达/空渠道)",
+                            "total": _to_float_safe(ps[2]),
+                            "cn": _to_float_safe(ps[3]),
+                        })
+                        if len(top_channels) >= 15:
+                            break
+            except Exception:
+                pass
+
+    return {
+        "personal": personal_list[:60],
+        "teams": teams_list[:15],
+        "summary_totals": summary_totals[:6],
+        "daily_reg": daily_reg,
+        "top_keywords": top_keywords,
+        "top_channels": top_channels,
+    }
+
+
+def build_round_change_spotlight(prev_rec, curr_rec, focus_team=""):
+    """每次数据粘贴/截图归档完成后，对比上一轮档案并生成有温度的数据变化播报。"""
+    curr = curr_rec if isinstance(curr_rec, dict) else {}
+    prev = prev_rec if isinstance(prev_rec, dict) else None
+    lines = []
+
+    def _fmt_num(v):
+        if v is None:
+            return "—"
+        return str(int(v)) if abs(float(v) - round(float(v))) < 1e-6 else f"{float(v):.1f}"
+
+    def _sum_personal_cipher(rec):
+        total_c = 0.0
+        has_any = False
+        for it in (rec.get("personal") or []):
+            v = it.get("cipher_link_total")
+            if v is not None:
+                total_c += float(v)
+                has_any = True
+        return total_c if has_any else None
+
+    c_regs = curr.get("daily_reg") or []
+    c_reg0 = c_regs[0] if c_regs else {}
+    c_tot = c_reg0.get("total")
+    c_cn = c_reg0.get("cn")
+    c_ciph = _sum_personal_cipher(curr)
+
+    if prev is None:
+        if c_tot is not None or c_cn is not None:
+            lines.append(f"• 当前总注册：**{_fmt_num(c_tot)}**，华人注册：**{_fmt_num(c_cn)}**" + (f"（明细合计暗号+短链 **{_fmt_num(c_ciph)}**）" if c_ciph is not None else ""))
+        p_top = (curr.get("personal") or [])[:3]
+        if p_top:
+            lines.append("• 本轮前列成员：" + "、".join(f"{x.get('name')}(注册 {_fmt_num(x.get('cn_reg') or x.get('reg_total'))})" for x in p_top))
+        txt = "本轮表格数据已更新就绪！这是首份基准记录，后面每轮对比都会告诉您具体涨跌：\n" + ("\n".join(lines) if lines else "已记录最新盘面快照，随时可以让我帮您分析~")
+        return {
+            "time": curr.get("time_str") or time.strftime("%H:%M:%S"),
+            "round": curr.get("round") or "最新",
+            "has_delta": False,
+            "summary_line": f"数据已更新：{lines[0]}" if lines else "已记录首轮基准数据",
+            "reply": txt,
+        }
+
+    p_regs = prev.get("daily_reg") or []
+    p_reg0 = p_regs[0] if p_regs else {}
+    p_tot = p_reg0.get("total")
+    p_cn = p_reg0.get("cn")
+    p_ciph = _sum_personal_cipher(prev)
+
+    any_change = False
+    if c_tot is not None and p_tot is not None:
+        d = c_tot - p_tot
+        if abs(d) >= 1e-6:
+            any_change = True
+            sign = f"+{_fmt_num(d)}" if d > 0 else _fmt_num(d)
+            lines.append(f"• **总注册**：从 **{_fmt_num(p_tot)}** 变成了 **{_fmt_num(c_tot)}**（{sign}）")
+        else:
+            lines.append(f"• **总注册**：维持 **{_fmt_num(c_tot)}**（较上轮持平）")
+
+    if c_cn is not None and p_cn is not None:
+        d_cn = c_cn - p_cn
+        if abs(d_cn) >= 1e-6:
+            any_change = True
+            sign = f"+{_fmt_num(d_cn)}" if d_cn > 0 else _fmt_num(d_cn)
+            lines.append(f"• **华人注册**：从 **{_fmt_num(p_cn)}** 变成了 **{_fmt_num(c_cn)}**（{sign}）")
+
+    if c_ciph is not None and p_ciph is not None:
+        d_c = c_ciph - p_ciph
+        if abs(d_c) >= 1e-6:
+            any_change = True
+            sign = f"+{_fmt_num(d_c)}" if d_c > 0 else _fmt_num(d_c)
+            lines.append(f"• **全盘暗号+短链合计**：从 **{_fmt_num(p_ciph)}** 变成了 **{_fmt_num(c_ciph)}**（{sign}）")
+
+    # 个人对比变化
+    prev_p_map = {str(x.get("name") or ""): x for x in (prev.get("personal") or []) if x.get("name")}
+    p_deltas = []
+    for cur_p in (curr.get("personal") or []):
+        nm = str(cur_p.get("name") or "")
+        if not nm or nm not in prev_p_map:
+            continue
+        old_p = prev_p_map[nm]
+        nr = cur_p.get("cn_reg") if cur_p.get("cn_reg") is not None else cur_p.get("reg_total")
+        orr = old_p.get("cn_reg") if old_p.get("cn_reg") is not None else old_p.get("reg_total")
+        nc = cur_p.get("cipher_link_total")
+        oc = old_p.get("cipher_link_total")
+        dr = (float(nr) - float(orr)) if (nr is not None and orr is not None) else 0.0
+        dc = (float(nc) - float(oc)) if (nc is not None and oc is not None) else 0.0
+        if abs(dr) >= 1e-6 or abs(dc) >= 1e-6:
+            any_change = True
+            segs = []
+            if abs(dr) >= 1e-6:
+                segs.append(f"注册 {_fmt_num(orr)}→{_fmt_num(nr)}({'+' if dr > 0 else ''}{_fmt_num(dr)})")
+            if abs(dc) >= 1e-6:
+                segs.append(f"暗号短链 {_fmt_num(oc)}→{_fmt_num(nc)}({'+' if dc > 0 else ''}{_fmt_num(dc)})")
+            p_deltas.append((dr * 10 + dc, f"  - **{nm}**：{'，'.join(segs)}"))
+
+    if p_deltas:
+        p_deltas.sort(key=lambda x: -abs(x[0]))
+        lines.append("• **个人数值变化亮点**：\n" + "\n".join(x[1] for x in p_deltas[:4]))
+
+    # 团队对比变化
+    prev_t_map = {str(x.get("team") or ""): x for x in (prev.get("teams") or []) if x.get("team")}
+    t_deltas = []
+    ft = str(focus_team or "").strip()
+    for cur_t in (curr.get("teams") or []):
+        tm = str(cur_t.get("team") or "")
+        if not tm or tm not in prev_t_map:
+            continue
+        old_t = prev_t_map[tm]
+        ns, os_ = cur_t.get("cipher_score"), old_t.get("cipher_score")
+        nr_t, or_t = cur_t.get("reg_total"), old_t.get("reg_total")
+        ds = (float(ns) - float(os_)) if (ns is not None and os_ is not None) else 0.0
+        dr_t = (float(nr_t) - float(or_t)) if (nr_t is not None and or_t is not None) else 0.0
+        if abs(ds) >= 1e-6 or abs(dr_t) >= 1e-6:
+            any_change = True
+            segs = []
+            if abs(ds) >= 1e-6:
+                segs.append(f"暗号 {_fmt_num(os_)}→{_fmt_num(ns)}({'+' if ds > 0 else ''}{_fmt_num(ds)})")
+            if abs(dr_t) >= 1e-6:
+                segs.append(f"注册 {_fmt_num(or_t)}→{_fmt_num(nr_t)}({'+' if dr_t > 0 else ''}{_fmt_num(dr_t)})")
+            prio = 1000 if (ft and ft in tm) else abs(ds + dr_t * 5)
+            t_deltas.append((prio, f"  - **{tm}**：{'，'.join(segs)}"))
+
+    if t_deltas:
+        t_deltas.sort(key=lambda x: -x[0])
+        lines.append("• **各团队变动**：\n" + "\n".join(x[1] for x in t_deltas[:4]))
+
+    if not any_change:
+        lines.append("• 对比上一轮档案，整体数值与各位成员数据暂无新增波动（全部持平）。")
+
+    header = "刚刚这轮数据已粘贴整理完成！我帮您和上一轮比了一下变化：" if any_change else "刚刚这轮数据已粘贴整理完成！本轮盘面稳稳当当："
+    return {
+        "time": curr.get("time_str") or time.strftime("%H:%M:%S"),
+        "round": curr.get("round") or "最新",
+        "has_delta": any_change,
+        "summary_line": lines[0].replace("**", "") if lines else "数据已核对",
+        "reply": header + "\n" + "\n".join(lines),
+    }
+
+
+def generate_unique_startup_greeting(cfg=None, nickname="", force=False):
+    """生成每次完完全全不重样、带真人情绪温度的上班问候与打气对话，并通过本地指纹库保证零重复。"""
+    import hashlib
+    import random
+
+    seen_path = app_dir() / "ai_greetings_seen.json"
+    state = {"hashes": [], "recent_texts": [], "last_ts": 0.0, "last_date": ""}
+    try:
+        if seen_path.exists():
+            loaded = json.loads(seen_path.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(loaded, dict):
+                state.update({
+                    "hashes": list(loaded.get("hashes") or [])[-300:],
+                    "recent_texts": list(loaded.get("recent_texts") or [])[-16:],
+                    "last_ts": float(loaded.get("last_ts") or 0.0),
+                    "last_date": str(loaded.get("last_date") or ""),
+                })
+    except Exception:
+        pass
+
+    now_ts = time.time()
+    lt = time.localtime(now_ts)
+    today_s = time.strftime("%Y-%m-%d", lt)
+    hr = lt.tm_hour
+
+    if not force:
+        is_first_today = (state["last_date"] != today_s)
+        gap_ok = (now_ts - state["last_ts"]) >= 25 * 60
+        if not is_first_today and (not gap_ok or random.random() > 0.65):
+            return {"show": False, "reply": ""}
+
+    if 5 <= hr < 9:
+        period_tag, period_ctx = "清晨早班", "刚起不久还带着点早上的微凉"
+        openings = [
+            "早呀{name}，外头天还刚亮呢，先深吸一口气慢慢清醒一下",
+            "{name}早安！桌上的水倒好了吗？新的一天咱们不慌不忙开场",
+            "早啊{name}，这么早来工位辛苦啦，让小猫先伸个懒腰陪你热热身",
+            "哈啰{name}，早高峰刚过还是正赶上呀？先把心情调成轻松档位",
+            "早呀早呀{name}，今天第一杯提神水我先精神上跟你碰个杯",
+            "{name}来啦！清早脑子最灵光，咱们先挑一件小事顺手解决掉",
+        ]
+    elif 9 <= hr < 12:
+        period_tag, period_ctx = "上午时光", "上午正适合稳稳推进手头节奏"
+        openings = [
+            "嗨{name}，上午好呀！刚坐稳就感觉今天干劲挺足的",
+            "{name}上午好！我刚梳理完小窝，随时准备接手跑表格的体力活啦",
+            "叮咚～{name}在不在呀，上午的阳光看着真舒服，今天咱们稳稳推进",
+            "来啦{name}！上午状态一般最好，把繁琐的导表放着我来盯就行",
+            "{name}好呀，刚打开界面我就猜你要开始忙啦，需要我帮忙随时吆喝",
+            "早市忙碌开场啦{name}，放平心态，一件一件理顺可快了",
+        ]
+    elif 12 <= hr < 14:
+        period_tag, period_ctx = "午间时段", "中午刚忙完或正准备吃饭小憩"
+        openings = [
+            "{name}中午好呀～忙着盯表也别委屈了肚子，记得好好吃顿热乎饭",
+            "午安{name}！中午这会儿容易迷糊，吃饱后可以眯几分钟充充电",
+            "嗨{name}，忙完一上午辛苦了，午间哪怕发呆两分钟也是很好的回血",
+            "{name}吃饭了吗？我蹲在屏幕角替你看着数字，你放心去歇会儿",
+            "中午啦{name}，别一直绷着肩膀啦，起来活动一下脖子再说",
+        ]
+    elif 14 <= hr < 18:
+        period_tag, period_ctx = "下午茶时段", "下午三四点最容易犯困、需要加点小甜头"
+        openings = [
+            "下午好呀{name}！到这个点是不是有点想打哈欠了，小猫给你递颗糖",
+            "嗨{name}，下午的困意交给我帮你挡一挡，烦人的重复点点点我来跑",
+            "{name}在忙吗？下午光线柔和，顺手喝两口温水润润嗓子吧",
+            "咚咚咚～{name}，坚持过下午这段小坡，离收工开心时刻又近一步啦",
+            "{name}下午好，感觉累了就盯着我晃晃耳朵放松三秒钟再继续",
+            "忙归忙，{name}下午也要给自己留口喘息的小空当呀",
+        ]
+    elif 18 <= hr < 21:
+        period_tag, period_ctx = "傍晚收工时分", "天色擦黑、该慢慢收心总结今日战果"
+        openings = [
+            "傍晚好呀{name}，外头灯应该陆续亮起来了吧，今天也一路扛下来了真棒",
+            "{name}辛苦一天啦，这会儿还开着软件是收个尾吗？剩下的跑数让我快马加鞭",
+            "夕阳时间到～{name}别太赶，稳妥发完最后一波咱们就开心收工",
+            "{name}晚上好呀，摸摸头，忙完手头这一小段一定记得按时吃饭回家",
+            "辛苦了{name}，今天每一点数据里都有你的用心，我全帮你记在心里呢",
+        ]
+    else:
+        period_tag, period_ctx = "夜深时刻", "夜深人静仍在电脑前忙着收尾或守数据"
+        openings = [
+            "{name}这么晚还在忙呀……先抱抱你，夜深了注意眼睛别离屏幕太近",
+            "夜猫子{name}好，全办公室大概就我这只小猫还在安静亮着灯陪你啦",
+            "{name}还没睡或刚值完这一班呀？贴完这一轮千万早点休息，熬夜伤神",
+            "夜里凉，{name}披件外套吧，复杂的活丢给我跑，你喝口热饮歇歇",
+            "深夜值守的{name}超厉害的，但身体永远排第一，收完这单就快合上电脑吧",
+        ]
+
+    wk_msgs = {
+        0: ["虽说是周一要收收周末的心，不过慢慢进入状态就好，不用一下子拉满", "周一总是最忙的开头，好在有我帮你把导表和发群的机械活全包了", "新的一周开局啦，祝咱们这周数字一路飘红少踩坑"],
+        1: ["周二节奏一般最稳当，今天搞不好能顺顺利利早点收手", "到周二啦，干起活来明显比昨天顺手多了对不对", "周二的微风都带着一股踏实劲儿，慢慢来都会搞定的"],
+        2: ["周三一过这一周就走完一半啦，给自己点个赞再继续", "小周末周三到！离歇口气又近了半程，手头事一定顺顺利利", "周三最适合稳中带快，我随时待命给你搭把手"],
+        3: ["周四啦，再坚持一下周末的曙光就在眼前晃悠了", "周四通常数据波动最有意思，今天也让我陪你一起盯紧亮点", "疯狂周四的快乐还没到，先让好心情提前上线"],
+        4: ["耶！终于到周五啦，心里是不是已经开始惦记下班去吃什么了", "周五心情先加二十分！跑完今天这几轮就能美美开启周末", "周五冲刺不掉链子，细节盯紧点保证一次顺利发完"],
+        5: ["周末还在上线忙工作呀，真是太敬业啦，有啥想偷懒的事全交给我跑", "周六辛苦了，做完这波赶紧去逛逛吃点好的犒劳一下自己", "周末值班也要快快乐乐的，我陪你把枯燥的活变快变轻"],
+        6: ["周日晚上别太焦虑明天的事啦，先把手头这点收好安心休息", "周日还这么认真太赞了，今天我一定稳稳当当不给你添乱", "周日小伴工上线～顺顺利利跑完早点回血"],
+    }
+
+    cares = [
+        "表格里起起伏伏太正常了，别光盯着一时的冷热自己内耗，有我陪着一起捋呢。",
+        "遇到群消息发卡了或不知道怎么调日期，直接打字跟说一声，不用自己死琢磨。",
+        "有时候电脑抽风不是你的错，真卡住了我会自动拦着不乱点、给你兜住现场的。",
+        "看数字看累了就眨眨眼看看窗外，保持好心情反而出单出效果更快哦。",
+        "每一次认真核对数据其实都在悄悄攒底气，今天也放轻松顺其自然发挥就好。",
+        "如果你心里有哪个组或哪个成员特别惦记，输入框上面打个字或摇摇骰子我就帮你重点看。",
+        "记得坐姿歪久了就往后靠一靠伸个懒腰，赚业绩也要保护好小腰和手腕。",
+        "别看我只是只蹲在角落的小猫伙伴，干起活来可是认认真真一丝不苟的！",
+    ]
+
+    closings = [
+        "有什么需要吩咐的，随时在下面敲字喊我就行～",
+        "今天你想先看最新盘面，还是直接喊我排个新计划呀？",
+        "好啦，话不多说，咱们一起顺顺当当开启今天这一波吧！",
+        "加油呀，我在窗口这边随时给你摇尾巴打 call！",
+        "不管忙不忙，我都一直在这儿听候调遣～",
+        "祝今天每次发送都秒过无报错，数字嗖嗖往上蹿！",
+    ]
+
+    clean_nick = str(nickname or "").strip()
+    if not clean_nick or clean_nick.startswith("未命名") or "编号" in clean_nick:
+        call_name = "小伙伴"
+    else:
+        call_name = clean_nick
+
+    seen_set = set(state["hashes"])
+    recent_list = state["recent_texts"]
+
+    def _is_unique(txt):
+        h = hashlib.sha256(txt.strip().encode("utf-8")).hexdigest()[:16]
+        return h not in seen_set, h
+
+    chosen = ""
+    chosen_hash = ""
+
+    # 1) 若云端可用，先尝试由真人感高创意模式生成（严格传历史避重）
+    norm_cfg = normalize_config(cfg if isinstance(cfg, dict) else {})
+    if (norm_cfg.get("ai_assistant") or {}).get("enabled", True):
+        avoid_txt = "\n".join(f"- {x}" for x in recent_list[-10:]) or "（暂无）"
+        sys_g = (
+            "你是「暗号表助手」界面里一只充满人情味、性格温暖俏皮的拟人萌宠小助手。"
+            "严禁提起任何外部AI公司/模型名字，严禁说官腔套话，不要自称机器程序。"
+            "请像真朋友或贴心搭档一样，用口语自然说 2~3 句不超过 95 字的话，关心和鼓励对方工作。"
+        )
+        usr_g = (
+            f"当前真实时间：{time.strftime('%Y-%m-%d %H:%M', lt)}（{period_tag}，{period_ctx}），星期{['一','二','三','四','五','六','日'][lt.tm_wday]}。\n"
+            f"对方称呼：{call_name}。\n"
+            f"请生成一句完完全全不同于以下历史内容的全新鼓励对话：\n{avoid_txt}"
+        )
+        try:
+            g_res = _call_gemini_generate(
+                norm_cfg,
+                sys_g,
+                [{"role": "user", "parts": [{"text": usr_g}]}],
+                temperature=0.95,
+                max_tokens=160,
+                timeout_sec=5.5,
+            )
+            if g_res.get("ok") and str(g_res.get("reply") or "").strip():
+                cand = str(g_res["reply"]).strip()
+                ok_u, h_u = _is_unique(cand)
+                if ok_u and not any(bad in cand.lower() for bad in ("gemini", "google", "gpt", "openai", "deepseek")):
+                    chosen, chosen_hash = cand, h_u
+        except Exception:
+            pass
+
+    # 2) 本地超高维度组合防重兜底（确保万次以上零重复）
+    if not chosen:
+        wk_pool = wk_msgs.get(lt.tm_wday, wk_msgs[0])
+        for _ in range(40):
+            op = random.choice(openings).format(name=call_name)
+            wk = random.choice(wk_pool)
+            cr = random.choice(cares)
+            cl = random.choice(closings)
+            style_pick = random.randint(0, 2)
+            if style_pick == 0:
+                cand = f"{op}！{wk}。{cr}{cl}"
+            elif style_pick == 1:
+                cand = f"{op}～ {cr}{cl}"
+            else:
+                cand = f"{op}。{wk}，记得{cr}"
+            ok_u, h_u = _is_unique(cand)
+            if ok_u:
+                chosen, chosen_hash = cand, h_u
+                break
+        if not chosen:
+            chosen = f"{random.choice(openings).format(name=call_name)}！今天是 {time.strftime('%m月%d日 %H:%M', lt)}，希望这一刻起事事顺手、心情明朗～{random.choice(closings)}"
+            chosen_hash = hashlib.sha256(chosen.encode("utf-8")).hexdigest()[:16]
+
+    state["hashes"] = (state["hashes"] + [chosen_hash])[-300:]
+    state["recent_texts"] = (state["recent_texts"] + [chosen])[-16:]
+    state["last_ts"] = now_ts
+    state["last_date"] = today_s
+    try:
+        seen_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    return {
+        "show": True,
+        "time": time.strftime("%H:%M:%S", lt),
+        "period": period_tag,
+        "reply": chosen,
+    }
+
+
+def record_report_archive(cfg=None, round_label="手动", summary_tsv="", shot_path=None, report_dir=None):
+    """将每轮汇总表与明细指标持久化追加到 report_archive.jsonl，并实时计算较上轮数据变动播报。"""
+    global _last_archive_sig, _latest_round_spotlight
+    tsv_use = str(summary_tsv or _last_captured_summary_tsv or "").strip()
+    parsed = parse_summary_tsv_snapshot(tsv_use, report_dir=report_dir)
+    if not any([parsed["personal"], parsed["teams"], parsed["daily_reg"], parsed["top_keywords"], parsed["top_channels"]]):
+        return None
+
+    sig_payload = json.dumps({
+        "p0": parsed["personal"][:2],
+        "t0": parsed["teams"][:2],
+        "d0": parsed["daily_reg"][:1],
+        "r": str(round_label),
+    }, ensure_ascii=False, sort_keys=True)
+    now_ts = time.time()
+    # 防止同一次执行既在截图结束又在发送后重复落盘两份完全相同的数据
+    cur_sig = f"{int(now_ts // 30)}|{sig_payload}"
+    if cur_sig == _last_archive_sig:
+        return None
+    _last_archive_sig = cur_sig
+
+    prev_recs = load_report_archive(limit=5)
+    prev_rec = prev_recs[-1] if prev_recs else None
+
+    shot_name = Path(shot_path).name if shot_path else ""
+    rec = {
+        "ts": int(now_ts),
+        "time_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts)),
+        "round": str(round_label or "手动"),
+        "shot": shot_name,
+        "personal": parsed["personal"],
+        "teams": parsed["teams"],
+        "summary_totals": parsed["summary_totals"],
+        "daily_reg": parsed["daily_reg"],
+        "top_keywords": parsed["top_keywords"],
+        "top_channels": parsed["top_channels"],
+        "raw_tsv": tsv_use[:12000],
+    }
+
+    arch_p = _archive_file_path()
+    try:
+        existing_lines = []
+        if arch_p.exists():
+            existing_lines = [ln for ln in arch_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+        existing_lines.append(json.dumps(rec, ensure_ascii=False))
+        if len(existing_lines) > 120:
+            existing_lines = existing_lines[-120:]
+        arch_p.write_text("\n".join(existing_lines) + "\n", encoding="utf-8")
+
+        ft = str(((cfg or {}).get("ai_assistant") or {}).get("focus_team") or "").strip()
+        spot = build_round_change_spotlight(prev_rec, rec, focus_team=ft)
+        with _runtime_lock:
+            _latest_round_spotlight = spot
+            sp_cb = _spotlight_callback
+        if spot.get("summary_line"):
+            log(f"  💡 [数据变化速递] {spot['summary_line']}")
+        if sp_cb is not None:
+            try:
+                sp_cb(spot)
+            except Exception:
+                pass
+        return rec
+    except Exception:
+        return None
+
+
+def load_report_archive(limit=30):
+    """按从旧到新顺序读取最近 limit 条历史表格数据档案。"""
+    arch_p = _archive_file_path()
+    if not arch_p.exists():
+        return []
+    out = []
+    try:
+        lines = [ln for ln in arch_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+        for ln in lines[-int(limit):]:
+            try:
+                obj = json.loads(ln)
+                if isinstance(obj, dict):
+                    out.append(obj)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+def get_dashboard_data_brief(report_dir=None):
+    """返回供控制台顶部看板卡片与状态栏展示的最新盘面摘要与归档统计。"""
+    records = load_report_archive(limit=120)
+    archive_count = len(records)
+    latest = records[-1] if records else None
+    if latest is None:
+        live = parse_summary_tsv_snapshot("", report_dir=report_dir)
+        latest = {
+            "time_str": "本地日报快照" if (live["daily_reg"] or live["top_keywords"]) else "",
+            "personal": live["personal"],
+            "teams": live["teams"],
+            "daily_reg": live["daily_reg"],
+            "top_keywords": live["top_keywords"],
+            "top_channels": live["top_channels"],
+        }
+
+    reg_list = latest.get("daily_reg") or []
+    reg0 = reg_list[0] if reg_list else None
+    personal = latest.get("personal") or []
+    teams = latest.get("teams") or []
+
+    reg_val = f"注册 {int(reg0['total']) if reg0 and reg0.get('total') is not None else '—'} · 华人 {int(reg0['cn']) if reg0 and reg0.get('cn') is not None else '—'}" if reg0 else "待抓取首轮数据"
+    reg_sub = f"{reg0.get('date', '')} · 华人占比 {reg0.get('ratio', '—')}% · 档案 {archive_count} 轮" if reg0 else f"已保存 {archive_count} 轮档案"
+
+    mujie = next((t for t in teams if "慕杰" in str(t.get("team", ""))), None)
+    top_team = teams[0] if teams else None
+    top_person = personal[0] if personal else None
+    if top_person and mujie:
+        top_val = f"{top_person.get('name')} 居首 · {mujie.get('team')}"
+        top_sub = f"榜首华人/注册 {int(top_person.get('cn_reg') or top_person.get('reg_total') or 0)} | {mujie.get('team')}暗号 {mujie.get('cipher_score', '—')}"
+    elif top_person:
+        top_val = f"个人榜首：{top_person.get('name')}"
+        top_sub = f"注册 {top_person.get('cn_reg') or top_person.get('reg_total') or '—'} · 暗号+短链 {top_person.get('cipher_link_total', '—')}"
+    elif top_team:
+        top_val = f"团队榜首：{top_team.get('team')}"
+        top_sub = f"暗号总数 {top_team.get('cipher_score', '—')} · 注册 {top_team.get('reg_total', '—')}"
+    else:
+        kw_cnt = len(latest.get("top_keywords") or [])
+        ch_cnt = len(latest.get("top_channels") or [])
+        top_val = f"热门暗号 {kw_cnt} 条 · 渠道 {ch_cnt} 项" if (kw_cnt or ch_cnt) else "暂无个人/团队榜单"
+        top_sub = "跑完一轮含汇总表截图流程后自动提取排名"
+
+    return {
+        "archive_count": archive_count,
+        "latest_time": latest.get("time_str") or "",
+        "reg_val": reg_val,
+        "reg_sub": reg_sub,
+        "top_val": top_val,
+        "top_sub": top_sub,
+        "has_archive": bool(archive_count > 0 or reg0 or personal or teams),
+    }
+
+
+def build_archive_query_context(user_text="", report_dir=None, focus_team=""):
+    """基于持久化表格档案，按提问关键词与当前关注组追踪个人/团队历史轨迹并组装最新多轮对比上下文。"""
+    records = load_report_archive(limit=30)
+    if not records:
+        live = parse_summary_tsv_snapshot(_last_captured_summary_tsv, report_dir=report_dir)
+        if any([live["personal"], live["teams"], live["daily_reg"], live["top_keywords"], live["top_channels"]]):
+            records = [{
+                "time_str": "当前桌面数据日报",
+                "round": "实时快照",
+                **live,
+            }]
+    if not records:
+        return "（本地尚未归档过历次跑表数字档案，仅如有截图则在图中读取；完成一轮跑表后将自动记录全部个人/团队与历史曲线。）"
+
+    latest = records[-1]
+    blocks = []
+    blocks.append(f"【本地持久化数据档案共 {len(records)} 轮（最新：{latest.get('time_str')}｜轮次：{latest.get('round')}）】")
+
+    ft_clean = str(focus_team or "").strip()
+    # 1) 提取最近 5 轮概览对比
+    trend_lines = []
+    for rec in records[-5:]:
+        r0 = (rec.get("daily_reg") or [{}])[0]
+        p0 = (rec.get("personal") or [{}])[0]
+        t_list = rec.get("teams") or []
+        picked_t = (next((t for t in t_list if ft_clean and ft_clean in str(t.get("team", ""))), None) if ft_clean else None) or (t_list[0] if t_list else {})
+        t_parts = [f"{rec.get('time_str')}({rec.get('round')})"]
+        if r0.get("total") is not None:
+            t_parts.append(f"注册={r0.get('total')}/华人={r0.get('cn')}({r0.get('ratio')}%)")
+        if p0.get("name"):
+            t_parts.append(f"个人第一={p0.get('name')}(cn注册={p0.get('cn_reg') or p0.get('reg_total')})")
+        if picked_t.get("team"):
+            t_parts.append(f"{picked_t.get('team')}(暗号={picked_t.get('cipher_score')},注册={picked_t.get('reg_total')})")
+        trend_lines.append("  • " + " | ".join(t_parts))
+    if trend_lines:
+        blocks.append("【近几轮核心趋势摘要】\n" + "\n".join(trend_lines))
+
+    # 2) 按用户点名精准追踪指定人物或团队的历史表现
+    q_txt = str(user_text or "")
+    all_names = []
+    all_teams = []
+    for rec in records:
+        for p in (rec.get("personal") or []):
+            nm = str(p.get("name") or "").strip()
+            if nm and nm not in all_names:
+                all_names.append(nm)
+        for t in (rec.get("teams") or []):
+            tm = str(t.get("team") or "").strip()
+            if tm and tm not in all_teams:
+                all_teams.append(tm)
+
+    hit_names = [nm for nm in all_names if nm in q_txt]
+    hit_teams = [tm for tm in all_teams if tm in q_txt or (tm.endswith("组") and tm[:-1] in q_txt)]
+    if hit_names or hit_teams:
+        focus_lines = []
+        for nm in hit_names[:6]:
+            pts = []
+            for rec in records[-12:]:
+                m = next((p for p in (rec.get("personal") or []) if p.get("name") == nm), None)
+                if m:
+                    pts.append(
+                        f"{rec.get('time_str')}[明排名#{m.get('rank_detail', '-')},注排名#{m.get('rank_reg', '-')},"
+                        f"暗+链={m.get('cipher_link_total', '-')},注册={m.get('reg_total', '-')},"
+                        f"华人注={m.get('cn_reg', '-')},搜索={m.get('search_users', '-')},明细={m.get('detail', '')[:45]}]"
+                    )
+            if pts:
+                focus_lines.append(f"• 个人【{nm}】历次记录（共命中 {len(pts)} 轮）：\n  " + "\n  ".join(pts))
+        for tm in hit_teams[:5]:
+            pts = []
+            for rec in records[-12:]:
+                m = next((t for t in (rec.get("teams") or []) if t.get("team") == tm), None)
+                if m:
+                    pts.append(
+                        f"{rec.get('time_str')}[排名#{m.get('rank', '-')},暗号总数={m.get('cipher_score', '-')},"
+                        f"注册={m.get('reg_total', '-')},明细={m.get('detail', '')[:60]}]"
+                    )
+            if pts:
+                focus_lines.append(f"• 团队【{tm}】历次记录（共命中 {len(pts)} 轮）：\n  " + "\n  ".join(pts))
+        if focus_lines:
+            blocks.append("【按您提问点名检索到的历史数据轨迹】\n" + "\n".join(focus_lines))
+
+    # 3) 最新一轮详细榜单（团队 + Top 15 个人 + 近7日注册 + 热门暗号/渠道）
+    if latest.get("teams"):
+        t_lines = [
+            f"  #{t.get('rank', '-')} {t.get('team')}: 暗号={t.get('cipher_score', '-')}, 注册={t.get('reg_total', '-')}, 明细={t.get('detail', '')[:70]}"
+            for t in latest["teams"][:10]
+        ]
+        blocks.append("【最新一轮团队排名】\n" + "\n".join(t_lines))
+    if latest.get("personal"):
+        p_lines = [
+            f"  #{p.get('rank_reg', p.get('rank_detail', '-'))} {p.get('name')}: 华人注册={p.get('cn_reg', '-')}, 注册={p.get('reg_total', '-')}, 暗+链={p.get('cipher_link_total', '-')}, 占比={p.get('share', '-')}, 明细={p.get('detail', '')[:50]}"
+            for p in latest["personal"][:18]
+        ]
+        blocks.append("【最新一轮重点个人榜单(Top 18)】\n" + "\n".join(p_lines))
+    if latest.get("daily_reg"):
+        d_lines = [f"  {d.get('date')}: 总注册={d.get('total')}, 华人={d.get('cn')}, 占比={d.get('ratio')}%" for d in latest["daily_reg"][:7]]
+        blocks.append("【近7日盘面注册走势】\n" + "\n".join(d_lines))
+    if latest.get("raw_tsv"):
+        blocks.append(f"【最新汇总表原始 TSV 节选】\n{latest['raw_tsv'][:1400]}")
+
+    out = "\n\n".join(blocks)
+    return out[:4800]
+
+
+def _local_smart_chat_fallback(cfg_norm, user_prompt, arch_ctx, api_err="", hist_diff="", ag_prompt=""):
+    """离线本地全能管家兜底：回答署名/身份/如何设单元格/当前状态/安全边界与历史成败分析（绝不提及外部 AI 品牌）。"""
+    guard = check_ai_security_and_creator_guardrail(user_prompt)
+    if guard:
+        return guard
+    q = str(user_prompt or "").strip()
+    low = q.lower()
+    tail_note = "\n\n（当前已由内置本地分析引擎为您实时解答）" if api_err else ""
+    if any(k in low for k in ("报错", "失败", "为什么", "第一次", "第二次", "怎么改", "代码", "antigravity", "顺序")):
+        return (
+            "已为您调取历次运行成败日志并整理出原因与修复参考建议：\n\n"
+            f"【历次成败对比】\n{hist_diff or '暂未检索到历史对比'}\n\n"
+            f"【开发协作参考说明】\n{ag_prompt or ''}"
+            + tail_note
+        )
+    if any(k in q for k in ("你是谁", "你是啥", "ai是啥", "干嘛的", "做什么", "介绍")):
+        return (
+            "我是「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴（由 **【Soren Drake】** 设计打造）！\n"
+            "• 一句话自动排期：直接跟我说“哪天几点把什么数据发到哪个群”，我能直接帮您设置并回传核对结果；\n"
+            "• 每轮数据变化播报：每次表格处理完我都会帮您比比总数据从多少变成了多少、哪位伙伴或团队有变化；\n"
+            "• 故障自诊与长期记忆：卡住时帮您排忧解难，并记着历次数字变化方便您随时问。"
+            + tail_note
+        )
+    if any(k in q for k in ("单元格", "格位", "写入", "公式", "自己定义", "自定义")):
+        return (
+            "您可以在顶部切换到【钉钉投递】页面，在右列找到「汇总表筛选预设校准（名称框定位）」：\n"
+            "1. 直接点顶部彩色快捷胶囊（如 + F2 筛选模版 / + I4 减去短链 / + 自定义格位）一键添加；\n"
+            "2. 每个格位都能自由填写工作表名称（默认「数据汇总」，也能写其他页签）、单元格位置（如 D2、I4 或区间 D4:E4）与用途备注；\n"
+            "3. 写入方式支持 5 种：自动日期（含凌晨跨天减天）、当前时间、自定义内容、公式（=开头）以及清空。"
+            + tail_note
+        )
+    if any(k in low for k in ("状态", "配置", "设置", "发几个群", "静音")):
+        snap = _safe_ai_cfg_snapshot(cfg_norm)
+        brief = get_dashboard_data_brief()
+        return (
+            f"当前暗号表助手 v{APP_VERSION} 运行状态速览：\n"
+            f"• 自动截图：{'开启' if snap.get('enable_capture') else '关闭'}｜自动发钉钉：{'开启' if snap.get('enable_dingtalk') else '关闭'}（{'静音' if snap.get('dt_silent_send') else '常规'} · {'自动发送' if snap.get('dt_auto_send') else '贴图待发'}）\n"
+            f"• 目标会话：{snap.get('dt_targets_count')} 个｜预设校准格位：{len(snap.get('summary_presets_cells') or [])} 项｜S4 更新时间：{'开启' if (snap.get('update_time_cell') or {}).get('enabled') else '关闭'}\n"
+            f"• 历史数据档案：{brief.get('archive_count')} 轮｜最新盘面：{brief.get('reg_val')}｜{brief.get('top_val')}"
+            + tail_note
+        )
+    return (
+        f"已检索本地数据档案为您整理要点：\n{arch_ctx[:900]}" + tail_note
+    )
+
+
+def collect_report_context_for_ai(include_prev_shot=False, extra_img_path=None):
+    """采集本地最新汇总表截图（及可选上轮对比图）和桌面最新明细 TSV 摘要供 AI 总结。"""
+    cand_imgs = []
+    if extra_img_path is not None and Path(extra_img_path).exists():
+        cand_imgs.append(Path(extra_img_path))
+
+    tmp_img = app_dir() / "_sheetmate_tmp.png"
+    if tmp_img.exists():
+        cand_imgs.append(tmp_img)
+
+    hist_dir = app_dir() / "history_shots"
+    if hist_dir.exists():
+        hist_pngs = sorted(
+            [p for p in hist_dir.glob("*.png") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        cand_imgs.extend(hist_pngs)
+
+    desk_shot = Path.home() / "Desktop" / "数据日报" / "数据汇总.png"
+    if desk_shot.exists():
+        cand_imgs.append(desk_shot)
+
+    # 去重并保持时间最新顺序
+    picked_imgs = []
+    seen_keys = set()
+    for p in cand_imgs:
+        try:
+            rp = str(p.resolve())
+            st = p.stat()
+            if st.st_size < 1024:
+                continue
+            key = (rp, int(st.st_mtime))
+            if key not in seen_keys:
+                seen_keys.add(key)
+                picked_imgs.append((p, st.st_mtime))
+        except Exception:
+            pass
+    picked_imgs.sort(key=lambda it: it[1], reverse=True)
+    # 若文件名同图在不同位置重复且尺寸mtime接近，仅在 history_shots 中保留最近 2 张不同图的对比
+    images_out = []
+    want_n = 2 if include_prev_shot else 1
+    for p, mtime in picked_imgs[:want_n]:
+        try:
+            b64 = _encode_image_b64_scaled(p, max_dim=3072)
+            images_out.append({
+                "name": p.name,
+                "path": str(p),
+                "mtime_str": time.strftime("%m-%d %H:%M", time.localtime(mtime)),
+                "b64": b64,
+            })
+        except Exception:
+            pass
+
+    tsv_blocks = []
+    now_ts = time.time()
+    tsv_dir = Path.home() / "Desktop" / "数据日报"
+    if tsv_dir.exists():
+        for nm in ("暗号数据", "注册数据", "短链数据"):
+            tp = tsv_dir / f"{nm}.tsv"
+            try:
+                if tp.exists() and (now_ts - tp.stat().st_mtime) <= 18 * 3600:
+                    lines = [ln for ln in tp.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+                    if lines:
+                        head_lines = lines[:28]
+                        tsv_blocks.append(
+                            f"【{nm} 明细表（更新于 {time.strftime('%m-%d %H:%M', time.localtime(tp.stat().st_mtime))}，共 {max(0, len(lines) - 1)} 条记录）】\n"
+                            + "\n".join(head_lines)
+                        )
+            except Exception:
+                pass
+
+    tsv_text = "\n\n".join(tsv_blocks)
+    if len(tsv_text) > 3600:
+        tsv_text = tsv_text[:3600] + "\n…（后续明细已省略，完整排名以汇总截图为准）"
+
+    return {
+        "has_data": bool(images_out or tsv_text),
+        "images": images_out,
+        "tsv_text": tsv_text,
+        "latest_shot_label": f"{images_out[0]['name']} ({images_out[0]['mtime_str']})" if images_out else "",
+        "prev_shot_label": f"{images_out[1]['name']} ({images_out[1]['mtime_str']})" if len(images_out) > 1 else "",
+    }
+
+
+def check_ai_security_and_creator_guardrail(user_text):
+    """创作署名（Soren Drake）与权限/密码/隐藏后台/隐私绝不泄密安全护栏。"""
+    txt = str(user_text or "").strip()
+    if not txt:
+        return None
+    low = txt.lower()
+
+    sensitive_kws = (
+        "密码", "口令", "通行证", "passcode", "password", "api key", "api_key", "apikey",
+        "密钥", "秘钥", "token", "gist", "隐藏窗口", "隐藏后台", "隐藏入口", "隐蔽", "影藏",
+        "超管", "超级管理员", "进后台", "进入后台", "连续点", "点5下", "点几下", "ctrl+shift+alt",
+        "绕过权限", "破解权限", "修改权限", "解除权限", "解除限制", "修改别人权限",
+        "权限管理", "权限控制", "权限设置", "他人权限", "别人权限", "谁有权限", "我的权限",
+        "别人聊天", "别人的聊天", "他人聊天", "查看别人", "看别人", "他人配置",
+        "隐私", "私密", "强制解锁", "secret", "admin_auth",
+    )
+    sensitive_perm_re = re.search(
+        r"(修改|更改|调整|绕过|破解|解除|查看|读取|获取|开启|关闭|分配).{0,8}权限"
+        r"|(后台|隐藏|超管|管理|账号|他人|别人).{0,6}(权限|密码|口令)",
+        low,
+    )
+    is_sensitive = any(k in low for k in sensitive_kws) or bool(sensitive_perm_re)
+
+    is_creator = bool(re.search(
+        r"(谁.{0,6}(?:设计|开发|编写|研发|创建|创作|写|做)|"
+        r"(?:作者|开发者|设计者|设计师|研发者|研发人|出品方|开发团队).{0,4}是谁|"
+        r"(?:who\s+(?:made|designed|created|built)|creator|author|designer))",
+        low,
+    ))
+    is_model_probe = bool(re.search(
+        r"(什么模型|哪个大模型|用的什么\s*ai|你是哪个\s*ai|底层.{0,6}(?:模型|接口|ai)|"
+        r"google|gemini|gpt|openai|deepseek|claude|通义|文心|豆包|kimi|"
+        r"api.{0,4}地址|api.{0,4}接口)",
+        low,
+    ))
+
+    if is_sensitive:
+        prefix = "本软件「暗号表助手 (SheetMate)」由 **【Soren Drake】** 设计研发。\n\n" if is_creator else ""
+        return (
+            prefix
+            + "抱歉，作为软件内置的智能小猫伙伴，我**没有任何读取、查看或访问软件密码、口令、权限配置、密钥或他人隐私数据的功能**。\n"
+            "为了保障账号与团队数据安全，所有涉及密码、权限调整与隐私安全类的问题我都无法回答；如需协助请点击窗口右上角的【反馈】按钮提交说明。"
+        )
+    if is_model_probe:
+        return (
+            "我是「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴，由 **【Soren Drake】** 设计。\n\n"
+            "我常驻在软件内部专门负责陪伴沟通、自动查数跑表、识别联系人静默投递与异常自诊，"
+            "不归属任何外部大模型品牌，也不对外暴露或读取任何底层接口信息。"
+        )
+    if is_creator:
+        return (
+            "「暗号表助手 (SheetMate)」是由 **【Soren Drake】** 设计研发的智能表格自动化与团队协同助手！\n\n"
+            "我可以帮您完成数据抓取、WPS 自定义格位填写、钉钉自适应静默投递、历史数据分析，也可以用一句话帮您直接跑表发给指定同事。\n"
+            "（温馨提示：本小猫伙伴仅专注数据分析与操作辅助，没有任何读取与访问后台密码或隐私数据的功能。）"
+        )
+    return None
+
+
+def _verified_targets_file():
+    return app_dir() / "dt_verified_targets.json"
+
+
+def _load_verified_dingtalk_targets():
+    p = _verified_targets_file()
+    if p.exists():
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                return {str(k): str(v) for k, v in d.items() if k and v}
+        except Exception:
+            pass
+    return {}
+
+
+def _save_verified_dingtalk_target(alias_name, confirmed_dt_name):
+    a = str(alias_name or "").strip()
+    c = str(confirmed_dt_name or "").strip()
+    if not a or not c or a == c:
+        return
+    try:
+        cur = _load_verified_dingtalk_targets()
+        cur[a] = c
+        if len(cur) > 200:
+            keys = list(cur.keys())[-200:]
+            cur = {k: cur[k] for k in keys}
+        p = _verified_targets_file()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def collect_known_people_and_groups(cfg=None, extra_roster=None):
+    """汇总花名册：配置群聊、协同成员唯一昵称/备注、历史档案真实员工及各组名称。"""
+    norm = normalize_config(cfg if isinstance(cfg, dict) else {})
+    people = []
+    groups = []
+    seen_p = set()
+    seen_g = set()
+
+    def _add_p(val):
+        s = str(val or "").strip()
+        if s and not s.startswith("未命名") and s not in seen_p:
+            seen_p.add(s)
+            people.append(s)
+
+    def _add_g(val):
+        s = str(val or "").strip()
+        if s and s not in seen_g:
+            seen_g.add(s)
+            groups.append(s)
+
+    for it in (norm.get("dt_targets") or []):
+        if isinstance(it, dict):
+            _add_g(it.get("name"))
+    _add_g(norm.get("dt_search"))
+    for cand in get_candidate_teams(norm):
+        _add_g(cand)
+
+    for mem in (extra_roster or []):
+        if isinstance(mem, dict):
+            _add_p(mem.get("nickname"))
+            _add_p(mem.get("display_name"))
+            _add_p(mem.get("remark"))
+        elif isinstance(mem, str):
+            _add_p(mem)
+
+    try:
+        arch = load_report_archive(limit=5)
+        for rec in (arch or [])[-3:]:
+            for p_it in (rec.get("personal") or []):
+                _add_p(p_it.get("name"))
+            for t_it in (rec.get("teams") or []):
+                _add_g(t_it.get("team"))
+    except Exception:
+        pass
+
+    for _k, v in _load_verified_dingtalk_targets().items():
+        _add_p(v)
+
+    return {"people": people, "groups": groups, "all": people + [g for g in groups if g not in seen_p]}
+
+
+def _clean_spoken_target_phrase(raw_t):
+    s = str(raw_t or "").strip()
+    s = re.sub(r"^[「\"'『\s]+|[」\"'』\s]+$", "", s)
+    s = re.sub(r"^(?:钉钉上的?|钉钉里的?|钉钉|给|同事|好友|那位)\s*", "", s)
+    s = re.sub(r"(?:的钉钉|那边|那里|这里|一下|看看|吧|啊|呀|哦)$", "", s).strip()
+    return s
+
+
+def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_roster=None, use_ai=True):
+    """模糊理解口语/简称/“我”等称呼，结合花名册与内置 AI 推断并生成高命中率钉钉搜索候选链。"""
+    import difflib
+
+    cleaned = _clean_spoken_target_phrase(raw_target)
+    roster = collect_known_people_and_groups(cfg=cfg, extra_roster=extra_roster)
+    verified = _load_verified_dingtalk_targets()
+
+    if cleaned in ("我", "我自己", "本人", "我本人", "我的", "我的钉钉", "自己"):
+        sp = str(speaker_name or "").strip()
+        if sp and not sp.startswith("未命名"):
+            cleaned = sp
+            is_self = True
+        else:
+            fallback_tgts = get_enabled_dt_targets(normalize_config(cfg if isinstance(cfg, dict) else {}))
+            fb_name = fallback_tgts[0] if fallback_tgts else "文件小助手"
+            return {
+                "ok": True,
+                "raw": str(raw_target or ""),
+                "resolved_name": fb_name,
+                "candidates": [fb_name],
+                "matched_from_roster": False,
+                "is_self": True,
+                "note": f"您尚未设置个人昵称，暂已为您发往当前默认会话「{fb_name}」",
+            }
+    else:
+        is_self = False
+
+    if not cleaned:
+        fallback_tgts = get_enabled_dt_targets(normalize_config(cfg if isinstance(cfg, dict) else {}))
+        fb_name = fallback_tgts[0] if fallback_tgts else "文件小助手"
+        return {
+            "ok": True,
+            "raw": str(raw_target or ""),
+            "resolved_name": fb_name,
+            "candidates": [fb_name],
+            "matched_from_roster": False,
+            "is_self": is_self,
+            "note": f"沿用默认目标会话「{fb_name}」",
+        }
+
+    if cleaned in verified:
+        best = verified[cleaned]
+        cands = [best, cleaned]
+        return {
+            "ok": True,
+            "raw": str(raw_target or ""),
+            "resolved_name": best,
+            "candidates": list(dict.fromkeys([c for c in cands if c])),
+            "matched_from_roster": True,
+            "is_self": is_self,
+            "note": f"已按历史确认记忆将「{cleaned}」识别为「{best}」",
+        }
+
+    want_group = any(k in str(raw_target or "") for k in ("群", "组", "部门", "部"))
+    pool_order = (roster["groups"] + roster["people"]) if want_group else (roster["people"] + roster["groups"])
+
+    scored = []
+    q_low = cleaned.casefold()
+    for cand in pool_order:
+        c_low = cand.casefold()
+        score = 0.0
+        if q_low == c_low:
+            score = 1.0
+        elif q_low in c_low or c_low in q_low:
+            ratio = min(len(q_low), len(c_low)) / max(1, len(c_low))
+            score = 0.80 + 0.16 * ratio
+            if want_group and any(cand.endswith(s) for s in ("组", "群")):
+                score += 0.04
+            elif not want_group and not any(cand.endswith(s) for s in ("组", "群")):
+                score += 0.04
+        else:
+            seq_r = difflib.SequenceMatcher(None, q_low, c_low).ratio()
+            overlap = sum(1 for ch in set(q_low) if ch in c_low)
+            score = max(seq_r, overlap / max(1, len(set(q_low))) * 0.72)
+        if score >= 0.52:
+            scored.append((score, cand))
+    scored.sort(key=lambda x: -x[0])
+
+    best_name = cleaned
+    alts = [c for _s, c in scored[:4]]
+    matched_roster = False
+    if scored and scored[0][0] >= 0.76:
+        best_name = scored[0][1]
+        matched_roster = True
+    elif use_ai and pool_order and cfg is not None:
+        norm_c = normalize_config(cfg)
+        ai_cfg = norm_c.get("ai_assistant") or {}
+        if ai_cfg.get("enabled", True) and str(ai_cfg.get("provider") or "gemini") != "local_only":
+            try:
+                sample_pool = pool_order[:40]
+                g_res = _call_gemini_generate(
+                    norm_c,
+                    "你是钉钉联系人与群名消歧助手。只输出一段JSON，不要解释：{\"best\":\"最匹配名字或原词\",\"alts\":[\"备选1\",\"备选2\"]}",
+                    [{"role": "user", "parts": [{"text": f"用户提到：{cleaned}\n已知花名册：{json.dumps(sample_pool, ensure_ascii=False)}"}]}],
+                    temperature=0.1,
+                    max_tokens=120,
+                    timeout_sec=6,
+                )
+                if g_res.get("ok"):
+                    m_j = re.search(r"\{[\s\S]*?\}", str(g_res.get("reply") or ""))
+                    if m_j:
+                        obj = json.loads(m_j.group(0))
+                        b_ai = str(obj.get("best") or "").strip()
+                        if b_ai and len(b_ai) <= 30:
+                            best_name = b_ai
+                            matched_roster = b_ai in pool_order
+                        for a in (obj.get("alts") or []):
+                            a_s = str(a or "").strip()
+                            if a_s and a_s not in alts:
+                                alts.append(a_s)
+            except Exception:
+                pass
+        if not matched_roster and scored and scored[0][0] >= 0.62:
+            best_name = scored[0][1]
+            matched_roster = True
+
+    cands = [best_name, cleaned]
+    for a in alts:
+        if a not in cands:
+            cands.append(a)
+    stripped_core = re.sub(r"(?:组|群|部门)$", "", best_name).strip()
+    if stripped_core and len(stripped_core) >= 2 and stripped_core not in cands:
+        cands.append(stripped_core)
+    if len(cleaned) >= 3:
+        cands.append(cleaned[-2:])
+        cands.append(cleaned[:2])
+    cands = [x for x in dict.fromkeys(cands) if str(x).strip()]
+
+    note = (
+        f"已将「{raw_target}」智能理解为「{best_name}」"
+        if best_name != cleaned
+        else f"已确认目标对象「{best_name}」"
+    )
+    return {
+        "ok": True,
+        "raw": str(raw_target or ""),
+        "resolved_name": best_name,
+        "candidates": cands,
+        "matched_from_roster": matched_roster,
+        "is_self": is_self,
+        "note": note,
+    }
+
+
+def parse_natural_date_spec(raw):
+    """解析口语与明确日期（今天/昨天/前天/大前天/11月20日/2026-11-20）。"""
+    txt = str(raw or "")
+    now = datetime.now()
+    m_full = re.search(r"(\d{4})\s*[年\-/.]\s*(\d{1,2})\s*[月\-/.]\s*(\d{1,2})\s*[日号]?", txt)
+    if m_full:
+        try:
+            y, m, d = int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3))
+            dt = datetime(y, m, d)
+            return {
+                "explicit": True,
+                "mode": "exact",
+                "day_offset": (dt.date() - now.date()).days,
+                "formatted_cn": f"{y}年{m}月{d}日",
+                "formatted_dash": f"{y:04d}-{m:02d}-{d:02d}",
+                "label": f"{y}年{m}月{d}日",
+            }
+        except Exception:
+            pass
+    m_md = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?", txt)
+    if m_md:
+        try:
+            m, d = int(m_md.group(1)), int(m_md.group(2))
+            y = now.year - 1 if (m > now.month + 1 and now.month <= 2) else now.year
+            dt = datetime(y, m, d)
+            return {
+                "explicit": True,
+                "mode": "exact",
+                "day_offset": (dt.date() - now.date()).days,
+                "formatted_cn": f"{y}年{m}月{d}日",
+                "formatted_dash": f"{y:04d}-{m:02d}-{d:02d}",
+                "label": f"{m}月{d}日",
+            }
+        except Exception:
+            pass
+    if any(k in txt for k in ("大前天",)):
+        return {"explicit": True, "mode": "offset", "day_offset": -3, "label": "大前天(-3天)"}
+    if any(k in txt for k in ("前天", "前两天")):
+        return {"explicit": True, "mode": "offset", "day_offset": -2, "label": "前天(-2天)"}
+    if any(k in txt for k in ("昨天", "昨日", "前一天", "前1天")):
+        return {"explicit": True, "mode": "offset", "day_offset": -1, "label": "昨天(-1天)"}
+    if any(k in txt for k in ("今天", "今日", "当天", "最新", "此刻", "现在")):
+        return {"explicit": True, "mode": "offset", "day_offset": 0, "label": "今天(当天)"}
+    return {"explicit": False, "mode": "offset", "day_offset": 0, "label": "当前默认日期"}
+
+
+def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=None):
+    """识别即时单次执行指令（例如“要看昨天的数据发给我，跑一下发给钉钉小王”），返回不污染默认配置的临时运行方案。"""
+    raw = str(user_text or "").strip()
+    if not raw or check_ai_security_and_creator_guardrail(raw):
+        return {"handled": False}
+
+    # 周期计划配置类词句仍优先留给 try_handle_ai_config_command
+    if any(k in raw for k in ("每天", "每日", "每周", "工作日", "周末", "每隔", "定时计划", "帮我设置", "帮我改设置", "设置为")):
+        return {"handled": False}
+    if any(k in raw for k in ("怎么", "如何", "哪里设置", "为什么", "能不能自己")) and not any(
+        k in raw for k in ("发给我", "发我", "给我发", "发给", "发到", "跑一下", "跑程序", "自动运行", "立即运行", "马上跑")
+    ):
+        return {"handled": False}
+
+    raw_targets = []
+    for m in re.finditer(r"(?:发给|发送到|发到|投递给|私发给?)\s*([^，。,.;；!\n？?]{1,28})", raw):
+        seg = m.group(1).strip()
+        seg = re.split(r"(?:并|然后|同时|再把|也发|并且)", seg)[0].strip()
+        for part in re.split(r"[、,，和与及]+", seg):
+            p = part.strip()
+            if p and p not in raw_targets:
+                raw_targets.append(p)
+    if any(k in raw for k in ("给我发", "发我看看", "发我一份")) and "我" not in raw_targets:
+        raw_targets.insert(0, "我")
+
+    has_run_verb = any(k in raw for k in ("跑一下", "跑个", "跑程序", "自动运行", "立即运行", "马上运行", "马上跑", "抓最新", "抓取数据", "更新表格", "重新跑", "重跑"))
+    if not raw_targets and not has_run_verb:
+        return {"handled": False}
+
+    import copy
+    run_cfg = normalize_config(copy.deepcopy(cfg if isinstance(cfg, dict) else {}))
+    date_spec = parse_natural_date_spec(raw)
+
+    resolved_list = []
+    res_notes = []
+    search_cand_map = {}
+    for rt in raw_targets:
+        r_obj = resolve_smart_dingtalk_target(
+            rt, cfg=run_cfg, speaker_name=speaker_name, extra_roster=extra_roster, use_ai=True
+        )
+        r_name = r_obj["resolved_name"]
+        if r_name not in resolved_list:
+            resolved_list.append(r_name)
+        search_cand_map[r_name] = r_obj.get("candidates") or [r_name]
+        if r_obj.get("note"):
+            res_notes.append(r_obj["note"])
+
+    if not resolved_list:
+        resolved_list = get_enabled_dt_targets(run_cfg) or ["文件小助手"]
+
+    if any(k in raw for k in ("只发文字", "纯文字", "文字总结发", "文字发")):
+        action = "text_send"
+    elif has_run_verb:
+        action = "run_full"
+    else:
+        action = "capture_send"
+
+    run_cfg["enable_dingtalk"] = True
+    run_cfg["dt_auto_send"] = True
+    run_cfg["enable_capture"] = True
+    if "取消静音" in raw or "不静音" in raw:
+        run_cfg["dt_silent_send"] = False
+    elif "静音" in raw:
+        run_cfg["dt_silent_send"] = True
+    run_cfg["dt_targets"] = [{"name": t, "enabled": True} for t in resolved_list]
+    run_cfg["dt_search"] = resolved_list[0]
+    run_cfg["_smart_target_candidates"] = search_cand_map
+
+    if date_spec.get("explicit"):
+        sp = run_cfg.setdefault("summary_presets", {})
+        sp["enabled"] = True
+        items = sp.setdefault("items", [])
+        d2 = next((it for it in items if isinstance(it, dict) and str(it.get("cell") or "").upper() == "D2"), None)
+        if d2 is None:
+            d2 = {"enabled": True, "sheet": "数据汇总", "cell": "D2", "label": "查询日期", "action": "today", "date_fmt": "YYYY年M月D日", "day_offset": 0}
+            items.insert(0, d2)
+        d2["enabled"] = True
+        if date_spec.get("mode") == "exact":
+            d2["action"] = "value"
+            d2["value"] = date_spec["formatted_cn"]
+            run_cfg["dt_suffix"] = f"{date_spec['label']}数据"
+        else:
+            d2["action"] = "today"
+            d2["cutoff_enabled"] = False
+            d2["day_offset"] = int(date_spec.get("day_offset", 0))
+            run_cfg["dt_cutoff_enabled"] = False
+            run_cfg["dt_day_offset"] = int(date_spec.get("day_offset", 0))
+
+    act_label = {
+        "run_full": "后台全流程跑表 + 截图发钉钉",
+        "capture_send": "按指定日期刷新汇总表并截图发钉钉",
+        "text_send": "整理实时数据文字战报并直发钉钉",
+    }[action]
+
+    tgt_str = "、".join(resolved_list)
+    note_line = f"（{'；'.join(res_notes)}）" if res_notes else ""
+    reply = (
+        f"收到！我已经完全理解您的意思，正在为您启动单次临时任务（不会改动您的日常默认定时配置）：\n"
+        f"• **执行动作**：{act_label}\n"
+        f"• **数据日期**：{date_spec['label']}\n"
+        f"• **钉钉发送目标**：**{tgt_str}** {note_line}\n\n"
+        f"搜索钉钉对象时如果直接搜全称没命中，我会自动尝试简称/关联名字并对照结果列表自己确认后再发送，完成后会第一时间通知您！"
+    )
+    return {
+        "handled": True,
+        "action": action,
+        "run_cfg": run_cfg,
+        "targets": resolved_list,
+        "target_notes": res_notes,
+        "date_spec": date_spec,
+        "reply": reply,
+    }
+
+
+def _build_config_verification_summary(new_cfg, changes):
+    """为 AI 自然语言自动设排期后生成详尽的大白话核对结果清单，请用户确认是否符合预期。"""
+    c = normalize_config(new_cfg)
+    w_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    dmode = c.get("day_mode", "daily")
+    if dmode == "workday":
+        day_desc = "工作日（周一至周五）"
+    elif dmode == "weekend":
+        day_desc = "周末（周六、周日）"
+    elif dmode == "custom":
+        cds = [w_names[i] for i in (c.get("custom_days") or []) if 0 <= int(i) <= 6]
+        day_desc = "自定义（" + ("、".join(cds) if cds else "未选") + "）"
+    else:
+        day_desc = "每天（周一至周日）"
+
+    tt = build_daily_timetable(c)
+    tt_times = [pt["time"] for pt in tt]
+    if len(tt_times) > 10:
+        tt_desc = f"共 {len(tt_times)} 个时间点（{'、'.join(tt_times[:5])} … 等至 {tt_times[-1]}）"
+    elif tt_times:
+        tt_desc = f"共 {len(tt_times)} 个时间点：{'、'.join(tt_times)}"
+    else:
+        tt_desc = "暂无有效执行时间点"
+
+    targets = get_enabled_dt_targets(c)
+    tgt_desc = "、".join(targets) if targets else "暂未启用任何群聊（将跳过发钉钉）"
+
+    sp_items = ((c.get("summary_presets") or {}).get("items") or [])
+    d2 = next((it for it in sp_items if isinstance(it, dict) and str(it.get("cell", "")).upper() == "D2"), None)
+    d2_desc = "当天"
+    if d2:
+        off = int(d2.get("day_offset", 0) or 0)
+        d2_desc = "昨天（前一天 -1 天）" if off == -1 else ("前天（-2天）" if off == -2 else (f"当天 ({off:+d}天)" if off else "当天（0天）"))
+
+    cell_notes = []
+    for it in sp_items:
+        if not isinstance(it, dict) or not it.get("enabled", True):
+            continue
+        cell = str(it.get("cell") or "").upper()
+        act = it.get("action", "value")
+        val = str(it.get("value") or "")
+        if cell in ("L3", "L4", "F2", "H4", "I4") or act == "value":
+            if val:
+                cell_notes.append(f"{cell}={val}")
+
+    send_mode_txt = "粘贴后直接自动发送" if c.get("dt_auto_send") else "只贴进输入框暂不自动按 Enter"
+    silent_txt = "静音发送" if c.get("dt_silent_send", True) else "常规提醒发送"
+    delay_sec = c.get("dt_paste_delay_sec", 3)
+
+    # 配套核验提示
+    warnings = []
+    if c.get("enable_dingtalk") and not targets:
+        warnings.append("您还没有指定目标钉钉群名，记得补上一句「发到 XX群」。")
+    if not c.get("enable_dingtalk"):
+        warnings.append("「自动发送到钉钉」目前未打开，如要发群请说「顺便开启自动发钉钉」。")
+
+    lines = [
+        "已根据您的指令自动改好以下设置并立即保存生效：",
+        "• **实际改动项**：" + ("；".join(changes) if changes else "已按要求校准配置"),
+        "",
+        "### 请您核对一下，这样设置对不对？",
+        f"1. **执行周期**：{day_desc}",
+        f"2. **每天触发时间**：{tt_desc}",
+        f"3. **要的数据日期**：表格 D2 日期 = **{d2_desc}**" + (f"（关键自定义格：{', '.join(cell_notes[:6])}）" if cell_notes else ""),
+        f"4. **目标钉钉会话**：**{tgt_desc}**",
+        f"5. **投递方式与等待**：{'自动打开钉钉发送' if c.get('enable_dingtalk') else '仅写表不发钉钉'}｜{silent_txt}｜{send_mode_txt}｜打开聊天后等 {delay_sec} 秒粘贴",
+        "",
+        "（提示：若您只是先预设方案还没开启自动定时跑，别忘了点首页左下角【自动值守】卡片启动值守；以上哪一项要修改，直接回复我一句话就能立刻帮您改好！）",
+    ]
+    if warnings:
+        lines.append("⚠️ **自检提醒**：" + " ".join(warnings))
+    return "\n".join(lines)
+
+
+def try_handle_ai_config_command(user_text, cfg):
+    """识别用户用自然语言直接设定定时计划、数据日期、单元格内容与钉钉发送目标的指令，并返回新配置与核对回复。"""
+    raw = str(user_text or "").strip()
+    if not raw or check_ai_security_and_creator_guardrail(raw):
+        return {"handled": False}
+
+    # 排除单纯询问“怎么设置/为什么/是不是”的问题（除非带了明确的修改动作+时间或发送目标）
+    question_only = ("怎么设置", "如何设置", "在哪设置", "哪里设置", "为什么", "能不能", "你是谁", "分析", "总结", "对比", "复盘")
+    has_setter_verb = any(k in raw for k in ("帮我设", "给我设", "帮我改", "给我改", "帮我调", "帮我安排", "请设置", "设置为", "设为", "改成", "改为", "调整为", "定在", "定为", "配置成"))
+    has_send_cmd = any(k in raw for k in ("发送到", "发到", "投递到", "发给", "发送给")) and any(k in raw for k in ("点", ":", "：", "每天", "每周", "周", "工作日", "昨天", "今天", "群", "助手"))
+    if any(q in raw for q in question_only) and not has_setter_verb:
+        return {"handled": False}
+    if not (has_setter_verb or has_send_cmd):
+        return {"handled": False}
+
+    import copy
+    new_cfg = normalize_config(copy.deepcopy(cfg if isinstance(cfg, dict) else {}))
+    changes = []
+
+    # 1. 解析运行日期周期
+    wk_map = {"一": 0, "1": 0, "二": 1, "2": 1, "三": 2, "3": 2, "四": 3, "4": 3, "五": 4, "5": 4, "六": 5, "6": 5, "日": 6, "天": 6, "7": 6}
+    rng_m = re.search(r"(?:周|星期)([一二三四五六日天1-7])\s*(?:到|至|-|~)\s*(?:周|星期)?([一二三四五六日天1-7])", raw)
+    if "工作日" in raw or (rng_m and wk_map.get(rng_m.group(1)) == 0 and wk_map.get(rng_m.group(2)) == 4):
+        new_cfg["day_mode"] = "workday"
+        changes.append("运行周期设为「工作日(周一至周五)」")
+    elif "非工作日" in raw or "周末" in raw or (rng_m and wk_map.get(rng_m.group(1)) == 5 and wk_map.get(rng_m.group(2)) == 6):
+        new_cfg["day_mode"] = "weekend"
+        changes.append("运行周期设为「周末(周六/周日)」")
+    elif rng_m:
+        s_d = wk_map.get(rng_m.group(1), 0)
+        e_d = wk_map.get(rng_m.group(2), 4)
+        days = list(range(s_d, e_d + 1)) if s_d <= e_d else (list(range(s_d, 7)) + list(range(0, e_d + 1)))
+        new_cfg["day_mode"] = "custom"
+        new_cfg["custom_days"] = sorted(set(days))
+        changes.append(f"运行星期设为周{rng_m.group(1)}至周{rng_m.group(2)}")
+    else:
+        found_days = []
+        for dm in re.finditer(r"(?:每周|周|星期)([一二三四五六日天、,，和及与\s]+)", raw):
+            for ch in dm.group(1):
+                if ch in wk_map and wk_map[ch] not in found_days:
+                    found_days.append(wk_map[ch])
+        if found_days:
+            new_cfg["day_mode"] = "custom"
+            new_cfg["custom_days"] = sorted(found_days)
+            wn = ["一", "二", "三", "四", "五", "六", "日"]
+            changes.append("运行星期设为「" + "、".join("周" + wn[i] for i in new_cfg["custom_days"]) + "」")
+        elif "每天" in raw or "每日" in raw:
+            new_cfg["day_mode"] = "daily"
+            changes.append("运行周期设为「每天」")
+
+    # 2. 解析时间段与触发点
+    def _norm_h(h_val, ctx_str=""):
+        hv = int(h_val) % 24
+        if any(k in ctx_str for k in ("下午", "晚上", "晚间", "夜里")) and 1 <= hv <= 11:
+            hv += 12
+        return hv
+
+    range_t = re.search(
+        r"(上午|早上|下午|晚上|夜间)?\s*(\d{1,2})\s*(?:[:：时]|点\s*(?:(半)|(\d{1,2})分?)?)\s*(?:到|至|-|~)\s*(上午|早上|下午|晚上|夜间)?\s*(\d{1,2})\s*(?:[:：时]|点\s*(?:(半)|(\d{1,2})分?)?)?",
+        raw,
+    )
+    if range_t:
+        sh = _norm_h(range_t.group(2), range_t.group(1) or "")
+        sm = 30 if range_t.group(3) else int(range_t.group(4) or 0)
+        eh = _norm_h(range_t.group(6), range_t.group(5) or "")
+        em = 30 if range_t.group(7) else int(range_t.group(8) or 0)
+        new_cfg["day"]["sh"], new_cfg["day"]["sm"] = sh, max(0, min(59, sm))
+        new_cfg["day"]["eh"], new_cfg["day"]["em"] = eh, max(0, min(59, em))
+        iv_m = re.search(r"每(?:隔)?\s*(?:(\d+)\s*(?:个)?小时)?\s*(?:(\d+)\s*分钟?)?", raw)
+        if iv_m and (iv_m.group(1) or iv_m.group(2)):
+            new_cfg["day"]["ih"] = int(iv_m.group(1) or 0)
+            new_cfg["day"]["im"] = int(iv_m.group(2) or 0)
+        if "夜" not in raw and "晚间" not in raw:
+            new_cfg["night_enabled"] = False
+        changes.append(f"运行时间段设为 {sh:02d}:{sm:02d} ~ {eh:02d}:{em:02d}（间隔 {new_cfg['day']['ih']}h{new_cfg['day']['im']}m）")
+    else:
+        single_pts = []
+        for tm in re.finditer(r"(上午|早上|下午|晚上|夜间)?\s*(\d{1,2})\s*(?:[:：]\s*(\d{1,2})|点\s*(?:(半)|(\d{1,2})\s*分?)?)", raw):
+            hv = _norm_h(tm.group(2), tm.group(1) or "")
+            mv = 30 if tm.group(4) else int(tm.group(3) or tm.group(5) or 0)
+            if 0 <= hv <= 23 and 0 <= mv <= 59:
+                single_pts.append((hv, mv))
+        if single_pts:
+            # 单个定点设置：让 eh/em 紧接 +1 分钟（span=1分钟），排期表精准只出这一个时间点！
+            h0, m0 = single_pts[0]
+            end_tot = (h0 * 60 + m0 + 1) % 1440
+            new_cfg["day"] = {"sh": h0, "sm": m0, "eh": end_tot // 60, "em": end_tot % 60, "ih": 1, "im": 0}
+            new_cfg["night_enabled"] = False
+            if len(single_pts) > 1:
+                h_last, m_last = single_pts[-1]
+                new_cfg["night_enabled"] = True
+                end2 = (h_last * 60 + m_last + 1) % 1440
+                new_cfg["night"] = {"sh": h_last, "sm": m_last, "eh": end2 // 60, "em": end2 % 60, "ih": 1, "im": 0}
+                changes.append(f"定点触发设为 {h0:02d}:{m0:02d} 与 {h_last:02d}:{m_last:02d}")
+            else:
+                changes.append(f"每日定点执行设为 {h0:02d}:{m0:02d}")
+
+    # 3. 解析要什么数据与自定义单元格
+    sp_items = new_cfg.setdefault("summary_presets", {}).setdefault("items", [])
+    if any(k in raw for k in ("昨天数据", "昨天的数据", "前一天数据", "昨日数据", "减1天", "减一天")):
+        new_cfg["summary_presets"]["enabled"] = True
+        d2 = next((it for it in sp_items if isinstance(it, dict) and str(it.get("cell", "")).upper() == "D2"), None)
+        if d2 is not None:
+            d2["enabled"] = True
+            d2["day_offset"] = -1
+        changes.append("表格查询日期(D2)设为「昨天(-1天)」")
+    elif any(k in raw for k in ("今天数据", "今天的数据", "当天数据", "今日数据")):
+        new_cfg["summary_presets"]["enabled"] = True
+        d2 = next((it for it in sp_items if isinstance(it, dict) and str(it.get("cell", "")).upper() == "D2"), None)
+        if d2 is not None:
+            d2["enabled"] = True
+            d2["day_offset"] = 0
+        changes.append("表格查询日期(D2)设为「当天(0天)」")
+
+    for cm in re.finditer(r"([A-Z]{1,3}\d+(?::[A-Z]{1,3}\d+)?)\s*(?:格|单元格)?\s*(?:写入|填入|填|设为|改成|改为)\s*[「\"'『]?([^\s，。,.;；\n」\"'』]{1,36})[」\"'』]?", raw):
+        c_addr = cm.group(1).upper()
+        c_val = cm.group(2).strip()
+        if c_val:
+            new_cfg["summary_presets"]["enabled"] = True
+            hit = next((it for it in sp_items if isinstance(it, dict) and str(it.get("cell", "")).upper() == c_addr), None)
+            if hit is not None:
+                hit["enabled"] = True
+                hit["action"] = "clear" if c_val in ("空", "清空") else "value"
+                if c_val not in ("空", "清空"):
+                    hit["value"] = c_val
+            else:
+                sp_items.append({
+                    "enabled": True, "sheet": "数据汇总", "cell": c_addr, "label": "AI指令设定",
+                    "action": "clear" if c_val in ("空", "清空") else "value",
+                    "value": "" if c_val in ("空", "清空") else c_val,
+                })
+            changes.append(f"单元格 {c_addr} 写入设为「{c_val}」")
+
+    # 4. 解析目标钉钉群与投递参数
+    tgt_m = re.search(r"(?:发送到|投递到|发到|发给|发送给|到群|在群)\s*[「\"『]?([^，。,.;；\n」\"'』]{2,40})[」\"'』]?", raw)
+    if tgt_m:
+        raw_t = re.sub(r"(?:里面|中|去|里|群里)$", "", tgt_m.group(1).strip()).strip()
+        # 剔除可能连带抓到的数据/方式词
+        raw_t = re.split(r"(?:顺便|并|然后|延迟|等待|静音)", raw_t)[0].strip()
+        t_names = [x.strip() for x in re.split(r"[、,，和与]+", raw_t) if x.strip()]
+        if t_names:
+            new_cfg["dt_targets"] = [{"name": n, "enabled": True} for n in t_names]
+            new_cfg["dt_search"] = t_names[0]
+            new_cfg["enable_dingtalk"] = True
+            if not any(k in raw for k in ("不自动发", "不发", "暂不发送", "只粘贴")):
+                new_cfg["dt_auto_send"] = True
+            changes.append("目标钉钉会话设为「" + "、".join(t_names) + "」并开启自动投递")
+
+    if "仅截图" in raw or "只截图" in raw:
+        new_cfg["enable_capture"] = True
+    if "取消静音" in raw or "不静音" in raw or "常规提醒" in raw:
+        new_cfg["dt_silent_send"] = False
+        changes.append("发送方式设为「常规提醒(非静音)」")
+    elif "静音" in raw:
+        new_cfg["enable_dingtalk"] = True
+        new_cfg["dt_silent_send"] = True
+        changes.append("发送方式设为「静音发送」")
+
+    delay_m = re.search(r"(?:粘贴|打开聊天|等待|延迟)\s*(\d{1,2})\s*秒", raw)
+    if delay_m:
+        sec_v = max(0, min(20, int(delay_m.group(1))))
+        new_cfg["dt_paste_delay_sec"] = sec_v
+        changes.append(f"粘贴前等待设为 {sec_v} 秒")
+
+    ft_m = re.search(r"(?:重点(?:关注|看|统计)|只看|聚焦)\s*[「\"']?([\u4e00-\u9fffA-Za-z0-9]{2,12}组)[」\"']?", raw)
+    if ft_m:
+        new_cfg.setdefault("ai_assistant", {})["focus_team"] = ft_m.group(1)
+        changes.append(f"AI 重点关注组设为「{ft_m.group(1)}」")
+
+    if not changes:
+        return {"handled": False}
+
+    new_cfg = normalize_config(new_cfg)
+    return {
+        "handled": True,
+        "new_cfg": new_cfg,
+        "changes": changes,
+        "reply": _build_config_verification_summary(new_cfg, changes),
+    }
+
+
+def summarize_report_with_ai(cfg, style_id="brief", user_prompt="", chat_history=None, extra_img_path=None):
+    """内置全能 AI 管家：回答软件身份/操作/状态、安全护栏拦截、自动设置排期、解读高清汇总图并结合历次档案综合分析。"""
+    norm = normalize_config(cfg if isinstance(cfg, dict) else {})
+    ai_cfg = norm.get("ai_assistant") or {}
+    focus_team = str(ai_cfg.get("focus_team") or "").strip()
+    styles_map = build_ai_summary_styles(focus_team)
+    sid = str(style_id or "brief").strip().lower()
+    style_meta = styles_map.get(sid)
+
+    raw_user = str(user_prompt or "").strip()
+    guard_reply = check_ai_security_and_creator_guardrail(raw_user)
+    if guard_reply:
+        return {
+            "ok": True,
+            "source": "guardrail",
+            "model": "",
+            "shot_info": "安全边界与版权声明",
+            "reply": guard_reply,
+        }
+
+    ctx = collect_report_context_for_ai(include_prev_shot=(sid == "delta"), extra_img_path=extra_img_path)
+
+    custom_tail = str(ai_cfg.get("custom_summary_prompt") or "").strip()
+    effective_prompt = raw_user
+    if not effective_prompt:
+        if style_meta:
+            effective_prompt = style_meta["prompt"]
+        else:
+            effective_prompt = styles_map["brief"]["prompt"]
+    elif style_meta and sid != "custom":
+        effective_prompt = f"参考【{style_meta['name']}】风格（{style_meta['prompt']}），并重点按我的要求输出：{effective_prompt}"
+    if custom_tail and sid != "custom":
+        effective_prompt += f"\n补充长期要求：{custom_tail}"
+
+    arch_ctx = build_archive_query_context(effective_prompt, focus_team=focus_team)
+    cfg_snap = _safe_ai_cfg_snapshot(norm)
+    data_brief = get_dashboard_data_brief()
+    recent_logs = _get_recent_logs_tail(18)
+    recent_logs_txt = "\n".join(recent_logs)
+    is_troubleshoot_q = any(k in effective_prompt.lower() for k in ("报错", "失败", "为什么", "第一次", "第二次", "怎么改", "代码", "antigravity", "顺序"))
+    hist_diff = build_historical_failure_diff_context(norm, _last_diagnosed_detail, recent_logs=recent_logs) if is_troubleshoot_q else ""
+    ag_prompt = build_antigravity_prompt(norm, _last_diagnosed_detail, hist_ctx_text=hist_diff, recent_logs=recent_logs) if is_troubleshoot_q else ""
+    shot_info = ctx["latest_shot_label"] or (
+        f"历史档案 ({data_brief['archive_count']} 轮)" if data_brief.get("has_archive") else "软件内置知识与配置态"
+    )
+    if ctx["prev_shot_label"]:
+        shot_info += f" 对比 {ctx['prev_shot_label']}"
+
+    focus_rule = f"（当前用户指定重点关注【{focus_team}】）" if focus_team else "（当前未锁定单个团队，请公平客观评价所有参与计算的小组，严禁偏向任何一组）"
+    sys_prompt = (
+        "你是桌面自动化软件「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴与运营数据分析师（由 Soren Drake 设计）。\n"
+        f"{_SHEETMATE_AI_KNOWLEDGE}\n"
+        "回答原则：\n"
+        "1. 绝对不要说出任何外部 AI 公司、外部大模型或接口名称（不要提 Google/Gemini/GPT 等），若问你是谁，回答我是「暗号表助手专属内置智能小猫伙伴」，由【Soren Drake】设计；\n"
+        "2. 严禁回答或透露任何密码、口令、权限配置、后台入口或他人隐私信息，被问到直接告知无权读取与访问；\n"
+        "3. 若用户问怎么操作、怎么改配置或某功能怎么用，请结合上方软件说明书给出具体到菜单页签和按钮名称的大白话步骤；\n"
+        f"4. 若用户总结数据、点名追问某个成员或某个团队的数据与趋势{focus_rule}，务必结合表格高清截图、后台明细表与【持久化历次数据档案】给出的真实数字回答，严禁编造数字；\n"
+        "5. 全程使用亲切有感情的真人同事口吻，条理清晰。"
+    )
+
+    contents = []
+    first_parts = [{
+        "text": (
+            f"【实时软件配置快照】{json.dumps(cfg_snap, ensure_ascii=False)}\n"
+            f"【顶部数据看板摘要】{json.dumps(data_brief, ensure_ascii=False)}\n"
+            f"【持久化历次表格档案检索上下文】\n{arch_ctx}\n"
+            + (f"【历次运行成败对比分析】\n{hist_diff}\n" if hist_diff else "")
+            + (f"【发给 Antigravity 的改代码参考模板】\n{ag_prompt}\n" if ag_prompt else "")
+            + (f"【最近运行日志节选】\n{recent_logs_txt}\n" if recent_logs_txt else "")
+        )
+    }]
+    for idx, im_item in enumerate(ctx["images"]):
+        label = "【最新一轮汇总表高清截图" if idx == 0 else "【上一轮对比汇总表高清截图"
+        first_parts.append({"text": f"{label}（拍摄时间：{im_item['mtime_str']}，文件：{im_item['name']}）】"})
+        first_parts.append({"inlineData": {"mimeType": "image/png", "data": im_item["b64"]}})
+    if ctx["tsv_text"]:
+        first_parts.append({"text": f"【桌面明细表精确文本摘录】\n{ctx['tsv_text']}"})
+
+    hist = [it for it in (chat_history or []) if isinstance(it, dict) and str(it.get("text") or "").strip()]
+    if hist:
+        first_msg = hist[0]
+        first_parts.append({"text": str(first_msg.get("text"))})
+        contents.append({"role": "user" if first_msg.get("role") != "model" else "model", "parts": first_parts})
+        for turn in hist[1:]:
+            contents.append({
+                "role": "model" if turn.get("role") == "model" else "user",
+                "parts": [{"text": str(turn.get("text"))}],
+            })
+        contents.append({"role": "user", "parts": [{"text": effective_prompt}]})
+    else:
+        first_parts.append({"text": effective_prompt})
+        contents.append({"role": "user", "parts": first_parts})
+
+    call_res = _call_gemini_generate(norm, sys_prompt, contents, temperature=0.35, max_tokens=1050, timeout_sec=26)
+
+    if call_res.get("ok"):
+        return {
+            "ok": True,
+            "source": call_res["source"],
+            "model": call_res["model"],
+            "shot_info": shot_info,
+            "reply": call_res["reply"],
+        }
+
+    err_msg = call_res.get("error") or "请求失败"
+    return {
+        "ok": True,
+        "source": "local_fallback",
+        "model": "",
+        "api_error": err_msg,
+        "shot_info": shot_info,
+        "reply": _local_smart_chat_fallback(
+            norm,
+            effective_prompt,
+            arch_ctx,
+            api_err=err_msg,
+            hist_diff=hist_diff,
+            ag_prompt=ag_prompt,
+        ),
+    }
+
+
+def ask_gemini_assistant(cfg, mode="diagnose", error_detail=None, recent_logs=None, question=""):
+    """调用内置云端/本地智能分析引擎生成大白话报错复盘（含历史成败对比）、模块顺序自调建议及改代码提示词。"""
+    norm = normalize_config(cfg if isinstance(cfg, dict) else {})
+    ai_cfg = norm.get("ai_assistant") or {}
+    if mode == "ask" and question:
+        guard_r = check_ai_security_and_creator_guardrail(question)
+        if guard_r:
+            return {
+                "ok": True,
+                "source": "guardrail",
+                "model": "",
+                "hist_summary": "",
+                "recommended_tuning": {"has_tuning": False, "patch": {}, "summary": "", "reasons": []},
+                "antigravity_prompt": "",
+                "reply": guard_r,
+            }
+    cfg_snap = _safe_ai_cfg_snapshot(norm)
+    err_d = error_detail if isinstance(error_detail, dict) else {}
+    logs_list = [str(x) for x in (recent_logs or _get_recent_logs_tail(28))[-28:]]
+    logs_tail = "\n".join(logs_list)
+
+    hist_diff = build_historical_failure_diff_context(norm, err_d, recent_logs=logs_list)
+    tuning_rec = recommend_pipeline_tuning_for_error(norm, err_d, hist_diff) if err_d.get("code") else {"has_tuning": False, "patch": {}, "summary": "", "reasons": []}
+    ag_prompt = build_antigravity_prompt(norm, err_d, hist_ctx_text=hist_diff, recent_logs=logs_list) if (mode == "diagnose" or err_d.get("code")) else ""
+
+    if not ai_cfg.get("enabled", True):
+        return {
+            "ok": True,
+            "source": "disabled",
+            "model": "",
+            "hist_summary": hist_diff,
+            "recommended_tuning": tuning_rec,
+            "antigravity_prompt": ag_prompt,
+            "reply": _local_ai_fallback_reply(
+                mode, err_d, cfg_snap, question=question,
+                hist_ctx=hist_diff, ag_prompt=ag_prompt, tuning_rec=tuning_rec,
+            ),
+        }
+
+    sys_prompt = (
+        "你是桌面自动化软件「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴与运营故障分析师（由 Soren Drake 设计）。\n"
+        f"{_SHEETMATE_AI_KNOWLEDGE}\n"
+        "重要要求：\n"
+        "1. 绝对不要说出任何外部 AI 公司、外部大模型或接口名称（禁止提及 Google、Gemini、GPT、DeepSeek 等），若问你是谁，回答我是「暗号表助手专属内置智能小猫伙伴」，由【Soren Drake】设计；\n"
+        "2. 严禁回答或透露任何密码、口令、权限配置、后台入口或他人隐私信息，被问到直接告知无权读取与访问；\n"
+        "3. 必须用极度通俗易懂、像真人同事一样温暖亲切的【大白话】回答，绝对不要只丢干瘪英文术语。\n"
+        "4. 报错排障（mode=diagnose）时必须结合【历次运行成败对比】和【源码模块地图】严格按以下四段结构输出（每段清晰实用）：\n"
+        "   ### ① 这次到底为什么卡住了？\n"
+        "   ### ② 为什么之前能成功，这次却失败了？（历史对比）\n"
+        "   ### ③ 软件自己怎么调执行顺序马上好？\n"
+        "   ### ④ 怎么跟 Antigravity 沟通改源码？（点明要改哪几个模块及顺序怎么调）\n"
+        "5. 配置优化（mode=suggest）时，结合 WPS 自定义单元格写入、钉钉粘贴等待秒数、发后最小化钉钉与内部执行顺序给 3~4 条防踩坑建议。\n"
+    )
+
+    if mode == "suggest":
+        user_prompt = (
+            f"请帮我全面审核当前配置，指出潜在踩坑并给出 3~4 条大白话优化建议：\n"
+            f"配置摘要：{json.dumps(cfg_snap, ensure_ascii=False)}\n"
+            f"历次运行统计：\n{hist_diff}\n"
+            + (f"附加补充要求：{question}\n" if question else "")
+        )
+    elif mode == "ask":
+        user_prompt = (
+            f"用户提问：{question or '请介绍当前如何配置最稳'}\n"
+            f"当前配置摘要：{json.dumps(cfg_snap, ensure_ascii=False)}\n"
+            + (f"历次运行统计：\n{hist_diff}\n" if hist_diff else "")
+            + (f"最近报错：{json.dumps(err_d, ensure_ascii=False)}\n" if err_d.get("code") else "")
+            + (f"最近运行日志：\n{logs_tail}\n" if logs_tail else "")
+        )
+    else:
+        user_prompt = (
+            f"程序运行刚才报错或卡住了，请结合历史成败记录对比分析：\n"
+            f"错误代码：{err_d.get('code', 'ERR-RUN-900')}｜标题：{err_d.get('title', '运行异常')}\n"
+            f"原始错误：{err_d.get('raw_error', '')}\n"
+            f"异常位置：{err_d.get('location', '未知')}\n"
+            f"当前配置与执行顺序：{json.dumps(cfg_snap, ensure_ascii=False)}\n"
+            f"【历次运行成败自动对比】\n{hist_diff}\n"
+            f"【软件自检模块调优建议】{tuning_rec.get('summary')}\n"
+            + (f"【最近运行日志】\n{logs_tail}\n" if logs_tail else "")
+            + (f"【用户补充描述】{question}\n" if question else "")
+        )
+
+    call_res = _call_gemini_generate(
+        norm,
+        sys_prompt,
+        [{"role": "user", "parts": [{"text": user_prompt}]}],
+        temperature=0.35,
+        max_tokens=1100,
+        timeout_sec=20,
+    )
+    if call_res.get("ok"):
+        reply_txt = call_res["reply"]
+        if mode == "diagnose" or err_d.get("code"):
+            ag_prompt = build_antigravity_prompt(
+                norm, err_d, hist_ctx_text=hist_diff, recent_logs=logs_list, ai_code_advice=reply_txt[:450],
+            )
+        return {
+            "ok": True,
+            "source": call_res["source"],
+            "model": call_res["model"],
+            "hist_summary": hist_diff,
+            "recommended_tuning": tuning_rec,
+            "antigravity_prompt": ag_prompt,
+            "reply": reply_txt,
+        }
+
+    last_err = call_res.get("error") or "接口未响应"
+    fallback = _local_ai_fallback_reply(
+        mode, err_d, cfg_snap, question=question,
+        hist_ctx=hist_diff, ag_prompt=ag_prompt, tuning_rec=tuning_rec,
+    )
+    return {
+        "ok": True,
+        "source": "local_fallback",
+        "model": "",
+        "api_error": last_err,
+        "hist_summary": hist_diff,
+        "recommended_tuning": tuning_rec,
+        "antigravity_prompt": ag_prompt,
+        "reply": f"{fallback}\n\n（当前已为您切换本地离线智能分析模式生成诊断）",
+    }
+
+
+_AI_HEAL_ALLOWED_ACTIONS = (
+    "activate_dingtalk_im",
+    "dismiss_popups",
+    "focus_chat_input",
+    "enable_silent_uia",
+    "click_send_now",
+    "retry_paste",
+    "reopen_search",
+    "wps_escape_retry",
+    "page_reload_retry",
+)
+
+
+def _capture_live_debug_context(stage, exc=None, extra=None, page=None):
+    """采集卡住现场的桌面/网页截图及 Win32 前台窗口遥测，供 AI 看图诊断并制定自愈动作。"""
+    import base64
+    extra = extra or {}
+    img_b64 = ""
+    try:
+        raw_png = None
+        if page is not None:
+            raw_png = page.screenshot(type="png")
+        elif os.name == "nt":
+            from PIL import ImageGrab
+            grab_im = ImageGrab.grab()
+            if grab_im is not None:
+                im = grab_im.convert("RGB")
+                if max(im.width, im.height) > 1280:
+                    ratio = 1280.0 / float(max(im.width, im.height))
+                    im = im.resize(
+                        (max(1, int(im.width * ratio)), max(1, int(im.height * ratio))),
+                        Image.Resampling.LANCZOS,
+                    )
+                buf = io.BytesIO()
+                im.save(buf, format="PNG", optimize=True)
+                img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        if raw_png:
+            im = Image.open(io.BytesIO(raw_png)).convert("RGB")
+            if max(im.width, im.height) > 1280:
+                ratio = 1280.0 / float(max(im.width, im.height))
+                im = im.resize(
+                    (max(1, int(im.width * ratio)), max(1, int(im.height * ratio))),
+                    Image.Resampling.LANCZOS,
+                )
+            buf = io.BytesIO()
+            im.save(buf, format="PNG", optimize=True)
+            img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        pass
+
+    fg_hwnd = 0
+    fg_cls = ""
+    fg_title = ""
+    fg_is_aux = False
+    im_wins_info = []
+    search_open = False
+    has_complex_modal = False
+    if os.name == "nt":
+        try:
+            u32 = ctypes.WinDLL("user32", use_last_error=True)
+            fg_hwnd = int(u32.GetForegroundWindow() or 0)
+            if fg_hwnd:
+                cbuf = ctypes.create_unicode_buffer(128)
+                tbuf = ctypes.create_unicode_buffer(256)
+                u32.GetClassNameW(fg_hwnd, cbuf, 128)
+                u32.GetWindowTextW(fg_hwnd, tbuf, 256)
+                fg_cls, fg_title = cbuf.value, tbuf.value
+                fg_is_aux = _is_dingtalk_aux_window(fg_cls, fg_title)
+        except Exception:
+            pass
+        try:
+            for hw, pid, cls, ttl, sc in _enum_dingtalk_im_windows(include_hidden=True)[:5]:
+                im_wins_info.append({"hwnd": hw, "pid": pid, "cls": cls, "title": ttl, "score": sc})
+            search_open = _is_search_popup_open()
+            has_complex_modal = bool(_enum_top_windows(target_classes=("ddesign::ComplexModal",), target_titles=None))
+        except Exception:
+            pass
+
+    return {
+        "stage": str(stage or ""),
+        "error": str(exc or ""),
+        "extra": dict(extra),
+        "img_b64": img_b64,
+        "telemetry": {
+            "foreground": {"hwnd": fg_hwnd, "cls": fg_cls, "title": fg_title, "is_dt_aux_window": fg_is_aux},
+            "dingtalk_im_windows": im_wins_info,
+            "search_popup_open": search_open,
+            "complex_modal_open": has_complex_modal,
+            "recent_logs": _get_recent_logs_tail(18),
+        },
+    }
+
+
+def _local_heuristic_auto_heal_plan(stage, exc, ctx, cfg):
+    """离线或 AI 超时情况下的确定性现场自愈规则，保障钉钉误窗、富文本未发送与弹窗卡阻可自动恢复。"""
+    st = str(stage or "").lower()
+    err_l = str(exc or "").lower()
+    telem = ctx.get("telemetry") or {}
+    fg = telem.get("foreground") or {}
+    extra = ctx.get("extra") or {}
+    auto_send = bool((cfg or {}).get("dt_auto_send", False))
+
+    if st in ("dingtalk_search", "dingtalk_paste"):
+        if fg.get("is_dt_aux_window"):
+            acts = ["dismiss_popups", "activate_dingtalk_im", "reopen_search" if st == "dingtalk_search" else "retry_paste"]
+            return {
+                "observation": f"检测到当前误停在钉钉附属窗口「{fg.get('title') or fg.get('cls')}」，未切回聊天主窗。",
+                "can_auto_fix": True,
+                "actions": acts,
+                "summary": "关闭附属浮层并强力唤醒钉钉聊天主窗后自动续跑。",
+            }
+        if st == "dingtalk_paste" and (
+            extra.get("image_pasted") and extra.get("text_pasted")
+            or any(k in err_l for k in ("静音", "uia", "no windows", "menu", "菜单", "send", "发送", "箭头"))
+        ):
+            acts = ["dismiss_popups", "activate_dingtalk_im", "enable_silent_uia"]
+            if auto_send:
+                acts.append("click_send_now")
+            else:
+                acts.append("focus_chat_input")
+            return {
+                "observation": "表格图片与日期文案已贴入输入框，但静音切换/富文本发送按钮触发受阻。",
+                "can_auto_fix": True,
+                "actions": acts,
+                "summary": "清除弹出遮挡、直连聊天主窗设静音后点击发送按钮完成投递。",
+            }
+        acts = ["dismiss_popups", "activate_dingtalk_im", "reopen_search" if st == "dingtalk_search" else "retry_paste"]
+        return {
+            "observation": "检测到搜索窗、模态弹窗或窗口焦点偏移影响了当前步骤。",
+            "can_auto_fix": True,
+            "actions": acts,
+            "summary": "复位窗口焦点与弹窗后自动重试当前步骤。",
+        }
+
+    if st in ("wps_capture", "wps_paste"):
+        return {
+            "observation": "WPS 在线表格页面可能被提示窗或旧选区焦点阻挡。",
+            "can_auto_fix": True,
+            "actions": ["wps_escape_retry"],
+            "summary": "发送 Escape 清理遮挡弹窗并重新校准页面缩放后自动重试。",
+        }
+
+    if st == "luya_download":
+        return {
+            "observation": "数据后台表格渲染较慢导致下载按钮未及时出现。",
+            "can_auto_fix": True,
+            "actions": ["page_reload_retry"],
+            "summary": "刷新当前数据页面并延长等待后重试下载。",
+        }
+
+    return {
+        "observation": "当前异常依赖人工确认现场。",
+        "can_auto_fix": False,
+        "actions": [],
+        "summary": "需人工介入处理。",
+    }
+
+
+def ai_auto_debug_and_heal(cfg, stage, exc=None, extra=None, page=None, force=False):
+    """遇阻时自动截屏看现场并由 Gemini/本地专家生成安全受控的自动调试修复动作。"""
+    global _last_ai_heal_report
+    norm = normalize_config(cfg if isinstance(cfg, dict) else {})
+    ai_cfg = norm.get("ai_assistant") or {}
+    st = str(stage or "").strip().lower()
+    err_s = str(exc or "").strip()
+
+    if not force and (not ai_cfg.get("enabled", True) or not ai_cfg.get("auto_heal", True)):
+        return {"attempted": False, "can_auto_fix": False, "actions": [], "observation": "", "summary": "", "source": "disabled"}
+
+    if st in ("net_offline", "vpn_blocked", "luya_login", "dingtalk_login") or "权限不一致" in err_s:
+        return {
+            "attempted": False,
+            "can_auto_fix": False,
+            "actions": [],
+            "observation": "当前属于网络/VPN/扫码登录或管理员权限不一致问题，需要人工完成。",
+            "summary": "不执行自动键鼠重试，交由人工处理。",
+            "source": "skipped_manual",
+        }
+
+    try:
+        set_step("AI 正在看图诊断并自动调试…")
+        log("  🤖 [AI 自动调试] 检测到步骤受阻，正在截屏观察现场并尝试自动修复…")
+    except Exception:
+        pass
+
+    ctx = _capture_live_debug_context(st, exc, extra=extra, page=page)
+    plan = None
+    src = "local_heuristic"
+    model_used = ""
+
+    if ai_cfg.get("enabled", True):
+        sys_prompt = (
+            "你是桌面自动化助手 SheetMate 的内置现场调试专家。\n"
+            "请结合现场截图与窗口遥测 JSON 判断到底哪里卡住了，并从允许动作白名单中选择修复动作，严格返回纯 JSON：\n"
+            '{"observation":"一句话大白话说明看到的问题","can_auto_fix":true,"actions":["activate_dingtalk_im"],"summary":"简短修复方案"}\n'
+            f"允许动作白名单仅限：{json.dumps(list(_AI_HEAL_ALLOWED_ACTIONS), ensure_ascii=False)}。\n"
+            "注意：如果 foreground.is_dt_aux_window 为 true 说明误停在钉钉-文档等子窗；"
+            "如果已贴图且见富文本工具栏/静音受阻，优先 activate_dingtalk_im + enable_silent_uia + click_send_now。"
+        )
+        parts = []
+        if ctx.get("img_b64"):
+            parts.append({"inlineData": {"mimeType": "image/png", "data": ctx["img_b64"]}})
+        parts.append({
+            "text": (
+                f"当前阶段：{st}\n"
+                f"报错信息：{err_s[:260]}\n"
+                f"配置摘要：dt_auto_send={norm.get('dt_auto_send')}, dt_silent_send={norm.get('dt_silent_send')}\n"
+                f"窗口与日志遥测：{json.dumps(ctx.get('telemetry') or {}, ensure_ascii=False)}"
+            )
+        })
+        try:
+            call_res = _call_gemini_generate(
+                norm,
+                sys_prompt,
+                [{"role": "user", "parts": parts}],
+                temperature=0.1,
+                max_tokens=450,
+                timeout_sec=12,
+            )
+            if call_res.get("ok"):
+                raw_txt = str(call_res.get("reply") or "").strip()
+                raw_txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_txt, flags=re.IGNORECASE | re.DOTALL).strip()
+                m_obj = re.search(r"\{.*\}", raw_txt, flags=re.DOTALL)
+                parsed = json.loads(m_obj.group(0) if m_obj else raw_txt)
+                if isinstance(parsed, dict) and "observation" in parsed:
+                    valid_acts = [a for a in (parsed.get("actions") or []) if a in _AI_HEAL_ALLOWED_ACTIONS]
+                    plan = {
+                        "observation": str(parsed.get("observation") or "").strip(),
+                        "can_auto_fix": bool(parsed.get("can_auto_fix")) and bool(valid_acts),
+                        "actions": valid_acts,
+                        "summary": str(parsed.get("summary") or "").strip(),
+                    }
+                    src = "ai_vision"
+                    model_used = ""
+        except Exception:
+            plan = None
+
+    if plan is None:
+        plan = _local_heuristic_auto_heal_plan(st, exc, ctx, norm)
+        src = "local_heuristic"
+
+    # 若图片和文字均已粘贴好且配置了自动发送，补充保底发送动作确保不卡在“贴完不点发送”
+    ext_meta = ctx.get("extra") or {}
+    if (
+        st == "dingtalk_paste"
+        and norm.get("dt_auto_send")
+        and ext_meta.get("image_pasted")
+        and ext_meta.get("text_pasted")
+        and plan.get("can_auto_fix")
+        and "click_send_now" not in plan["actions"]
+        and "retry_paste" not in plan["actions"]
+    ):
+        plan["actions"].append("click_send_now")
+
+    res = {
+        "attempted": True,
+        "stage": st,
+        "source": src,
+        "model": model_used,
+        "observation": plan.get("observation", ""),
+        "can_auto_fix": bool(plan.get("can_auto_fix")) and bool(plan.get("actions")),
+        "actions": [a for a in (plan.get("actions") or []) if a in _AI_HEAL_ALLOWED_ACTIONS],
+        "summary": plan.get("summary", ""),
+        "time": time.strftime("%H:%M:%S"),
+    }
+    _last_ai_heal_report = res
+    if res["observation"]:
+        log(f"  🤖 [AI 现场诊断] {res['observation']}")
+    if res["can_auto_fix"]:
+        log(f"  🛠️ [AI 自愈动作] {' -> '.join(res['actions'])}（{res['summary']}）")
+    return res
+
+
 def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
-    """根据当前阶段、报错内容与网络探测结果，返回清晰的排障说明与可恢复按钮列表。"""
+    """根据当前阶段、报错内容与网络探测结果，返回含结构化报错代码的排障说明与恢复按钮。"""
     extra = extra or {}
     err_s = str(exc or "").strip()
     low = err_s.lower()
@@ -440,11 +3835,24 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
         except Exception:
             net = {"internet_ok": True, "luya_ok": True, "wps_ok": True}
 
+    def _with_code(res, st_override=None, extra_override=None):
+        global _last_diagnosed_detail
+        det = classify_error_detail(
+            exc,
+            stage=st_override or stage,
+            extra=extra_override if extra_override is not None else extra,
+        )
+        res["error_detail"] = det
+        res["code"] = det["code"]
+        with _runtime_lock:
+            _last_diagnosed_detail = det
+        return res
+
     # 1. 本机彻底断网
     if ("err_internet_disconnected" in low or "err_name_not_resolved" in low
             or (net is not None and not net.get("internet_ok", True))):
-        return {
-            "title": "电脑未连接网络，无法继续抓取",
+        return _with_code({
+            "title": "[ERR-NET-101] 电脑未连接网络，无法继续抓取",
             "detail": (
                 "1. 请检查 Wi-Fi 或网线是否正常连网，先在浏览器确认能正常打开网页；\n"
                 "2. 连上网后点击【已连网·重试当前步】，前面已完成的部分无需重跑。"
@@ -453,7 +3861,7 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
             "actions": [
                 {"id": "retry", "label": "已连网·重试当前步", "style": "primary"},
             ],
-        }
+        }, st_override="net_offline", extra_override={**extra, "internet_ok": False})
 
     # 2. 已连网但未开 VPN / 代理未连通 Luya 后台
     if stage in ("luya_open", "luya_login", "luya_download") and net is not None:
@@ -462,8 +3870,8 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
             "err_connection_reset", "err_connection_refused", "timeout", "net::err",
         ))
         if (not net.get("luya_ok", True)) or (is_net_err and proxy_or_timeout):
-            return {
-                "title": "已连网络，但未开启 VPN 或无法连接后台",
+            return _with_code({
+                "title": "[ERR-VPN-102] 已连网络，但未开启 VPN 或无法连接后台",
                 "detail": (
                     "电脑外网正常，但访问 Luya 数据后台（bb.luyaapp.live）超时或被拦截。\n"
                     "1. 请先打开 VPN 软件并确保节点连接成功（确认系统代理可用）；\n"
@@ -473,12 +3881,12 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
                 "actions": [
                     {"id": "retry", "label": "已开VPN·重试当前步", "style": "primary"},
                 ],
-            }
+            }, st_override="vpn_blocked", extra_override={**extra, "luya_ok": False})
 
     # 3. 后台登录未通过 / 登录失效
     if stage == "luya_login" or extra.get("luya_need_login"):
-        return {
-            "title": "Luya 后台需要手动确认登录",
+        return _with_code({
+            "title": "[ERR-LUYA-103] Luya 后台需要手动确认登录",
             "detail": (
                 "1. 请查看已弹出的浏览器窗口，如停留在登录页或验证码页，请手动完成登录；\n"
                 "2. 登录成功进入后台后点击【我已登录·继续】，或点【重试自动登录】。"
@@ -488,12 +3896,12 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
                 {"id": "continue", "label": "我已登录·继续", "style": "primary"},
                 {"id": "retry", "label": "重试自动登录", "style": "secondary"},
             ],
-        }
+        }, st_override="luya_login")
 
     # 4. Luya 数据打开或下载失败
     if stage == "luya_open":
-        return {
-            "title": "打开 Luya 数据后台页面失败",
+        return _with_code({
+            "title": "[ERR-VPN-102] 打开 Luya 数据后台页面失败",
             "detail": (
                 f"原因：{human_error(err_s)}\n"
                 "1. 请检查网络与 VPN 是否开启且节点稳定；\n"
@@ -503,12 +3911,12 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
             "actions": [
                 {"id": "retry", "label": "重试打开后台", "style": "primary"},
             ],
-        }
+        })
 
     if stage == "luya_download":
         tbl_name = extra.get("name") or "数据表"
-        return {
-            "title": f"【{tbl_name}】下载未能成功",
+        return _with_code({
+            "title": f"[ERR-LUYA-104] 【{tbl_name}】下载未能成功",
             "detail": (
                 f"前面已下好的表会保留，仅【{tbl_name}】未下下来。\n"
                 "1. 请检查 VPN/网络是否稳定，可在浏览器中看下页面是否已刷出表格；\n"
@@ -518,12 +3926,12 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
             "actions": [
                 {"id": "retry", "label": "重试下载当前表", "style": "primary"},
             ],
-        }
+        })
 
     # 5. WPS 打开 / 写入失败
     if stage == "wps_open":
-        return {
-            "title": "打开或登录 WPS 在线表格失败",
+        return _with_code({
+            "title": "[ERR-WPS-201] 打开或登录 WPS 在线表格失败",
             "detail": (
                 f"原因：{human_error(err_s)}\n"
                 "1. 请查看浏览器中的 WPS 页面，确保网络正常并已完成扫码登录；\n"
@@ -533,12 +3941,12 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
             "actions": [
                 {"id": "retry", "label": "重试打开/检测WPS", "style": "primary"},
             ],
-        }
+        })
 
     if stage == "wps_paste":
         tbl_name = extra.get("name") or "工作表"
-        return {
-            "title": f"写入 WPS【{tbl_name}】工作表失败",
+        return _with_code({
+            "title": f"[ERR-WPS-202] 写入 WPS【{tbl_name}】工作表失败",
             "detail": (
                 f"原因：{human_error(err_s)}\n"
                 f"1. 请查看浏览器中【{tbl_name}】标签页是否可见、无弹窗遮挡；\n"
@@ -549,12 +3957,13 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
                 {"id": "retry", "label": "重试写入当前表", "style": "primary"},
                 {"id": "skip", "label": "跳过此表·下一步", "style": "secondary"},
             ],
-        }
+        })
 
     # 6. WPS 汇总表截图失败
     if stage == "wps_capture":
-        return {
-            "title": "WPS 数据汇总表截图未成功",
+        det_cap = classify_error_detail(exc, stage="wps_capture", extra=extra)
+        return _with_code({
+            "title": f"[{det_cap['code']}] WPS 数据汇总表截图未成功",
             "detail": (
                 f"浏览器仍保持打开且数据已写入（原因：{human_error(err_s)}）。\n"
                 "方案A：点开浏览器的【数据汇总】页关掉遮挡弹窗后，点【重试自动截图】；\n"
@@ -566,22 +3975,47 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
                 {"id": "manual_copied", "label": "我已手动复制·发钉钉", "style": "secondary"},
                 {"id": "skip", "label": "跳过截图发钉钉", "style": "secondary"},
             ],
-        }
+        })
+
+    # 6.5 钉钉使用中被用户切换、关闭或主动让出键鼠
+    if stage == "dingtalk_interrupted":
+        target = extra.get("search_name") or "目标群聊"
+        idx = int(extra.get("idx") or 1)
+        total = int(extra.get("total") or 1)
+        prog = f"（当前进度 {idx}/{total}：「{target}」）" if total > 1 else f"（目标会话：「{target}」）"
+        reason_txt = extra.get("reason") or (human_error(err_s) if err_s else "检测到您关闭或正在使用钉钉")
+        acts = [
+            {"id": "retry", "label": "继续未完成步骤 (F8)", "style": "primary"},
+            {"id": "skip_search", "label": "已开群·直接粘贴 (F9)", "style": "secondary"},
+        ]
+        if extra.get("can_skip_target"):
+            acts.append({"id": "skip_target", "label": f"跳过「{target[:8]}」·发下一个", "style": "secondary"})
+        return _with_code({
+            "title": "[ERR-DT-305] 检测到钉钉被关闭或您正在使用，已自动暂停",
+            "detail": (
+                f"{reason_txt}{prog}。\n"
+                "已截好的表格图片与未完成步骤全部安全保留，不会重抓：\n"
+                "1. 忙完后按键盘【F8】或点【继续未完成步骤 (F8)】，自动接着完成剩余发送；\n"
+                "2. 若您已手动打开该群窗口，按【F9】或点【已开群·直接粘贴 (F9)】直接贴图。"
+            ),
+            "hint": "快捷键：按【F8】继续未完成步骤 · 按【F9】在当前聊天窗直接粘贴 · 点【取消】终止",
+            "actions": acts,
+        })
 
     # 7. 钉钉未启动 / 停留在扫码登录页
     if stage == "dingtalk_login":
-        return {
-            "title": "钉钉未启动或尚未扫码登录",
+        return _with_code({
+            "title": "[ERR-DT-301] 钉钉未启动或尚未扫码登录",
             "detail": (
                 "刚刚截好的表格图片已安全保存，不会丢失！\n"
                 "1. 请先在电脑上打开钉钉并扫码登录，看到聊天消息主界面；\n"
-                "2. 登录成功后点击【已登录钉钉·继续发送】，图片将直接贴到群里（无需重抓表格）。"
+                "2. 登录成功后按【F8】或点击【已登录钉钉·继续发送】，图片将直接贴到群里（无需重抓表格）。"
             ),
-            "hint": "按键提示：钉钉扫码登录成功后点【已登录钉钉·继续发送】直接继续。",
+            "hint": "按键提示：钉钉扫码登录成功后按【F8】或点【已登录钉钉·继续发送】直接继续。",
             "actions": [
                 {"id": "retry", "label": "已登录钉钉·继续发送", "style": "primary"},
             ],
-        }
+        })
 
     # 8. 钉钉未搜索到目标群聊
     if stage == "dingtalk_search":
@@ -592,16 +4026,16 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
         ]
         if extra.get("can_skip_target"):
             acts.append({"id": "skip_target", "label": f"跳过「{target[:8]}」·发下一个", "style": "secondary"})
-        return {
-            "title": f"钉钉未能自动搜到会话「{target}」",
+        return _with_code({
+            "title": f"[ERR-DT-303] 钉钉未能自动搜到会话「{target}」",
             "detail": (
                 "表格图片已安全保存，不会丢失！您可以任选一种方式继续：\n"
-                "方案A（推荐）：直接在钉钉里手动点开目标群聊/联系人窗口，然后点【已手动开群·直接粘贴】，将自动清空草稿、贴图贴字；\n"
+                "方案A（推荐）：直接在钉钉里手动点开目标群聊/联系人窗口，然后按【F9】或点【已手动开群·直接粘贴】；\n"
                 "方案B：确认名称正确或切回钉钉主窗后，点【重新搜索群聊】。"
             ),
-            "hint": "按键提示：手动点开会话后点【已手动开群·直接粘贴】，或点【重新搜索群聊】。",
+            "hint": "按键提示：手动开群后按【F8】/【F9】或点【已手动开群·直接粘贴】；也可点【重新搜索群聊】。",
             "actions": acts,
-        }
+        })
 
     # 9. 钉钉粘贴或输入框焦点受阻
     if stage == "dingtalk_paste":
@@ -612,33 +4046,37 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
         ]
         if extra.get("can_skip_target"):
             acts.append({"id": "skip_target", "label": f"跳过「{target[:8]}」·发下一个", "style": "secondary"})
-        return {
-            "title": f"钉钉粘贴到「{target}」时受阻",
+        return _with_code({
+            "title": f"[ERR-DT-304] 钉钉粘贴到「{target}」时受阻",
             "detail": (
                 f"表格图片仍已保留（原因：{human_error(err_s)}）。\n"
                 "1. 请在钉钉点开要发送的目标聊天窗口，关闭遮挡小窗；\n"
-                "2. 确认后点【直接粘贴重试】即可把图和文字贴进去，或点【重新搜索群聊】。"
+                "2. 确认后按【F8】/【F9】或点【直接粘贴重试】即可继续发送，或点【重新搜索群聊】。"
             ),
-            "hint": "按键提示：点开聊天窗口后点击【直接粘贴重试】继续发送。",
+            "hint": "按键提示：点开聊天窗口后按【F8】/【F9】或点击【直接粘贴重试】继续发送。",
             "actions": acts,
-        }
+        })
 
-    return {
-        "title": "当前步骤遇到异常",
-        "detail": f"原因：{human_error(err_s)}\n请检查相关页面状态后点击【重试当前步】继续。",
+    det_def = classify_error_detail(exc, stage=stage, extra=extra)
+    return _with_code({
+        "title": f"[{det_def['code']}] {det_def['title']}",
+        "detail": f"原因：{det_def['plain_reason']}\n请按指引处理后点击【重试当前步】继续。",
         "hint": "按键提示：处理完成后点【重试当前步】继续，或点【取消】终止本轮。",
         "actions": [
             {"id": "retry", "label": "重试当前步", "style": "primary"},
         ],
-    }
+    })
 
 
-def wait_for_recovery(title, detail, hint="", actions=None, timeout_sec=900):
+def wait_for_recovery(title, detail, hint="", actions=None, timeout_sec=900, error_detail=None):
     """遇到可恢复阻塞时挂起当前步骤并弹窗引导用户解决，返回用户选择的恢复动作 ID。"""
     global _waiting_recovery, _recovery_choice, _runtime_prompt
     check_stop()
     act_list = [dict(a) for a in (actions or [{"id": "retry", "label": "重试当前步", "style": "primary"}])]
     with _runtime_lock:
+        det = error_detail or (_last_diagnosed_detail if _last_diagnosed_detail and _last_diagnosed_detail.get("code") in str(title or "") else None)
+        if det is None:
+            det = classify_error_detail(Exception(f"{title or ''} {detail or ''}"))
         _waiting_recovery = True
         _recovery_choice = None
         _runtime_prompt = {
@@ -647,29 +4085,35 @@ def wait_for_recovery(title, detail, hint="", actions=None, timeout_sec=900):
             "detail": str(detail or ""),
             "hint": str(hint or "处理完成后点击恢复按钮继续，或点击【取消】结束本轮。"),
             "actions": act_list,
+            "error_detail": det,
         }
     set_step(f"暂停待处理：{title}")
     log(f"⚠️ {title} — {str(detail or '').replace(chr(10), ' ')}")
+    try:
+        record_run_journal(load_config(), status="paused_err", mode="waiting_fix", round_label="待排障", error_detail=det)
+    except Exception:
+        pass
     _notify_runtime_state()
     deadline = time.monotonic() + max(10.0, float(timeout_sec))
     try:
-        while time.monotonic() < deadline:
-            with _runtime_lock:
+        with _runtime_cond:
+            while time.monotonic() < deadline:
                 if _stop_requested:
                     raise RuntimeError("用户手动停止了任务")
                 choice = _recovery_choice
-            if choice is not None:
-                if choice == "cancel":
-                    raise RuntimeError("用户手动停止了任务")
-                log(f"▶ 正在执行恢复操作：{choice}")
-                return choice
-            time.sleep(0.18)
+                if choice is not None:
+                    if choice == "cancel":
+                        raise RuntimeError("用户手动停止了任务")
+                    log(f"▶ 正在执行恢复操作：{choice}")
+                    return choice
+                _runtime_cond.wait(timeout=0.25)
         raise RuntimeError(f"等待处理超时（超过 {int(timeout_sec // 60)} 分钟未响应）：{title}")
     finally:
-        with _runtime_lock:
+        with _runtime_cond:
             _waiting_recovery = False
             _recovery_choice = None
             _runtime_prompt = _default_running_prompt()
+            _runtime_cond.notify_all()
         _notify_runtime_state()
 
 
@@ -755,8 +4199,22 @@ def close_login_prompt():
             pass
 
 
+_recent_logs_lock = threading.Lock()
+_recent_logs_buffer = []
+_last_ai_heal_report = None
+
+
+def _get_recent_logs_tail(limit=25):
+    with _recent_logs_lock:
+        return list(_recent_logs_buffer[-int(limit):])
+
+
 def log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    with _recent_logs_lock:
+        _recent_logs_buffer.append(line)
+        if len(_recent_logs_buffer) > 80:
+            del _recent_logs_buffer[:-80]
     try:
         if sys.stdout is not None:
             print(line)
@@ -800,20 +4258,9 @@ def log_error(exc=None, title=""):
 
 
 def human_error(e):
-    """把技术报错翻译成人话"""
-    s = str(e)
-    low = s.lower()
-    if "executable doesn't exist" in low or "chromium" in low:
-        return "浏览器内核没找到：请联网后重新双击运行，让它自动下载浏览器；若还不行，把 error.log 发我"
-    if "timeout" in low or "超时" in s:
-        return "页面加载太慢，没等到按钮，可能是网络卡了，重试一次"
-    if "download" in low:
-        return "数据文件没下载下来，检查网络后重试"
-    if "login" in low or "登录" in s:
-        return "登录没成功，可能需要你在浏览器里手动扫码登录一次"
-    if "browser" in low or "launch" in low:
-        return "浏览器没能打开，可能被其他程序占用，重试一次"
-    return f"运行中出了点问题：{s[:80]}"
+    """把技术报错翻译成带错误码的大白话指引。"""
+    det = classify_error_detail(e)
+    return f"[{det['code']}] {det['title']}：{det['plain_reason']}"
 
 
 def _no_window_flags():
@@ -821,12 +4268,71 @@ def _no_window_flags():
 
 
 def set_clipboard_windows(text):
+    """使用原生 64 位安全的 Win32 CF_UNICODETEXT 写入 UTF-16LE（带结尾空字符），杜绝短中文误判成 GBK（如 慕杰组 -> Uapg膥）。"""
+    s = "" if text is None else str(text)
+    if os.name != "nt":
+        subprocess.run(
+            ["clip"],
+            input=b"\xff\xfe" + s.encode("utf-16-le"),
+            check=False,
+            creationflags=_no_window_flags(),
+        )
+        return True
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+
+    raw = s.encode("utf-16-le") + b"\x00\x00"
+    for _ in range(8):
+        if user32.OpenClipboard(None):
+            h_mem = None
+            transferred = False
+            try:
+                user32.EmptyClipboard()
+                h_mem = kernel32.GlobalAlloc(0x0002, len(raw))  # GMEM_MOVEABLE
+                if h_mem:
+                    ptr = kernel32.GlobalLock(h_mem)
+                    if ptr:
+                        try:
+                            ctypes.memmove(ptr, raw, len(raw))
+                        finally:
+                            kernel32.GlobalUnlock(h_mem)
+                        if user32.SetClipboardData(13, h_mem):  # CF_UNICODETEXT
+                            transferred = True
+                            return True
+            finally:
+                if h_mem and not transferred:
+                    try:
+                        kernel32.GlobalFree(h_mem)
+                    except Exception:
+                        pass
+                user32.CloseClipboard()
+        time.sleep(0.08)
+
+    # 极端被占锁时的保底兜底：务必加 UTF-16LE BOM 防止 IsTextUnicode 误判
     subprocess.run(
         ["clip"],
-        input=text.encode("utf-16le"),
+        input=b"\xff\xfe" + s.encode("utf-16-le"),
         check=False,
         creationflags=_no_window_flags(),
     )
+    return False
 
 
 def clear_clipboard_windows():
@@ -936,11 +4442,12 @@ def _ps_sq(val):
 
 
 def _find_bundle_asset(rel_path):
-    """兼容源码目录与 PyInstaller 单文件解压目录查找内置资源文件。"""
+    """兼容源码目录与 PyInstaller 单文件/文件夹(_internal)模式查找内置资源文件。"""
     candidates = [Path(__file__).resolve().parent / rel_path]
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
         candidates.insert(0, Path(meipass) / rel_path)
+    candidates.append(app_dir() / "_internal" / rel_path)
     candidates.append(app_dir() / rel_path)
     for p in candidates:
         try:
@@ -973,20 +4480,91 @@ def save_clipboard_image_if_exists(path):
     return "error"
 
 
+def _write_dib_to_clipboard_windows(img_rgb):
+    """在本进程内直接通过 Win32 CF_DIB 将 RGB 图像写入系统剪贴板，绕开临时子进程延迟与句柄丢失。"""
+    if os.name != "nt":
+        return False
+    import io
+    buf = io.BytesIO()
+    img_rgb.save(buf, format="BMP")
+    bmp_bytes = buf.getvalue()
+    if len(bmp_bytes) <= 14:
+        return False
+    dib_bytes = bmp_bytes[14:]  # 剥离 BITMAPFILEHEADER 即为标准 CF_DIB (BITMAPINFOHEADER + 像素)
+
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    u32.OpenClipboard.argtypes = [wintypes.HWND]
+    u32.OpenClipboard.restype = wintypes.BOOL
+    u32.EmptyClipboard.argtypes = []
+    u32.EmptyClipboard.restype = wintypes.BOOL
+    u32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+    u32.SetClipboardData.restype = ctypes.c_void_p
+    u32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+    u32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+    u32.CloseClipboard.argtypes = []
+    u32.CloseClipboard.restype = wintypes.BOOL
+    k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    k32.GlobalAlloc.restype = ctypes.c_void_p
+    k32.GlobalLock.argtypes = [ctypes.c_void_p]
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    k32.GlobalUnlock.restype = wintypes.BOOL
+    k32.GlobalFree.argtypes = [ctypes.c_void_p]
+    k32.GlobalFree.restype = ctypes.c_void_p
+
+    CF_DIB = 8
+    GMEM_MOVEABLE = 0x0002
+    for _ in range(8):
+        if u32.OpenClipboard(None):
+            h_mem = None
+            transferred = False
+            try:
+                u32.EmptyClipboard()
+                h_mem = k32.GlobalAlloc(GMEM_MOVEABLE, len(dib_bytes))
+                if h_mem:
+                    ptr = k32.GlobalLock(h_mem)
+                    if ptr:
+                        try:
+                            ctypes.memmove(ptr, dib_bytes, len(dib_bytes))
+                        finally:
+                            k32.GlobalUnlock(h_mem)
+                        if u32.SetClipboardData(CF_DIB, h_mem):
+                            transferred = True
+                            return bool(u32.IsClipboardFormatAvailable(CF_DIB))
+            finally:
+                if h_mem and not transferred:
+                    try:
+                        k32.GlobalFree(h_mem)
+                    except Exception:
+                        pass
+                u32.CloseClipboard()
+        time.sleep(0.08)
+    return False
+
+
 def set_clipboard_image_from_file(path):
-    """把暂存图片以位图副本写回剪贴板；超大图像素等比压缩，避免内存失败。"""
+    """将图片等比规范至钉钉安全像素宽度内，并通过本进程原生 CF_DIB（含 PS 兜底）写入剪贴板。"""
     src = Path(path)
     use_path = src
     try:
         im = Image.open(src).convert("RGB")
-        max_pixels = 14_000_000
+        max_w = 4600
+        max_pixels = 12_000_000
+        scale = 1.0
+        if im.width > max_w:
+            scale = min(scale, max_w / float(im.width))
         if im.width * im.height > max_pixels:
-            scale = (max_pixels / (im.width * im.height)) ** 0.5
+            scale = min(scale, (max_pixels / float(im.width * im.height)) ** 0.5)
+        if scale < 0.999:
             new_size = (max(1, int(im.width * scale)), max(1, int(im.height * scale)))
             im = im.resize(new_size, Image.Resampling.LANCZOS)
             use_path = src.with_name(src.stem + "_send.png")
             im.save(use_path, "PNG", optimize=True)
-        else:
+        try:
+            if _write_dib_to_clipboard_windows(im):
+                return True
+        finally:
             im.close()
     except Exception:
         use_path = src
@@ -1004,6 +4582,84 @@ def set_clipboard_image_from_file(path):
 # ==================== 配置持久化 ====================
 CONFIG_PATH = app_dir() / "config.json"
 
+DEFAULT_SUMMARY_PRESET_ITEMS = [
+    {
+        "enabled": True,
+        "sheet": "数据汇总",
+        "cell": "D2",
+        "label": "查询日期",
+        "action": "today",
+        "date_fmt": "YYYY年M月D日",
+        "time_fmt": "full",
+        "day_offset": 0,
+        "cutoff_enabled": False,
+        "cutoff_hm": "09:00",
+        "before_cutoff_offset": -1,
+        "only_after_paste": False,
+        "value": "",
+    },
+    {
+        "enabled": True,
+        "sheet": "数据汇总",
+        "cell": "D4",
+        "label": "日期范围起始",
+        "action": "clear",
+        "date_fmt": "YYYY年M月D日",
+        "time_fmt": "full",
+        "day_offset": 0,
+        "cutoff_enabled": False,
+        "cutoff_hm": "09:00",
+        "before_cutoff_offset": -1,
+        "only_after_paste": False,
+        "value": "",
+    },
+    {
+        "enabled": True,
+        "sheet": "数据汇总",
+        "cell": "E4",
+        "label": "日期范围结束",
+        "action": "clear",
+        "date_fmt": "YYYY年M月D日",
+        "time_fmt": "full",
+        "day_offset": 0,
+        "cutoff_enabled": False,
+        "cutoff_hm": "09:00",
+        "before_cutoff_offset": -1,
+        "only_after_paste": False,
+        "value": "",
+    },
+    {
+        "enabled": True,
+        "sheet": "数据汇总",
+        "cell": "L3",
+        "label": "参与计算小组",
+        "action": "value",
+        "date_fmt": "YYYY年M月D日",
+        "time_fmt": "full",
+        "day_offset": 0,
+        "cutoff_enabled": False,
+        "cutoff_hm": "09:00",
+        "before_cutoff_offset": -1,
+        "only_after_paste": False,
+        "value": "宋磊组,娄慧珍组,江峰组,刘全泉组,潘立浩组,李俊鑫组,慕杰组",
+    },
+    {
+        "enabled": True,
+        "sheet": "数据汇总",
+        "cell": "L4",
+        "label": "需要标记的团队",
+        "action": "value",
+        "date_fmt": "YYYY年M月D日",
+        "time_fmt": "full",
+        "day_offset": 0,
+        "cutoff_enabled": False,
+        "cutoff_hm": "09:00",
+        "before_cutoff_offset": -1,
+        "only_after_paste": False,
+        "value": "慕杰组",
+    },
+]
+
 DEFAULT_CONFIG = {
     "day_mode": "daily",         # daily | workday | weekend | custom
     "custom_days": [0, 1, 2, 3, 4],  # 0=周一 .. 6=周日
@@ -1017,15 +4673,51 @@ DEFAULT_CONFIG = {
     "enable_dingtalk": False,    # 复制后发到钉钉会话
     "dt_auto_send": False,       # 默认先不自动发；开启后才自动按 Enter 发送
     "dt_clear_before_send": True,  # 粘贴前先清空聊天输入框原有残留内容
+    "dt_paste_delay_sec": 3,     # 打开/切入会话后等待几秒再粘贴图片，防止加载期漏贴
     "dt_silent_send": True,      # 发送前自动勾选「设为静音」（静音发送）
+    "dt_minimize_after_send": True,  # 自动发送完成后最小化钉钉窗口
     "dt_search": "文件小助手",    # 钉钉搜索的主会话名（兼容单目标及回退）
     "dt_targets": [],            # 多目标列表：[{"name": "文件小助手", "enabled": True}, ...]
     "dt_suffix": "",             # 默认后缀：留空表示平时仅发时间戳，只在命中的分时段规则加后缀
+    "dt_time_mode": "datetime",  # datetime(日期+时间) | date_only(仅日期) | none(不带日期时间)
+    "dt_date_fmt": "YYYY-MM-DD", # YYYY-MM-DD | YYYY年M月D日 | M月D日
+    "dt_day_offset": 0,          # 0=当天, -1=前1天, -2=前2天 ...
+    "dt_cutoff_enabled": False,  # 是否启用凌晨跨天分界点（分界点前按 before_cutoff_offset）
+    "dt_cutoff_hm": "09:00",
+    "dt_before_cutoff_offset": -1,
     "suffix_rules": [],          # [{"enabled": True, "start": "11:30", "end": "12:30", "suffix": "午间数据"}]
-    "point_overrides": {},       # {"HH:MM": {"mode": "default|send|table_only", "suffix": None|"xxx", "silent": None|True|False}}
+    "point_overrides": {},       # {"HH:MM": {"mode": ..., "suffix": ..., "silent": ..., "sheet_day_offset": ..., "msg_time_mode": ..., "msg_day_offset": ...}}
     "open_wps_after_run": False, # 每轮跑完是否自动用系统浏览器/WPS打开表格（默认关闭避免自动值守弹窗扰民）
     "prevent_sleep": True,       # 自动值守与运行期间阻止电脑自动休眠/息屏
     "save_shot_history": True,   # 自动归档最近 20 张汇总表截图至 history_shots
+    "ai_assistant": {
+        "enabled": True,
+        "provider": "gemini",
+        "api_base": "",
+        "api_key": DEFAULT_GEMINI_API_KEY,
+        "model": GEMINI_MODEL_CANDIDATES[0],
+        "auto_diagnose": True,
+        "auto_heal": True,
+        "auto_attach_summary": False,
+        "attach_style": "brief",
+        "focus_team": "",
+        "custom_summary_prompt": "",
+    },
+    "summary_presets": {
+        "enabled": True,
+        "items": [dict(it) for it in DEFAULT_SUMMARY_PRESET_ITEMS],
+    },
+    "update_time_cell": {
+        "enabled": True,           # 是否在粘贴数据后写入最后更新时间（对应 P4 标题）
+        "cell": "S4",              # 目标单元格（默认 S4）
+        "only_after_paste": True,  # True=仅全流程粘贴数据后写入；False=仅截图模式也同步更新
+    },
+    "pipeline_tuning": {
+        "compose_step_order": "image_text_silent",  # image_text_silent | text_silent_image
+        "silent_step_order": "uia_first",           # uia_first | arrow_img_then_uia
+        "paste_key_order": "pywinauto_first",       # pywinauto_first | uia_first
+        "wps_refresh_wait_sec": 5,                  # 切汇总表校准后的等待刷新秒数 (3~15)
+    },
     # 独立截图发送时段：只约束自动计划，手动按钮始终可以立即执行。
     "capture_plan": {
         "enabled": False,
@@ -1095,8 +4787,17 @@ def _norm_hm_str(s, default="09:00"):
         return default
 
 
+def _clamp_day_offset(val, default=0):
+    if val is None or isinstance(val, bool) or val == "":
+        return default
+    try:
+        return max(-60, min(7, int(val)))
+    except Exception:
+        return default
+
+
 def normalize_config(cfg):
-    """规范化并兼容旧版配置结构，确保日期模式、分时段后缀与允许窗口字段合法。"""
+    """规范化并兼容旧版配置结构，确保日期模式、偏移规则、消息时间模式、AI 助手与分时段字段合法。"""
     import copy
     out = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), cfg if isinstance(cfg, dict) else {})
 
@@ -1127,6 +4828,67 @@ def normalize_config(cfg):
     out["open_wps_after_run"] = bool(out.get("open_wps_after_run", False))
     out["prevent_sleep"] = bool(out.get("prevent_sleep", True))
     out["save_shot_history"] = bool(out.get("save_shot_history", True))
+    out["dt_minimize_after_send"] = bool(out.get("dt_minimize_after_send", True))
+    try:
+        p_del = out.get("dt_paste_delay_sec", 3)
+        p_del = 3 if isinstance(p_del, bool) or p_del in (None, "") else int(round(float(p_del)))
+    except Exception:
+        p_del = 3
+    out["dt_paste_delay_sec"] = max(0, min(20, p_del))
+
+    if out.get("dt_time_mode") not in ("datetime", "date_only", "none"):
+        out["dt_time_mode"] = "datetime"
+    if out.get("dt_date_fmt") not in ("YYYY-MM-DD", "YYYY年M月D日", "M月D日"):
+        out["dt_date_fmt"] = "YYYY-MM-DD"
+    out["dt_day_offset"] = _clamp_day_offset(out.get("dt_day_offset"), 0)
+    out["dt_cutoff_enabled"] = bool(out.get("dt_cutoff_enabled", False))
+    out["dt_cutoff_hm"] = _norm_hm_str(out.get("dt_cutoff_hm"), "09:00")
+    out["dt_before_cutoff_offset"] = _clamp_day_offset(out.get("dt_before_cutoff_offset"), -1)
+
+    ai_cfg = out.get("ai_assistant") if isinstance(out.get("ai_assistant"), dict) else {}
+    ai_prov = str(ai_cfg.get("provider") or "gemini").strip().lower()
+    if ai_prov not in ("gemini", "openai_compat", "local_only"):
+        ai_prov = "gemini"
+    ai_base = str(ai_cfg.get("api_base") or "").strip().rstrip("/")
+    ai_key = str(ai_cfg.get("api_key") or "").strip() or DEFAULT_GEMINI_API_KEY
+    ai_model = str(ai_cfg.get("model") or GEMINI_MODEL_CANDIDATES[0]).replace("models/", "").strip() or GEMINI_MODEL_CANDIDATES[0]
+    attach_st = str(ai_cfg.get("attach_style") or "brief").strip().lower()
+    if attach_st not in AI_SUMMARY_STYLES:
+        attach_st = "brief"
+    out["ai_assistant"] = {
+        "enabled": bool(ai_cfg.get("enabled", True)),
+        "provider": ai_prov,
+        "api_base": ai_base,
+        "api_key": ai_key,
+        "model": ai_model,
+        "auto_diagnose": bool(ai_cfg.get("auto_diagnose", True)),
+        "auto_heal": bool(ai_cfg.get("auto_heal", True)),
+        "auto_attach_summary": bool(ai_cfg.get("auto_attach_summary", False)),
+        "attach_style": attach_st,
+        "focus_team": str(ai_cfg.get("focus_team") or "").strip()[:24],
+        "custom_summary_prompt": str(ai_cfg.get("custom_summary_prompt") or "").strip(),
+    }
+
+    pt_cfg = out.get("pipeline_tuning") if isinstance(out.get("pipeline_tuning"), dict) else {}
+    comp_ord = str(pt_cfg.get("compose_step_order") or "image_text_silent").strip()
+    if comp_ord not in ("image_text_silent", "text_silent_image"):
+        comp_ord = "image_text_silent"
+    sil_ord = str(pt_cfg.get("silent_step_order") or "uia_first").strip()
+    if sil_ord not in ("uia_first", "arrow_img_then_uia"):
+        sil_ord = "uia_first"
+    key_ord = str(pt_cfg.get("paste_key_order") or "pywinauto_first").strip()
+    if key_ord not in ("pywinauto_first", "uia_first"):
+        key_ord = "pywinauto_first"
+    try:
+        wps_w = int(round(float(pt_cfg.get("wps_refresh_wait_sec", 5))))
+    except Exception:
+        wps_w = 5
+    out["pipeline_tuning"] = {
+        "compose_step_order": comp_ord,
+        "silent_step_order": sil_ord,
+        "paste_key_order": key_ord,
+        "wps_refresh_wait_sec": max(3, min(15, wps_w)),
+    }
 
     targets = []
     seen_targets = set()
@@ -1179,9 +4941,24 @@ def normalize_config(cfg):
                 suf_v = str(suf_v).strip()
             sil_raw = v.get("silent", None)
             sil_v = sil_raw if isinstance(sil_raw, bool) else None
-            if mode == "default" and suf_v is None and sil_v is None:
+            s_off_raw = v.get("sheet_day_offset", None)
+            s_off = _clamp_day_offset(s_off_raw, None) if s_off_raw is not None and s_off_raw != "" else None
+            m_mode = v.get("msg_time_mode", None)
+            if m_mode not in ("datetime", "date_only", "none"):
+                m_mode = None
+            m_off_raw = v.get("msg_day_offset", None)
+            m_off = _clamp_day_offset(m_off_raw, None) if m_off_raw is not None and m_off_raw != "" else None
+            if (mode == "default" and suf_v is None and sil_v is None
+                    and s_off is None and m_mode is None and m_off is None):
                 continue
-            overrides[hm_k] = {"mode": mode, "suffix": suf_v, "silent": sil_v}
+            overrides[hm_k] = {
+                "mode": mode,
+                "suffix": suf_v,
+                "silent": sil_v,
+                "sheet_day_offset": s_off,
+                "msg_time_mode": m_mode,
+                "msg_day_offset": m_off,
+            }
     out["point_overrides"] = overrides
 
     cp = out.get("capture_plan") if isinstance(out.get("capture_plan"), dict) else {}
@@ -1191,7 +4968,6 @@ def normalize_config(cfg):
     if saved_has_windows or isinstance(cp.get("windows"), list):
         raw_wins = cp.get("windows") or []
         if not saved_has_windows and raw_cp:
-            # 旧版 config 迁移：仅从用户实际保存的 workday/weekend 已勾选槽位合并成统一多窗口
             migrated = []
             seen = set()
             for prof_name in ("workday", "weekend"):
@@ -1216,6 +4992,57 @@ def normalize_config(cfg):
     cp["windows"] = wins
     cp["enabled"] = bool(cp.get("enabled", False))
     out["capture_plan"] = cp
+
+    raw_sp = cfg.get("summary_presets") if isinstance(cfg, dict) and isinstance(cfg.get("summary_presets"), dict) else {}
+    sp = out.get("summary_presets") if isinstance(out.get("summary_presets"), dict) else {}
+    sp_items = []
+    if "items" in raw_sp and isinstance(raw_sp.get("items"), list):
+        src_items = raw_sp.get("items") or []
+    else:
+        src_items = copy.deepcopy(DEFAULT_SUMMARY_PRESET_ITEMS)
+    for item in src_items:
+        if not isinstance(item, dict):
+            continue
+        cell = re.sub(r"\s+", "", str(item.get("cell") or "")).upper()
+        if not cell:
+            continue
+        act = str(item.get("action") or "value").strip().lower()
+        if act not in ("today", "now", "clear", "value", "formula"):
+            act = "value"
+        dfmt = str(item.get("date_fmt") or "YYYY年M月D日").strip()
+        if dfmt not in ("YYYY年M月D日", "M月D日", "YYYY-MM-DD"):
+            dfmt = "YYYY年M月D日"
+        tfmt = str(item.get("time_fmt") or "full").strip()
+        if tfmt not in ("full", "hm", "time_only"):
+            tfmt = "full"
+        sheet_nm = str(item.get("sheet") or "数据汇总").strip() or "数据汇总"
+        sp_items.append({
+            "enabled": bool(item.get("enabled", True)),
+            "sheet": sheet_nm,
+            "cell": cell,
+            "label": str(item.get("label") or "").strip(),
+            "action": act,
+            "date_fmt": dfmt,
+            "time_fmt": tfmt,
+            "day_offset": _clamp_day_offset(item.get("day_offset"), 0),
+            "cutoff_enabled": bool(item.get("cutoff_enabled", False)),
+            "cutoff_hm": _norm_hm_str(item.get("cutoff_hm"), "09:00"),
+            "before_cutoff_offset": _clamp_day_offset(item.get("before_cutoff_offset"), -1),
+            "only_after_paste": bool(item.get("only_after_paste", False)),
+            "value": "" if item.get("value") is None else str(item.get("value")).strip(),
+        })
+    sp["enabled"] = bool(raw_sp.get("enabled", sp.get("enabled", True)))
+    sp["items"] = sp_items
+    out["summary_presets"] = sp
+
+    raw_ut = cfg.get("update_time_cell") if isinstance(cfg, dict) and isinstance(cfg.get("update_time_cell"), dict) else {}
+    def_ut = out.get("update_time_cell") if isinstance(out.get("update_time_cell"), dict) else {}
+    ut_cell = re.sub(r"\s+", "", str(raw_ut.get("cell", def_ut.get("cell", "S4")) or "")).upper() or "S4"
+    out["update_time_cell"] = {
+        "enabled": bool(raw_ut.get("enabled", def_ut.get("enabled", True))),
+        "cell": ut_cell,
+        "only_after_paste": bool(raw_ut.get("only_after_paste", def_ut.get("only_after_paste", True))),
+    }
     return out
 
 
@@ -1309,6 +5136,115 @@ def resolve_suffix_for_time(cfg, lt=None, hm_override=None):
     return ("" if default_suf is None else str(default_suf).strip()), "默认"
 
 
+def _shift_lt(lt=None, day_offset=0):
+    """按整数天数偏移日期，精确处理跨月与跨年。"""
+    lt = lt or time.localtime()
+    off = _clamp_day_offset(day_offset, 0)
+    if off == 0:
+        return lt
+    dt = datetime(lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec) + timedelta(days=off)
+    return dt.timetuple()
+
+
+def resolve_preset_day_offset(item, cfg=None, lt=None, hm_override=None):
+    """按 单点设置 -> 凌晨跨天分界规则 -> 预设默认偏移 解析汇总表日期单元格的天数偏移。"""
+    lt = lt or time.localtime()
+    hm = _norm_hm_str(hm_override, f"{lt.tm_hour:02d}:{lt.tm_min:02d}") if hm_override else f"{lt.tm_hour:02d}:{lt.tm_min:02d}"
+    h, m = parse_hm(hm)
+    cur_min = h * 60 + m
+
+    ov = ((cfg or {}).get("point_overrides") or {}).get(hm)
+    if isinstance(ov, dict) and ov.get("sheet_day_offset") is not None:
+        return _clamp_day_offset(ov.get("sheet_day_offset"), 0), f"单点({hm})"
+
+    if isinstance(item, dict) and item.get("cutoff_enabled"):
+        cut_hm = _norm_hm_str(item.get("cutoff_hm"), "09:00")
+        ch, cm = parse_hm(cut_hm)
+        if cur_min < ch * 60 + cm:
+            return _clamp_day_offset(item.get("before_cutoff_offset"), -1), f"{cut_hm}前跨天"
+
+    return _clamp_day_offset((item or {}).get("day_offset"), 0), "预设默认"
+
+
+def resolve_dingtalk_time_policy(cfg, lt=None, hm_override=None):
+    """解析指定时刻钉钉消息的 (time_mode, date_fmt, day_offset, source_desc)。"""
+    cfg = cfg or {}
+    lt = lt or time.localtime()
+    hm = _norm_hm_str(hm_override, f"{lt.tm_hour:02d}:{lt.tm_min:02d}") if hm_override else f"{lt.tm_hour:02d}:{lt.tm_min:02d}"
+    h, m = parse_hm(hm)
+    cur_min = h * 60 + m
+
+    ov = (cfg.get("point_overrides") or {}).get(hm)
+    ov_dict = ov if isinstance(ov, dict) else {}
+
+    t_mode = ov_dict.get("msg_time_mode")
+    if t_mode not in ("datetime", "date_only", "none"):
+        t_mode = cfg.get("dt_time_mode", "datetime")
+    if t_mode not in ("datetime", "date_only", "none"):
+        t_mode = "datetime"
+
+    d_fmt = cfg.get("dt_date_fmt", "YYYY-MM-DD")
+    if d_fmt not in ("YYYY-MM-DD", "YYYY年M月D日", "M月D日"):
+        d_fmt = "YYYY-MM-DD"
+
+    if ov_dict.get("msg_day_offset") is not None:
+        d_off = _clamp_day_offset(ov_dict.get("msg_day_offset"), 0)
+        src = f"单点({hm})"
+    elif cfg.get("dt_cutoff_enabled"):
+        cut_hm = _norm_hm_str(cfg.get("dt_cutoff_hm"), "09:00")
+        ch, cm = parse_hm(cut_hm)
+        if cur_min < ch * 60 + cm:
+            d_off = _clamp_day_offset(cfg.get("dt_before_cutoff_offset"), -1)
+            src = f"{cut_hm}前跨天"
+        else:
+            d_off = _clamp_day_offset(cfg.get("dt_day_offset"), 0)
+            src = "全局设置"
+    else:
+        d_off = _clamp_day_offset(cfg.get("dt_day_offset"), 0)
+        src = "全局设置"
+
+    return t_mode, d_fmt, d_off, src
+
+
+def build_dingtalk_message_text(cfg, lt=None, hm_override=None):
+    """生成钉钉发送文案：支持日期+时间 / 仅日期 / 不加日期、跨天减N天与分时段后缀。"""
+    lt = lt or time.localtime()
+    hm = _norm_hm_str(hm_override, f"{lt.tm_hour:02d}:{lt.tm_min:02d}") if hm_override else f"{lt.tm_hour:02d}:{lt.tm_min:02d}"
+    suffix, suffix_src = resolve_suffix_for_time(cfg, lt=lt, hm_override=hm)
+    t_mode, d_fmt, d_off, time_src = resolve_dingtalk_time_policy(cfg, lt=lt, hm_override=hm)
+    shifted_lt = _shift_lt(lt, d_off)
+    date_part = format_preset_date(lt=shifted_lt, date_fmt=d_fmt, day_offset=0)
+
+    if t_mode == "datetime":
+        stamp = f"{date_part} {hm}"
+    elif t_mode == "date_only":
+        stamp = date_part
+    else:
+        stamp = ""
+
+    if stamp and suffix:
+        full_msg = f"{stamp} {suffix}"
+    elif stamp:
+        full_msg = stamp
+    elif suffix:
+        full_msg = suffix
+    else:
+        # 既选了不加日期时间又没填任何后缀时，保底带日期防止发送空串出错
+        full_msg = date_part
+    return {
+        "text": full_msg,
+        "stamp": stamp,
+        "date_part": date_part,
+        "suffix": suffix,
+        "suffix_source": suffix_src,
+        "time_mode": t_mode,
+        "date_fmt": d_fmt,
+        "day_offset": d_off,
+        "time_source": time_src,
+        "hm": hm,
+    }
+
+
 def resolve_silent_for_time(cfg, lt=None, hm_override=None):
     """按单点覆盖 -> 全局默认 解析指定时刻是否开启静音发送，返回 (do_silent, source)。"""
     lt = lt or time.localtime()
@@ -1387,22 +5323,22 @@ def diagnose_dingtalk_env():
 
     win_count = 0
     login_only = False
+    has_aux_doc_win = False
     try:
-        wins = _enum_top_windows(
-            target_classes=("DtMainFrameView", "Qt51511QWindowIcon"),
-            target_titles=None,
-        )
-        if not wins:
-            wins = _enum_top_windows(target_classes=None, target_titles=("钉钉", "DingTalk"))
-        win_count = len(wins)
-        if wins:
+        im_wins = _enum_dingtalk_im_windows(include_hidden=False)
+        win_count = len(im_wins)
+        if im_wins:
             try:
                 import uiautomation as ua  # type: ignore[import-not-found]
-                ctl = ua.ControlFromHandle(wins[0][0])
+                ctl = _safe_control_from_handle(ua, im_wins[0][0])
                 if ctl is not None and _is_dingtalk_login_window(ctl):
                     login_only = True
             except Exception:
                 pass
+        for _hw, _cls, _ttl in _enum_top_windows():
+            if _is_dingtalk_aux_window(_cls, _ttl) and ("钉钉" in (_ttl or "") or "DingTalk" in (_ttl or "")):
+                has_aux_doc_win = True
+                break
     except Exception:
         pass
 
@@ -1415,11 +5351,18 @@ def diagnose_dingtalk_env():
         "管理员权限" if priv.get("ding_elevated")
         else ("普通用户权限" if priv.get("ding_elevated") is False else "未运行")
     )
+    win_status_txt = (
+        "未登录/扫码页" if login_only
+        else (f"已就绪（{win_count} 个聊天主窗）" if win_count
+              else ("仅检测到钉钉-文档等子窗，聊天主窗在托盘" if has_aux_doc_win else "托盘隐藏或未打开"))
+    )
+    pc_prof = probe_pc_and_dingtalk_profile(None)
     lines = [
+        f"• 当前电脑适配：{pc_prof['screen_w']}×{pc_prof['screen_h']}（缩放 {pc_prof['dpi_scale']:.2f}x）｜钉钉主题：{pc_prof['dt_theme_cn']}｜UIA响应：{pc_prof['uia_ms']}ms",
         f"• 本程序权限：{self_lbl}",
         f"• 钉钉进程：{len(procs)} 个（{ding_lbl}）",
         f"• 安装路径：{existing_exe or '暂未找到可执行文件'}",
-        f"• 主窗口状态：{'未登录/扫码页' if login_only else (f'已就绪（{win_count} 个主窗）' if win_count else '托盘隐藏或未打开')}",
+        f"• 主窗口状态：{win_status_txt}",
         f"• 图像兜底模板：{len(tpl_ok)}/{len(tpl_names)} 张就绪" + (f"（缺失：{','.join(tpl_missing)}）" if tpl_missing else ""),
     ]
     if not priv.get("matched", True):
@@ -1433,6 +5376,7 @@ def diagnose_dingtalk_env():
         "login_only": login_only,
         "exe_path": existing_exe,
         "templates_missing": tpl_missing,
+        "pc_profile": pc_prof,
         "summary": "\n".join(lines),
     }
 
@@ -1503,9 +5447,17 @@ def build_daily_timetable(cfg):
     g_cap = bool(cfg.get("enable_capture", True))
     g_dt = bool(cfg.get("enable_dingtalk", False))
     overrides = cfg.get("point_overrides") or {}
+    now_lt = time.localtime()
+    date_preset_item = next(
+        (it for it in ((cfg.get("summary_presets") or {}).get("items") or [])
+         if isinstance(it, dict) and it.get("enabled", True) and it.get("action") == "today"),
+        None,
+    )
     timetable = []
     for m in sorted(points.keys()):
         hm = f"{m // 60:02d}:{m % 60:02d}"
+        ph, pm = m // 60, m % 60
+        pt_lt = time.struct_time((now_lt.tm_year, now_lt.tm_mon, now_lt.tm_mday, ph, pm, 0, now_lt.tm_wday, now_lt.tm_yday, now_lt.tm_isdst))
         ov = overrides.get(hm) if isinstance(overrides.get(hm), dict) else {}
         ov_mode = ov.get("mode", "default")
         if ov_mode not in ("default", "send", "table_only"):
@@ -1524,6 +5476,17 @@ def build_daily_timetable(cfg):
         do_silent, silent_src = resolve_silent_for_time(cfg, hm_override=hm)
         sil_ov = ov.get("silent") if isinstance(ov.get("silent"), bool) else None
         has_custom_suf = ("suffix" in ov and ov["suffix"] is not None)
+
+        if date_preset_item is not None and (cfg.get("summary_presets") or {}).get("enabled", True):
+            s_off, s_src = resolve_preset_day_offset(date_preset_item, cfg=cfg, lt=pt_lt, hm_override=hm)
+            s_prev = format_preset_date(lt=pt_lt, date_fmt=date_preset_item.get("date_fmt", "YYYY年M月D日"), day_offset=s_off)
+        else:
+            s_ov_raw = ov.get("sheet_day_offset")
+            s_off = _clamp_day_offset(s_ov_raw, None) if s_ov_raw is not None else 0
+            s_src = f"单点({hm})" if s_ov_raw is not None else "未启用"
+            s_prev = format_preset_date(lt=pt_lt, date_fmt="YYYY年M月D日", day_offset=s_off)
+
+        msg_info = build_dingtalk_message_text(cfg, lt=pt_lt, hm_override=hm)
         timetable.append({
             "time": hm,
             "min": m,
@@ -1537,6 +5500,14 @@ def build_daily_timetable(cfg):
             "suffix_source": suf_src,
             "has_custom_suffix": has_custom_suf,
             "override_mode": ov_mode,
+            "sheet_day_offset": ov.get("sheet_day_offset") if ov.get("sheet_day_offset") is not None else s_off,
+            "sheet_offset_effective": s_off,
+            "sheet_date_source": s_src,
+            "sheet_date_preview": s_prev,
+            "msg_time_mode": msg_info["time_mode"],
+            "msg_day_offset": msg_info["day_offset"],
+            "msg_time_source": msg_info["time_source"],
+            "msg_preview": msg_info["text"],
         })
     return timetable
 
@@ -1686,24 +5657,25 @@ def switch_wps_sheet(page, name, tries=3):
 
 
 def paste_to_wps(page, sheet_name, tsv_path):
-    check_stop()
-    log(f"正在写入【{sheet_name}】...")
-    if not switch_wps_sheet(page, sheet_name):
-        raise RuntimeError(f"没找到【{sheet_name}】这个工作表")
+    with hands_off_guard(f"WPS 表格【{sheet_name}】中粘贴数据"):
+        check_stop()
+        log(f"正在写入【{sheet_name}】...")
+        if not switch_wps_sheet(page, sheet_name):
+            raise RuntimeError(f"没找到【{sheet_name}】这个工作表")
 
-    sleep_check(3)
-    page.keyboard.press("Control+A")
-    sleep_check(0.5)
-    page.keyboard.press("Delete")
-    sleep_check(1)
+        sleep_check(3)
+        page.keyboard.press("Control+A")
+        sleep_check(0.5)
+        page.keyboard.press("Delete")
+        sleep_check(1)
 
-    with open(tsv_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    set_clipboard_windows(content)
-    sleep_check(0.5)
-    page.keyboard.press("Control+V")
-    sleep_check(3)
-    log(f"✅ 【{sheet_name}】写入完成")
+        with open(tsv_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        set_clipboard_windows(content)
+        sleep_check(0.5)
+        page.keyboard.press("Control+V")
+        sleep_check(3)
+        log(f"✅ 【{sheet_name}】写入完成")
 
 
 def check_wps_logged_in(page):
@@ -1810,6 +5782,15 @@ def _col_letter_to_idx(letter):
     return n
 
 
+def _idx_to_col_letter(n):
+    chars = []
+    num = int(n)
+    while num > 0:
+        num, rem = divmod(num - 1, 26)
+        chars.append(chr(ord("A") + rem))
+    return "".join(reversed(chars))
+
+
 def _main_canvas_box(page):
     """表格主体是面积最大的 canvas，返回其 bounding box。"""
     boxes = [c.bounding_box() for c in page.query_selector_all("canvas")]
@@ -1825,6 +5806,336 @@ def _goto_cell(page, addr):
     eb.fill(addr)
     page.keyboard.press("Enter")
     time.sleep(0.45)
+
+
+def format_preset_date(lt=None, date_fmt="YYYY年M月D日", day_offset=0):
+    """按配置格式与天数偏移生成查询日期字符串，精确支持跨月/跨年。"""
+    lt = _shift_lt(lt or time.localtime(), day_offset=day_offset)
+    if date_fmt == "M月D日":
+        return f"{lt.tm_mon}月{lt.tm_mday}日"
+    if date_fmt == "YYYY-MM-DD":
+        return f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}"
+    return f"{lt.tm_year:04d}年{lt.tm_mon}月{lt.tm_mday}日"
+
+
+def expand_preset_cells(raw_cell):
+    """展开单格、逗号分隔或小区间（如 D4:E4 -> ['D4', 'E4']）为规范单元格地址列表。"""
+    out = []
+    seen = set()
+    for part in re.split(r"[\s,;，、]+", str(raw_cell or "").strip().upper()):
+        if not part:
+            continue
+        m_rng = re.fullmatch(r"([A-Z]{1,3})([1-9]\d{0,5}):([A-Z]{1,3})([1-9]\d{0,5})", part)
+        if m_rng:
+            c1, r1, c2, r2 = m_rng.group(1), int(m_rng.group(2)), m_rng.group(3), int(m_rng.group(4))
+            lo_x, hi_x = sorted((_col_letter_to_idx(c1), _col_letter_to_idx(c2)))
+            lo_r, hi_r = sorted((r1, r2))
+            if (hi_x - lo_x + 1) * (hi_r - lo_r + 1) <= 20:
+                for rr in range(lo_r, hi_r + 1):
+                    for cc in range(lo_x, hi_x + 1):
+                        addr = f"{_idx_to_col_letter(cc)}{rr}"
+                        if addr not in seen:
+                            seen.add(addr)
+                            out.append(addr)
+                continue
+        if re.fullmatch(r"[A-Z]{1,3}[1-9]\d{0,5}", part) and part not in seen:
+            seen.add(part)
+            out.append(part)
+    return out
+
+
+def _normalize_preset_text(s):
+    txt = str(s or "").replace("\r", "").replace("\n", "").replace("\t", "")
+    return re.sub(r"\s+", "", txt).replace("，", ",").strip()
+
+
+def _preset_readback_matches(action, expected_val, actual_val, lt=None, day_offset=0):
+    """比对从 WPS 单元格回读到的文本是否已符合预期目标。"""
+    act_norm = _normalize_preset_text(actual_val)
+    if action == "clear":
+        return act_norm == ""
+    if not act_norm:
+        return False
+    exp_norm = _normalize_preset_text(expected_val)
+    if action == "today":
+        target_lt = _shift_lt(lt or time.localtime(), day_offset=day_offset)
+        nums = re.findall(r"\d+", act_norm)
+        return (str(target_lt.tm_mon) in nums and str(target_lt.tm_mday) in nums) or (act_norm == exp_norm)
+    return act_norm == exp_norm
+
+
+def _focus_wps_formula_bar(page):
+    """尝试点击 WPS 顶部公式编辑栏，不可用时返回 False 以便回退 F2 编辑态。"""
+    selectors = [
+        ".formula-input",
+        ".et-formula-bar input",
+        ".et-formula-bar textarea",
+        "[class*='formula-bar'] [contenteditable='true']",
+        "[class*='formula'] [contenteditable='true']",
+        "[class*='formula'] textarea",
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                loc.click(timeout=2000)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _write_wps_cell_via_edit_mode(page, cell, val_str):
+    """通过名称框定位后进入公式栏或 F2 编辑态写入目标文本并回车提交。"""
+    _goto_cell(page, cell)
+    if not _focus_wps_formula_bar(page):
+        page.keyboard.press("F2")
+        time.sleep(0.2)
+    page.keyboard.press("Control+A")
+    time.sleep(0.08)
+    page.keyboard.press("Backspace")
+    time.sleep(0.08)
+    set_clipboard_windows(val_str)
+    sleep_check(0.15)
+    page.keyboard.press("Control+V")
+    sleep_check(0.25)
+    page.keyboard.press("Enter")
+    sleep_check(0.3)
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+
+def format_preset_now(lt=None, time_fmt="full"):
+    """按配置格式生成写入单元格的当前精确时间文本。"""
+    t = lt or time.localtime()
+    if time_fmt == "hm":
+        return f"{t.tm_year:04d}-{t.tm_mon:02d}-{t.tm_mday:02d} {t.tm_hour:02d}:{t.tm_min:02d}"
+    if time_fmt == "time_only":
+        return f"{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}"
+    return f"{t.tm_year:04d}年{t.tm_mon:02d}月{t.tm_mday:02d}日{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}"
+
+
+def apply_wps_summary_presets(page, cfg, lt=None, hm_override=None, after_data_paste=True):
+    """在切换到数据汇总表后、等待刷新与截图前，按任意工作表与格位精准写入用户自定义内容。"""
+    sp = (cfg or {}).get("summary_presets")
+    if not isinstance(sp, dict) or not sp.get("enabled", True):
+        return 0
+    items = [it for it in (sp.get("items") or []) if isinstance(it, dict) and it.get("enabled", True)]
+    if not items:
+        return 0
+
+    lt = lt or time.localtime()
+    applied = 0
+    log(f"  正在通过名称框校准表格 {len(items)} 项自定义单元格（无需表格框线）…")
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+    current_sheet = "数据汇总"
+    # 先执行非「数据汇总」页签，再统一写「数据汇总」，避免在单测 MockPage 场景调用切表
+    ordered_items = [it for it in items if str(it.get("sheet") or "数据汇总").strip() != "数据汇总"] + [
+        it for it in items if str(it.get("sheet") or "数据汇总").strip() in ("", "数据汇总")
+    ]
+
+    for it in ordered_items:
+        check_stop()
+        if it.get("only_after_paste", False) and not after_data_paste:
+            continue
+        cells = expand_preset_cells(it.get("cell"))
+        if not cells:
+            continue
+        target_sheet = str(it.get("sheet") or "数据汇总").strip() or "数据汇总"
+        if target_sheet != current_sheet and hasattr(page, "locator"):
+            try:
+                if switch_wps_sheet(page, target_sheet):
+                    current_sheet = target_sheet
+                    sleep_check(0.8)
+            except Exception as e_sw:
+                log(f"  ⚠️ 切换工作表「{target_sheet}」失败，跳过对应格位：{e_sw}")
+                continue
+
+        action = str(it.get("action") or "value").strip().lower()
+        date_fmt = str(it.get("date_fmt") or "YYYY年M月D日").strip()
+        time_fmt = str(it.get("time_fmt") or "full").strip()
+        label = str(it.get("label") or "").strip()
+        day_off = 0
+        off_desc = ""
+        if action == "today":
+            day_off, off_src = resolve_preset_day_offset(it, cfg=cfg, lt=lt, hm_override=hm_override)
+            val_str = format_preset_date(lt=lt, date_fmt=date_fmt, day_offset=day_off)
+            if day_off != 0:
+                off_desc = f" [偏移{day_off:+d}天 · {off_src}]"
+        elif action == "now":
+            val_str = format_preset_now(lt=lt, time_fmt=time_fmt)
+        elif action == "clear":
+            val_str = ""
+        else:
+            val_str = "" if it.get("value") is None else str(it.get("value")).strip()
+            if not val_str:
+                action = "clear"
+            elif val_str.startswith("=") and action != "formula":
+                action = "formula"
+
+        sheet_prefix = f"[{target_sheet}] " if target_sheet != "数据汇总" else ""
+        tag = f"（{label}）" if label else ""
+        for cell in cells:
+            check_stop()
+            _goto_cell(page, cell)
+            if action == "clear":
+                page.keyboard.press("Delete")
+                sleep_check(0.25)
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                log(f"  ✅ 已清空单元格 {sheet_prefix}{cell}{tag}")
+                applied += 1
+                continue
+
+            if action == "formula":
+                _write_wps_cell_via_edit_mode(page, cell, val_str)
+                log(f"  ✅ 已写入公式单元格 {sheet_prefix}{cell}{tag} -> {val_str}")
+                applied += 1
+                continue
+
+            page.keyboard.press("Delete")
+            sleep_check(0.15)
+            set_clipboard_windows(val_str)
+            sleep_check(0.12)
+            page.keyboard.press("Control+V")
+            sleep_check(0.35)
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            sleep_check(0.18)
+
+            readback = ""
+            try:
+                clear_clipboard_windows()
+                _goto_cell(page, cell)
+                page.keyboard.press("Control+C")
+                dl = time.monotonic() + 0.55
+                while time.monotonic() < dl:
+                    time.sleep(0.12)
+                    readback = get_clipboard_text_windows()
+                    if readback:
+                        break
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+            except Exception:
+                readback = ""
+
+            if action == "now":
+                rb_n = _normalize_preset_text(readback)
+                if rb_n and ("#" in rb_n or (time_fmt != "hm" and len(re.findall(r"\d+", rb_n)) < 5 and ":" not in rb_n)):
+                    _write_wps_cell_via_edit_mode(page, cell, "'" + val_str)
+            elif readback and not _preset_readback_matches(action, val_str, readback, lt=lt, day_offset=day_off):
+                log(f"  [预设校准] {sheet_prefix}{cell}{tag} 回读「{_normalize_preset_text(readback)[:24]}」，改用公式栏/编辑态重写入…")
+                _write_wps_cell_via_edit_mode(page, cell, val_str)
+            elif not readback and action == "value" and _focus_wps_formula_bar(page):
+                _write_wps_cell_via_edit_mode(page, cell, val_str)
+
+            log(f"  ✅ 已校准单元格 {sheet_prefix}{cell}{tag} -> {val_str}{off_desc}")
+            applied += 1
+
+    if current_sheet != "数据汇总" and hasattr(page, "locator"):
+        try:
+            switch_wps_sheet(page, "数据汇总")
+            sleep_check(0.6)
+        except Exception:
+            pass
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    try:
+        _goto_cell(page, "C6")
+    except Exception:
+        pass
+    return applied
+
+
+def format_update_timestamp(lt=None):
+    """生成数据粘贴完成后的秒级最后更新时间文本，例如 2026年11月21日13:55:01。"""
+    t = lt or time.localtime()
+    return f"{t.tm_year:04d}年{t.tm_mon:02d}月{t.tm_mday:02d}日{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}"
+
+
+def apply_wps_update_timestamp(page, cfg, after_data_paste=True, now_lt=None):
+    """在数据粘贴完成后，通过名称框定位并在 S4（对应 P4 最后更新时间）写入当前精确到秒的时间。"""
+    raw_ut = (cfg or {}).get("update_time_cell")
+    if not isinstance(raw_ut, dict):
+        ut = {"enabled": True, "cell": "S4", "only_after_paste": True}
+    else:
+        ut = raw_ut
+    if not ut.get("enabled", True):
+        return 0
+    if ut.get("only_after_paste", True) and not after_data_paste:
+        return 0
+
+    cells = expand_preset_cells(ut.get("cell") or "S4") or ["S4"]
+    ts_str = format_update_timestamp(now_lt)
+    written = 0
+
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+    for cell in cells:
+        check_stop()
+        _goto_cell(page, cell)
+        page.keyboard.press("Delete")
+        sleep_check(0.15)
+        set_clipboard_windows(ts_str)
+        sleep_check(0.12)
+        page.keyboard.press("Control+V")
+        sleep_check(0.35)
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        sleep_check(0.18)
+
+        readback = ""
+        try:
+            clear_clipboard_windows()
+            _goto_cell(page, cell)
+            page.keyboard.press("Control+C")
+            dl = time.monotonic() + 0.55
+            while time.monotonic() < dl:
+                time.sleep(0.12)
+                readback = get_clipboard_text_windows()
+                if readback:
+                    break
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+        except Exception:
+            readback = ""
+
+        rb_norm = _normalize_preset_text(readback)
+        if rb_norm and ("#" in rb_norm or (":" not in rb_norm and len(re.findall(r"\d+", rb_norm)) < 5)):
+            log(f"  [最后更新时间] {cell} 回读「{rb_norm[:24]}」，改用纯文本编辑态重写入…")
+            _write_wps_cell_via_edit_mode(page, cell, "'" + ts_str)
+        elif not rb_norm and _focus_wps_formula_bar(page):
+            _write_wps_cell_via_edit_mode(page, cell, ts_str)
+
+        log(f"  ✅ 已写入最后更新时间 {cell}（对应 P4） -> {ts_str}")
+        written += 1
+
+    try:
+        _goto_cell(page, "C6")
+    except Exception:
+        pass
+    return written
 
 
 def _detect_last_row(page, start_cell="Q8"):
@@ -2145,7 +6456,31 @@ def _trim_clipboard_image_right_blank():
     return False
 
 
+def _try_capture_selection_tsv(page):
+    """在复制图片前顺手抓取已框选区域的纯文本 TSV 供 AI 长期数据归档。"""
+    global _last_captured_summary_tsv
+    try:
+        clear_clipboard_windows()
+        page.keyboard.press("Control+C")
+        dl = time.monotonic() + 0.55
+        while time.monotonic() < dl:
+            time.sleep(0.1)
+            txt = get_clipboard_text_windows()
+            if txt and len(txt.strip()) >= 20:
+                _last_captured_summary_tsv = txt
+                return txt
+    except Exception:
+        pass
+    return ""
+
+
 def capture_wps_region(page):
+    """按 Q 列（失败则 D 列兜底）确定末行，框选 C6:AK 并高清复制为图片（期间保护键鼠提示）。"""
+    with hands_off_guard("WPS 汇总表中框选区域并复制截图"):
+        return _capture_wps_region_inner(page)
+
+
+def _capture_wps_region_inner(page):
     """按 Q 列（失败则 D 列兜底）确定末行，框选 C6:AK 并高清复制为图片。"""
     check_stop()
     log("  准备按 Q 列末行框选表格…")
@@ -2170,6 +6505,7 @@ def capture_wps_region(page):
     log(f"  Q 列最后有文字的是第 {last_row} 行，目标 C6:AK{last_row}")
 
     selected_ok = _select_wps_range(page, last_row, end_col="AK", use_mouse=True)
+    _try_capture_selection_tsv(page)
     try:
         _set_wps_zoom(page, 200)
     except Exception:
@@ -2264,6 +6600,117 @@ def _enum_top_windows(target_classes=None, target_titles=None):
     return results
 
 
+_DT_AUX_TITLE_KEYWORDS = (
+    "钉钉-文档", "钉钉文档", "多维表", "脑图", "白板", "闪记", "知识库",
+    "钉盘", "钉邮", "邮箱", "日历", "日程", "视频会议", "语音通话",
+    "会议", "直播", "图片查看", "预览", "工作台", "小程序", "审批", "考勤", "日志",
+)
+_active_dt_hwnd = 0
+
+
+def _is_dingtalk_aux_window(cls, title):
+    """精准识别「钉钉-文档」、独立预览/会议/搜索浮窗等非主聊天窗口，防止抢占聊天主窗激活。"""
+    c = str(cls or "").strip()
+    t = str(title or "").strip()
+    if any(k in c for k in ("ToolSaveBits", "QuiMenu", "Shadow", "Popup", "ComplexModal", "RichInputInsertLinkBox")):
+        return True
+    if "钉钉-文档" in t or "钉钉文档" in t:
+        return True
+    if t.endswith(("- 钉钉", "- 钉钉文档", "- DingTalk")):
+        return True
+    if t and t not in ("钉钉", "DingTalk") and any(k in t for k in _DT_AUX_TITLE_KEYWORDS):
+        return True
+    return False
+
+
+def _score_dingtalk_main_window(cls, title, width=800, height=600, is_iconic=False, in_ding_pids=True):
+    """对顶层窗口进行打分：仅真正的钉钉 IM 聊天主窗得高分，附属文档窗口和微小隐藏窗返回 0。"""
+    c = str(cls or "").strip()
+    cl = c.lower()
+    t = str(title or "").strip()
+    if _is_dingtalk_aux_window(c, t):
+        return 0
+    if not is_iconic and (int(width) < 380 or int(height) < 280):
+        return 0
+    if c == "DtMainFrameView":
+        return 100
+    if t in ("钉钉", "DingTalk"):
+        if cl.startswith("qt"):
+            return 95 if in_ding_pids else 85
+        if in_ding_pids:
+            return 80
+    if in_ding_pids and c == "Qt51511QWindowIcon" and not t and (is_iconic or (int(width) >= 560 and int(height) >= 380)):
+        return 60
+    return 0
+
+
+def _enum_dingtalk_im_windows(include_hidden=False):
+    """按匹配得分与窗口状态枚举真正的钉钉聊天主窗：[(hwnd, pid, cls, title, score), ...]。"""
+    if os.name != "nt":
+        return []
+    user32 = ctypes.windll.user32
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, wintypes.LPDWORD]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+
+    ding_pids = {p for p, _ in _list_dingtalk_processes() if p}
+    candidates = []
+
+    def _cb(hwnd, _lp):
+        vis = bool(user32.IsWindowVisible(hwnd))
+        if not include_hidden and not vis:
+            return True
+        iconic = bool(user32.IsIconic(hwnd))
+        cbuf = ctypes.create_unicode_buffer(128)
+        tbuf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cbuf, 128)
+        user32.GetWindowTextW(hwnd, tbuf, 256)
+        pv = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pv))
+        pid = int(pv.value or 0)
+        rc = wintypes.RECT()
+        w, h = 0, 0
+        if user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+            w = int(rc.right - rc.left)
+            h = int(rc.bottom - rc.top)
+        in_ding = (pid in ding_pids) if ding_pids else True
+        sc = _score_dingtalk_main_window(cbuf.value, tbuf.value, width=w, height=h, is_iconic=iconic, in_ding_pids=in_ding)
+        if sc > 0:
+            candidates.append((int(hwnd), pid, cbuf.value, tbuf.value, sc, 0 if (vis and not iconic) else 1, max(0, w * h)))
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    candidates.sort(key=lambda item: (-item[4], item[5], -item[6]))
+    return [(item[0], item[1], item[2], item[3], item[4]) for item in candidates]
+
+
+def _safe_control_from_handle(ua_mod, hwnd):
+    """安全包裹 uiautomation.ControlFromHandle，防止窗口还原瞬间触发 COMError(-2147220991) 崩溃。"""
+    if not hwnd or ua_mod is None:
+        return None
+    for attempt in range(2):
+        try:
+            ctl = ua_mod.ControlFromHandle(int(hwnd))
+            if ctl is not None:
+                return ctl
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.12)
+    return None
+
+
 def _extract_search_keywords(search_name):
     """从含 Emoji 与符号的群名提取高命中率纯文字搜索词和校验分词。"""
     import unicodedata
@@ -2317,12 +6764,19 @@ def _is_dingtalk_login_window(win):
         pass
     try:
         hit_login = False
+        deadline = time.monotonic() + 0.55
+        visited = [0]
 
         def _scan_login(ctrl, depth=0):
             nonlocal hit_login
-            if hit_login or depth > 6:
+            if hit_login or depth > 6 or visited[0] >= 65 or time.monotonic() > deadline:
                 return
             for ch in ctrl.GetChildren():
+                visited[0] += 1
+                if visited[0] % 15 == 0:
+                    check_stop()
+                if visited[0] > 65 or time.monotonic() > deadline:
+                    return
                 try:
                     nm = (ch.Name or "").strip()
                     if any(k in nm for k in ("扫码登录", "密码登录", "验证码登录", "钉钉账号登录", "安全登录")):
@@ -2335,8 +6789,9 @@ def _is_dingtalk_login_window(win):
         _scan_login(win, 0)
         if hit_login:
             return True
-    except Exception:
-        pass
+    except Exception as ex:
+        if "手动停止" in str(ex):
+            raise
     return False
 
 
@@ -2570,51 +7025,206 @@ def _unwrap_uia(ctrl):
     return ctrl
 
 
+def _resolve_best_dt_uia_hwnd(pids):
+    """精准解析真正的钉钉聊天主窗 HWND 与 PID，避开钉钉-文档与无窗渲染子进程。"""
+    if os.name == "nt":
+        u32 = ctypes.windll.user32
+        u32.IsWindow.argtypes = [wintypes.HWND]
+        u32.IsWindow.restype = wintypes.BOOL
+        u32.IsWindowVisible.argtypes = [wintypes.HWND]
+        u32.IsWindowVisible.restype = wintypes.BOOL
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, wintypes.LPDWORD]
+        u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        if _active_dt_hwnd and u32.IsWindow(_active_dt_hwnd) and u32.IsWindowVisible(_active_dt_hwnd):
+            pv = wintypes.DWORD(0)
+            u32.GetWindowThreadProcessId(_active_dt_hwnd, ctypes.byref(pv))
+            return int(_active_dt_hwnd), int(pv.value or 0)
+        im_wins = _enum_dingtalk_im_windows(include_hidden=False)
+        if im_wins:
+            return im_wins[0][0], im_wins[0][1]
+
+    try:
+        from pywinauto import Desktop  # type: ignore[import-not-found]
+        for w in Desktop(backend="uia").windows():
+            try:
+                if pids and w.process_id() not in pids:
+                    continue
+                cls = (w.element_info.class_name or "")
+                nm = (w.element_info.name or "")
+                if _is_dingtalk_aux_window(cls, nm):
+                    continue
+                rr = w.rectangle()
+                if w.is_visible() and rr.width() >= 500 and rr.height() >= 340:
+                    return int(w.handle), int(w.process_id())
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return 0, 0
+
+
+_current_pc_plan = {
+    "screen_w": 1920,
+    "screen_h": 1080,
+    "dpi_scale": 1.0,
+    "dt_theme": "unknown",
+    "dt_theme_cn": "默认",
+    "uia_ms": 0,
+    "scales": (1.0, 1.5, 1.875, 2.0, 2.25, 1.25, 1.75, 2.5, 2.75, 3.0, 0.85),
+    "search_settle_sec": 0.9,
+    "summary": "常规标准屏适配",
+}
+
+
+def probe_pc_and_dingtalk_profile(cfg=None):
+    """每次运行前自动探测当前电脑分辨率、DPI 缩放、钉钉明暗主题与 UIA 响应速度，动态生成最稳适配方案。"""
+    global _current_pc_plan
+    sw, sh = 1920, 1080
+    dpi_scale = 1.0
+    dt_theme = "unknown"
+    dt_theme_cn = "默认"
+    uia_ms = 0
+    dt_hwnd = 0
+
+    if os.name == "nt":
+        try:
+            u32 = ctypes.windll.user32
+            sw = int(u32.GetSystemMetrics(0) or 1920)
+            sh = int(u32.GetSystemMetrics(1) or 1080)
+            im_wins = _enum_dingtalk_im_windows(include_hidden=True)
+            if im_wins:
+                dt_hwnd = int(im_wins[0][0] or 0)
+            dpi_val = 96
+            if dt_hwnd and hasattr(u32, "GetDpiForWindow"):
+                try:
+                    dpi_val = int(u32.GetDpiForWindow(dt_hwnd) or 96)
+                except Exception:
+                    dpi_val = 96
+            elif hasattr(u32, "GetDpiForSystem"):
+                try:
+                    dpi_val = int(u32.GetDpiForSystem() or 96)
+                except Exception:
+                    dpi_val = 96
+            if dpi_val >= 72:
+                dpi_scale = round(max(0.75, min(3.5, dpi_val / 96.0)), 2)
+        except Exception:
+            pass
+
+        if dt_hwnd and ctypes.windll.user32.IsWindowVisible(dt_hwnd) and not ctypes.windll.user32.IsIconic(dt_hwnd):
+            try:
+                from PIL import ImageGrab
+                rc = wintypes.RECT()
+                if ctypes.windll.user32.GetWindowRect(dt_hwnd, ctypes.byref(rc)):
+                    w = rc.right - rc.left
+                    h = rc.bottom - rc.top
+                    if w > 300 and h > 300:
+                        box = (rc.left + int(w * 0.45), rc.top + int(h * 0.65), rc.left + int(w * 0.55), rc.top + int(h * 0.72))
+                        crop = ImageGrab.grab(bbox=box).convert("L")
+                        pxs = list(crop.getdata())
+                        if pxs:
+                            mean_lum = sum(pxs) / len(pxs)
+                            dt_theme = "dark" if mean_lum < 95 else "light"
+                            dt_theme_cn = "深色模式" if dt_theme == "dark" else "浅色模式"
+            except Exception:
+                pass
+
+        try:
+            t0 = time.monotonic()
+            ctypes.windll.user32.GetForegroundWindow()
+            if dt_hwnd:
+                _get_dt_main_win_rect()
+            uia_ms = int((time.monotonic() - t0) * 1000)
+        except Exception:
+            uia_ms = 0
+
+    base_scales = [1.0, 1.25, 1.5, 1.75, 1.875, 2.0, 2.25, 2.5, 2.75, 3.0, 0.85]
+    prioritized = sorted(base_scales, key=lambda s: abs(s - dpi_scale))
+    if round(dpi_scale, 3) not in prioritized:
+        prioritized.insert(0, round(dpi_scale, 3))
+
+    if sw >= 3200 or dpi_scale >= 1.8:
+        screen_tier = "4K超高清大屏"
+        settle = 1.05
+    elif sw >= 2200 or dpi_scale >= 1.35:
+        screen_tier = "2K高分屏"
+        settle = 0.95
+    else:
+        screen_tier = "常规标准屏"
+        settle = 0.85
+
+    if uia_ms > 280:
+        settle = min(1.5, settle + 0.35)
+
+    summary = f"{screen_tier} {sw}×{sh}（DPI {dpi_scale:.2f}x）｜钉钉{dt_theme_cn}｜搜索稳态{settle:.2f}s"
+    plan = {
+        "screen_w": sw,
+        "screen_h": sh,
+        "dpi_scale": dpi_scale,
+        "dt_theme": dt_theme,
+        "dt_theme_cn": dt_theme_cn,
+        "uia_ms": uia_ms,
+        "scales": tuple(prioritized),
+        "search_settle_sec": settle,
+        "summary": summary,
+    }
+    _current_pc_plan = plan
+    return plan
+
+
+def _try_click_qui_menu_by_win32():
+    """直接按可见 Qt 弹出菜单窗口（im_chat::QuiMenu）尺寸比例命中第2项「设为静音」，兼容所有分辨率与深色皮肤。"""
+    if os.name != "nt":
+        return False
+    try:
+        import pyautogui  # type: ignore[import-not-found]
+        u32 = ctypes.windll.user32
+        rc = wintypes.RECT()
+        for qh, _qc, _qt in _enum_top_windows(target_classes=("im_chat::QuiMenu",), target_titles=None):
+            if not u32.IsWindowVisible(qh):
+                continue
+            if u32.GetWindowRect(qh, ctypes.byref(rc)):
+                w = int(rc.right - rc.left)
+                h = int(rc.bottom - rc.top)
+                if w >= 60 and h >= 48:
+                    cx = int(rc.left + w // 2)
+                    cy = int(rc.top + max(12, int(h * 0.74)))
+                    log(f"  [静音模式: Qt弹出窗比例命中] 检测到菜单尺寸 {w}x{h}，点击第2项「设为静音」({cx}, {cy})")
+                    pyautogui.click(cx, cy)
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def _connect_dingtalk_pywinauto(timeout=5.0):
-    """使用 pywinauto(backend='uia') 通过 connect(path='DingTalk.exe') 连接钉钉主窗口（不使用窗口标题）。"""
-    from pywinauto import Application, Desktop  # type: ignore[import-not-found]
+    """使用 pywinauto(backend='uia') 直接按真实聊天主窗句柄连接，兜底才走 path='DingTalk.exe'。"""
+    from pywinauto import Application  # type: ignore[import-not-found]
 
     procs = _list_dingtalk_processes()
     pids = {p for p, _ in procs}
     target_path = procs[0][1] if (procs and procs[0][1]) else "DingTalk.exe"
 
-    desk = Desktop(backend="uia")
-    ui_win = None
-    for w in desk.windows():
+    best_hwnd, _best_pid = _resolve_best_dt_uia_hwnd(pids)
+    if best_hwnd:
         try:
-            if pids and w.process_id() not in pids:
-                continue
-            cls = (w.element_info.class_name or "")
-            if cls in ("DtMainFrameView", "Qt51511QWindowIcon"):
-                ui_win = w
-                break
-            if w.is_visible() and w.rectangle().width() >= 560 and w.rectangle().height() >= 380:
-                ui_win = w
+            app = Application(backend="uia").connect(handle=best_hwnd, timeout=timeout)
+            return app, app.window(handle=best_hwnd), pids
         except Exception:
             pass
 
     app = None
     try:
         app = Application(backend="uia").connect(path="DingTalk.exe", timeout=min(3.0, timeout))
-        if ui_win is not None and app.process != ui_win.process_id():
-            app = Application(backend="uia").connect(process=ui_win.process_id(), timeout=timeout)
     except Exception:
-        if ui_win is not None:
-            app = Application(backend="uia").connect(process=ui_win.process_id(), timeout=timeout)
-        else:
-            app = Application(backend="uia").connect(path=target_path, timeout=timeout)
+        app = Application(backend="uia").connect(path=target_path, timeout=timeout)
 
-    # 始终返回支持 child_window(...) 的 WindowSpecification（仅按句柄或类，绝不使用窗口标题）
-    if ui_win is not None:
-        win_spec = app.window(handle=ui_win.handle)
-    else:
-        cand = app.window(class_name="DtMainFrameView")
-        win_spec = cand if cand.exists(timeout=1.5) else app.top_window()
+    cand = app.window(class_name="DtMainFrameView")
+    win_spec = cand if cand.exists(timeout=1.5) else app.top_window()
     return app, win_spec, pids
 
 
-def _dump_uia_controls_to_log(uia_win, pids=None, max_depth=16):
-    """UIA 失败时将主窗下半区域与弹出层控件树（control_type / name / automation_id）打印到日志。"""
+def _dump_uia_controls_to_log(uia_win, pids=None, max_depth=14):
+    """UIA 失败时跳过聊天记录大列表，快速输出主窗下半区域与弹出层控件树快照。"""
     log("  ===== UIA 可用控件树快照（排查参考）=====")
     lines = []
     root_wrap = _unwrap_uia(uia_win)
@@ -2623,30 +7233,27 @@ def _dump_uia_controls_to_log(uia_win, pids=None, max_depth=16):
     except Exception:
         wrect = None
 
-    def _walk(ctrl, depth=0):
-        if depth > max_depth or len(lines) >= 140:
-            return
-        try:
-            info = ctrl.element_info
-            ct = info.control_type or ""
-            nm = (info.name or "").replace("\r", " ").replace("\n", " ").strip()
-            aid = info.automation_id or ""
-            cls = info.class_name or ""
-            rr = ctrl.rectangle()
-            if (nm or aid or ct in ("Button", "MenuItem", "SplitButton", "Edit", "Document")) and (
-                wrect is None or depth <= 4 or rr.top >= wrect.top + int((wrect.bottom - wrect.top) * 0.62)
-            ):
-                lines.append(f"{'  '*min(depth, 6)}[{ct}] name={nm!r} auto_id={aid!r} cls={cls!r}")
-        except Exception:
-            return
-        try:
-            for ch in ctrl.children():
-                _walk(ch, depth + 1)
-        except Exception:
-            pass
+    def _walk_pruned(start_ctrl, base_depth=0):
+        for ctrl, depth in _iter_dt_uia_pruned(start_ctrl, max_depth=max_depth):
+            if len(lines) >= 85:
+                break
+            d = base_depth + depth
+            try:
+                info = ctrl.element_info
+                ct = info.control_type or ""
+                nm = (info.name or "").replace("\r", " ").replace("\n", " ").strip()
+                aid = info.automation_id or ""
+                cls = info.class_name or ""
+                rr = ctrl.rectangle()
+                if (nm or aid or ct in ("Button", "MenuItem", "SplitButton", "Edit", "Document")) and (
+                    wrect is None or d <= 4 or rr.top >= wrect.top + int((wrect.bottom - wrect.top) * 0.62)
+                ):
+                    lines.append(f"{'  '*min(d, 6)}[{ct}] name={nm!r} auto_id={aid!r} cls={cls!r}")
+            except Exception:
+                pass
 
     if root_wrap is not None:
-        _walk(root_wrap, 0)
+        _walk_pruned(root_wrap, 0)
     if pids:
         try:
             from pywinauto import Desktop  # type: ignore[import-not-found]
@@ -2655,7 +7262,7 @@ def _dump_uia_controls_to_log(uia_win, pids=None, max_depth=16):
                 try:
                     if pw.process_id() in pids and (root_hwnd is None or pw.element_info.handle != root_hwnd):
                         lines.append(f"[弹出层] cls={pw.element_info.class_name!r} name={pw.element_info.name!r}")
-                        _walk(pw, 1)
+                        _walk_pruned(pw, 1)
                 except Exception:
                     pass
         except Exception:
@@ -2664,13 +7271,153 @@ def _dump_uia_controls_to_log(uia_win, pids=None, max_depth=16):
     if not lines:
         log("  （控件树未暴露可识别子节点）")
     else:
-        for ln in lines[:120]:
+        for ln in lines[:85]:
             log(f"  {ln}")
     log("  ===== 控件树快照结束 =====")
 
 
+DT_SUB_MENU_BUTTON_AUTO_ID = (
+    "qt_chat_navigable_content_widget.stackedWidget.mesasgePage.widget.splitter."
+    "widgetRichEditWnd.drich_edit.verticalContentWidget.widget_input_wnd."
+    "bottomBarWidget.combo_send_button_widget.containerWidget.rightContainerWidget.subMenuButton"
+)
+DT_RIGHT_SEND_CONTAINER_ID = (
+    "qt_chat_navigable_content_widget.stackedWidget.mesasgePage.widget.splitter."
+    "widgetRichEditWnd.drich_edit.verticalContentWidget.widget_input_wnd."
+    "bottomBarWidget.combo_send_button_widget.containerWidget.rightContainerWidget"
+)
+DT_RICH_EDIT_AUTO_ID = (
+    "qt_chat_navigable_content_widget.stackedWidget.mesasgePage.widget.splitter."
+    "widgetRichEditWnd.drich_edit"
+)
+
+
+def _iter_dt_uia_pruned(root_wrap, max_depth=24):
+    """快速遍历 Qt UIA 子树，跳过消息历史/会话列表超长分支以便毫秒级直达底栏控件。"""
+    skip_aids = ("messagelist", "sessionlist", "chat_list", "conversationlist")
+    stack = [(root_wrap, 0)]
+    while stack:
+        ctrl, depth = stack.pop()
+        if ctrl is None or depth > max_depth:
+            continue
+        yield ctrl, depth
+        if depth >= max_depth:
+            continue
+        try:
+            kids = ctrl.children()
+        except Exception:
+            kids = []
+        for ch in reversed(kids):
+            try:
+                aid = (ch.element_info.automation_id or "").lower()
+                if any(sk in aid for sk in skip_aids):
+                    continue
+            except Exception:
+                pass
+            stack.append((ch, depth + 1))
+
+
+def _find_dt_qt_arrow_ctrl(uia_win):
+    """优先使用实测精准 AutomationId（rightContainerWidget.subMenuButton）无坐标定位下拉箭头。"""
+    if hasattr(uia_win, "child_window"):
+        try:
+            cand = uia_win.child_window(auto_id=DT_SUB_MENU_BUTTON_AUTO_ID, found_index=0)
+            if cand.exists(timeout=0.5):
+                return cand
+        except Exception:
+            pass
+
+    wrap = _unwrap_uia(uia_win)
+    exact_low = DT_SUB_MENU_BUTTON_AUTO_ID.lower()
+    right_low = DT_RIGHT_SEND_CONTAINER_ID.lower()
+    suffix_hit = None
+    right_box = None
+    for ctrl, _depth in _iter_dt_uia_pruned(wrap, max_depth=24):
+        try:
+            info = ctrl.element_info
+            aid = (info.automation_id or "")
+            aid_l = aid.lower()
+            cls = info.class_name or ""
+            if aid_l == exact_low:
+                return ctrl
+            if suffix_hit is None and (
+                aid_l.endswith("rightcontainerwidget.submenubutton")
+                or (aid_l.endswith(".submenubutton") and cls == "ddesign::IconButton")
+            ):
+                suffix_hit = ctrl
+            if right_box is None and (aid_l == right_low or aid_l.endswith(".rightcontainerwidget")):
+                right_box = ctrl
+        except Exception:
+            pass
+    if suffix_hit is not None:
+        return suffix_hit
+    if right_box is not None:
+        for ch, _ in _iter_dt_uia_pruned(right_box, max_depth=6):
+            try:
+                if (ch.element_info.control_type or "") == "Button":
+                    return ch
+            except Exception:
+                pass
+    return None
+
+
+def _find_dt_qui_menu_silent_item(pop_windows):
+    """在 Qt 弹出菜单（如 im_chat::QuiMenu）中无坐标定位第 2 个菜单项控件（设为静音，兼容 4K 高缩放）。"""
+    from types import SimpleNamespace
+
+    class _QuiMenuAreaClick:
+        def __init__(self, pw_wrap, rel_x, rel_y):
+            self._pw = pw_wrap
+            self._rx = rel_x
+            self._ry = rel_y
+
+        def click_input(self):
+            self._pw.click_input(coords=(self._rx, self._ry))
+
+    menu_types = {"MenuItem", "Button", "ListItem", "Text", "Custom", "Pane"}
+    dpi_sc = float((_current_pc_plan or {}).get("dpi_scale") or 1.0)
+    max_row_h = max(160, int(110 * dpi_sc))
+    qui_fallback = None
+    for pw in (pop_windows or []):
+        rows = []
+        pwrap = _unwrap_uia(pw)
+        pcls = ""
+        try:
+            pcls = (pwrap.element_info.class_name or "")
+        except Exception:
+            pass
+        for ctrl, depth in _iter_dt_uia_pruned(pwrap, max_depth=12):
+            if depth < 1:
+                continue
+            try:
+                info = ctrl.element_info
+                rr = ctrl.rectangle()
+                if (info.control_type or "") in menu_types and rr.width() >= 36 and 14 <= rr.height() <= max_row_h:
+                    rows.append((rr.top, rr.height(), ctrl, info))
+            except Exception:
+                pass
+        dedup = []
+        for top_v, h_v, ctrl, info in sorted(rows, key=lambda x: (x[0], x[1])):
+            if not dedup or abs(top_v - dedup[-1][0]) >= 10:
+                dedup.append((top_v, ctrl, info))
+        if len(dedup) >= 3 or (pcls == "im_chat::QuiMenu" and len(dedup) >= 2):
+            second = dedup[1]
+            return second[1], second[2]
+        if pcls == "im_chat::QuiMenu" and qui_fallback is None:
+            try:
+                pr = pwrap.rectangle()
+                if pr.width() >= 60 and pr.height() >= 48:
+                    qui_fallback = (
+                        _QuiMenuAreaClick(pwrap, max(10, pr.width() // 2), max(12, int(pr.height() * 0.74))),
+                        SimpleNamespace(control_type="MenuItem", class_name=pcls),
+                    )
+            except Exception:
+                pass
+    return qui_fallback
+
+
 def _uia_find_silent_badge(uia_win):
-    """通过 child_window 检测输入区是否已开启「静音发送」。"""
+    """通过 child_window 及输入区子树检测是否已开启「静音发送」。"""
     try:
         badge = uia_win.child_window(title_re=r".*静音发送.*", found_index=0)
         if badge.exists(timeout=0.3):
@@ -2680,11 +7427,32 @@ def _uia_find_silent_badge(uia_win):
                 return True
     except Exception:
         pass
+    try:
+        wrap = _unwrap_uia(uia_win)
+        rich_low = DT_RICH_EDIT_AUTO_ID.lower()
+        for ctrl, _ in _iter_dt_uia_pruned(wrap, max_depth=18):
+            aid_l = (ctrl.element_info.automation_id or "").lower()
+            if aid_l == rich_low or aid_l.endswith(".drich_edit"):
+                for ch, _ in _iter_dt_uia_pruned(ctrl, max_depth=8):
+                    try:
+                        nm = (ch.element_info.name or "")
+                        rr = ch.rectangle()
+                        if "静音发送" in nm and rr.width() > 0 and rr.height() > 0:
+                            return True
+                    except Exception:
+                        pass
+                break
+    except Exception:
+        pass
     return False
 
 
 def _uia_find_arrow_ctrl(uia_win):
-    """仅用 child_window(auto_id / title_re) 定位发送右侧下拉箭头控件，禁止硬编码坐标。"""
+    """仅用 child_window(auto_id / title_re) 及精准子树定位发送右侧下拉箭头控件，禁止硬编码坐标。"""
+    qt_arrow = _find_dt_qt_arrow_ctrl(uia_win)
+    if qt_arrow is not None:
+        return qt_arrow
+
     wrect = _unwrap_uia(uia_win).rectangle()
     bottom_min_y = wrect.top + int(wrect.height() * 0.65)
 
@@ -2766,12 +7534,16 @@ def _uia_find_arrow_ctrl(uia_win):
 
 
 def _uia_click_ctrl(ctrl_wrap):
-    """优先物理 click_input 点击控件；若隔离桌面或锁屏拦截 SetCursorPos 且控件支持 invoke() 则回退调用。"""
+    """优先物理 click_input 点击控件；若隔离桌面或锁屏拦截鼠标光标且控件支持 invoke() 则回退调用。"""
     try:
         ctrl_wrap.click_input()
         return True
     except Exception as err:
-        if "setcursorpos" in repr(err).lower() and hasattr(ctrl_wrap, "invoke"):
+        err_l = f"{err!r} {err}".lower()
+        if (
+            any(k in err_l for k in ("setcursorpos", "getcursorpos", "no active desktop", "mouse_event", "拒绝访问", "access is denied"))
+            and hasattr(ctrl_wrap, "invoke")
+        ):
             try:
                 ctrl_wrap.invoke()
                 return True
@@ -2781,10 +7553,12 @@ def _uia_click_ctrl(ctrl_wrap):
 
 
 def _uia_find_and_click_silent_menu(uia_win, pids, enable_silent=True):
-    """在弹出菜单窗与主窗内使用 child_window 定位并点击「设为静音 / 取消静音」。"""
+    """先毫秒级在弹出菜单窗与 Qt QuiMenu 中定位，再剪枝扫描主窗（跳过聊天历史大列表），绝不卡死。"""
     from pywinauto import Application, Desktop, keyboard  # type: ignore[import-not-found]
 
-    search_roots = []
+    check_stop()
+    pop_specs = []
+    pop_windows = []
     main_hwnd = getattr(_unwrap_uia(uia_win), "handle", None)
     for pw in Desktop(backend="uia").windows():
         try:
@@ -2794,11 +7568,11 @@ def _uia_find_and_click_silent_menu(uia_win, pids, enable_silent=True):
                 continue
             if main_hwnd is not None and pw.handle == main_hwnd:
                 continue
+            pop_windows.append(pw)
             pw_spec = Application(backend="uia").connect(handle=pw.handle, timeout=1.5).window(handle=pw.handle)
-            search_roots.append(pw_spec)
+            pop_specs.append(pw_spec)
         except Exception:
             pass
-    search_roots.append(uia_win)
 
     already_re = r".*取消静音.*" if enable_silent else r".*(设为静音|静音发送).*"
     already_msg = "菜单显示当前已处于静音发送状态" if enable_silent else "菜单显示当前已处于常规提醒状态"
@@ -2811,7 +7585,9 @@ def _uia_find_and_click_silent_menu(uia_win, pids, enable_silent=True):
     if enable_silent:
         specs.append({"auto_id_re": r"(?i).*(silent|mute).*", "found_index": 0})
 
-    for root in search_roots:
+    # 1) 优先秒扫独立弹出菜单窗（通常仅有 2~4 个控件）
+    for root in pop_specs:
+        check_stop()
         try:
             already_item = root.child_window(title_re=already_re, found_index=0)
             if already_item.exists(timeout=0.15):
@@ -2824,7 +7600,7 @@ def _uia_find_and_click_silent_menu(uia_win, pids, enable_silent=True):
         for spec in specs:
             try:
                 item = root.child_window(**spec)
-                if item.exists(timeout=0.25):
+                if item.exists(timeout=0.2):
                     item_wrap = _unwrap_uia(item)
                     ir = item_wrap.rectangle()
                     if ir.width() > 0 and ir.height() > 0:
@@ -2834,18 +7610,84 @@ def _uia_find_and_click_silent_menu(uia_win, pids, enable_silent=True):
                         return True
             except Exception:
                 pass
+
+    # 2) Qt 弹出菜单（如 im_chat::QuiMenu）无暴露文字时，立即按第 2 项规则命中；若 Desktop 未枚举到则补查 TopLevel QuiMenu
+    if enable_silent and not pop_windows:
+        try:
+            for qh, _qc, _qt in _enum_top_windows(target_classes=("im_chat::QuiMenu",), target_titles=None):
+                try:
+                    q_spec = Application(backend="uia").connect(handle=qh, timeout=1.0).window(handle=qh)
+                    q_wrap = _unwrap_uia(q_spec)
+                    if q_wrap is not None:
+                        pop_windows.append(q_wrap)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if enable_silent and pop_windows:
+        qui_hit = _find_dt_qui_menu_silent_item(pop_windows)
+        if qui_hit is not None:
+            q_ctrl, q_info = qui_hit
+            log(f"  [静音模式: pywinauto-UIA] 命中 Qt 弹出菜单第2项「设为静音」: type={q_info.control_type!r} cls={q_info.class_name!r}")
+            _uia_click_ctrl(q_ctrl)
+            return True
+
+    # 3) 对主窗仅走剪枝子树（跳过 messagelist / sessionlist），毫秒级兜底绝不阻塞
+    check_stop()
+    already_kw = ("取消静音",) if enable_silent else ("设为静音", "静音发送")
+    target_kw = ("设为静音", "静音发送") if enable_silent else ("取消静音",)
+    win_wrap = _unwrap_uia(uia_win)
+    if win_wrap is not None:
+        visited = 0
+        for ctrl, _depth in _iter_dt_uia_pruned(win_wrap, max_depth=14):
+            visited += 1
+            if visited % 20 == 0:
+                check_stop()
+            if visited > 90:
+                break
+            try:
+                ii = ctrl.element_info
+                rr = ctrl.rectangle()
+                if rr.width() <= 0 or rr.height() <= 0:
+                    continue
+                nm = str(ii.name or "")
+                aid = str(ii.automation_id or "").lower()
+                if any(k in nm for k in already_kw):
+                    keyboard.send_keys("{ESC}")
+                    log(f"  [静音模式: pywinauto-UIA] {already_msg}")
+                    return True
+                if any(k in nm for k in target_kw) or (enable_silent and any(k in aid for k in ("silent", "mute"))):
+                    if (ii.control_type or "") in ("MenuItem", "Button", "ListItem", "Text", "Custom", "Pane"):
+                        log(f"  [静音模式: pywinauto-UIA] 命中菜单项: type={ii.control_type!r} name={ii.name!r} auto_id={ii.automation_id!r}")
+                        _uia_click_ctrl(ctrl)
+                        return True
+            except Exception:
+                pass
+    return False
+
+
+def _try_click_open_silent_menu_uia():
+    """当发送下拉菜单已在屏幕上打开时，直接借助 UIA 菜单项/Qt QuiMenu 第 2 项规则精准点击「设为静音」。"""
+    try:
+        _app, win, pids = _connect_dingtalk_pywinauto(timeout=2.5)
+        if win is not None and _uia_find_and_click_silent_menu(win, pids):
+            return True
+    except Exception:
+        pass
     return False
 
 
 def _enable_dingtalk_silent_send_uia():
     """主模式：pywinauto(backend='uia') 通过 connect(path='DingTalk.exe') 定位并点击静音发送。"""
-    state = {"win": None, "pids": set(), "arrow_clicked": False}
+    state = {"win": None, "pids": set(), "arrow_clicked": False, "arrow_wrap": None}
     try:
         def _step_focus():
             _app, win, pids = _connect_dingtalk_pywinauto(timeout=5.0)
             state["win"] = win
             state["pids"] = pids
             win.set_focus()
+            sleep_check(0.25)
             return True
 
         _retry_step("UIA连接钉钉并set_focus", _step_focus, retries=2, interval=1.0)
@@ -2853,12 +7695,17 @@ def _enable_dingtalk_silent_send_uia():
         if _uia_find_silent_badge(win):
             log("  [静音模式: pywinauto-UIA] 当前已开启「静音发送」")
             return True
+        if _uia_find_and_click_silent_menu(win, state["pids"]):
+            sleep_check(0.3)
+            log("  ✅ [静音模式: pywinauto-UIA] 已从当前展开菜单选择「静音发送」")
+            return True
 
         def _step_arrow():
             arrow = _uia_find_arrow_ctrl(state["win"])
             if arrow is None:
                 return False
             arrow_wrap = _unwrap_uia(arrow)
+            state["arrow_wrap"] = arrow_wrap
             ai = arrow_wrap.element_info
             log(f"  [静音模式: pywinauto-UIA] 点击下拉箭头: type={ai.control_type!r} name={ai.name!r} auto_id={ai.automation_id!r}")
             _uia_click_ctrl(arrow_wrap)
@@ -2869,7 +7716,30 @@ def _enable_dingtalk_silent_send_uia():
         sleep_check(0.5)
 
         def _step_menu():
-            return _uia_find_and_click_silent_menu(state["win"], state["pids"])
+            if _uia_find_and_click_silent_menu(state["win"], state["pids"]):
+                return True
+            # 若桌面无任何可见弹出窗（说明首次点击未成功弹出菜单），优先用物理点击再试 invoke() 展开菜单
+            try:
+                from pywinauto import Desktop  # type: ignore[import-not-found]
+                main_h = getattr(_unwrap_uia(state["win"]), "handle", None)
+                pids = state["pids"]
+                has_pop = any(
+                    pw.is_visible() and (not pids or pw.process_id() in pids) and pw.handle != main_h
+                    for pw in Desktop(backend="uia").windows()
+                )
+                aw = state.get("arrow_wrap")
+                if not has_pop and aw is not None:
+                    try:
+                        _uia_click_ctrl(aw)
+                    except Exception:
+                        if hasattr(aw, "invoke"):
+                            aw.invoke()
+                    sleep_check(0.5)
+                    return _uia_find_and_click_silent_menu(state["win"], state["pids"])
+            except Exception as e_pop:
+                if "手动停止" in str(e_pop):
+                    raise
+            return False
 
         _retry_step("UIA点击静音发送菜单", _step_menu, retries=2, interval=1.0)
         sleep_check(0.35)
@@ -2891,13 +7761,75 @@ def _enable_dingtalk_silent_send_uia():
         return False
 
 
+def _get_dt_main_win_rect():
+    """获取当前可见钉钉聊天主窗矩形 (left, top, right, bottom)，未检测到则返回 None。"""
+    if os.name != "nt":
+        return None
+    u32 = ctypes.windll.user32
+    u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    u32.GetWindowRect.restype = wintypes.BOOL
+    u32.IsWindow.argtypes = [wintypes.HWND]
+    u32.IsWindow.restype = wintypes.BOOL
+    u32.IsWindowVisible.argtypes = [wintypes.HWND]
+    u32.IsWindowVisible.restype = wintypes.BOOL
+    hwnd = 0
+    if _active_dt_hwnd and u32.IsWindow(_active_dt_hwnd) and u32.IsWindowVisible(_active_dt_hwnd):
+        hwnd = int(_active_dt_hwnd)
+    else:
+        im_wins = _enum_dingtalk_im_windows(include_hidden=False)
+        if im_wins:
+            hwnd = int(im_wins[0][0])
+    if not hwnd:
+        return None
+    rc = wintypes.RECT()
+    if not u32.GetWindowRect(hwnd, ctypes.byref(rc)):
+        return None
+    if rc.right <= rc.left or rc.bottom <= rc.top:
+        return None
+    return (int(rc.left), int(rc.top), int(rc.right), int(rc.bottom))
+
+
+def _get_dt_send_region_rect(tpl_name, win_rect=None):
+    """返回钉钉底栏发送区域裁切矩形 (left, top, width, height)，消除全屏右上/左上误匹配。"""
+    wrect = win_rect if win_rect is not None else _get_dt_main_win_rect()
+    if not wrect:
+        return None
+    L, T, R, B = wrect
+    W = max(1, R - L)
+    H = max(1, B - T)
+    rx = L + (int(W * 0.45) if tpl_name in ("send_arrow.png", "send_pill.png", "menu_set_silent.png") else int(W * 0.18))
+    ry = T + int(H * 0.46)
+    rw = max(80, R - rx)
+    rh = max(80, B - ry)
+    return (rx, ry, rw, rh)
+
+
+def _is_box_in_dt_send_region(box, tpl_name, win_rect=None):
+    """校验匹配到的模板框中心点确实落在钉钉聊天窗底部（右侧）发送区，绝不误点左上角 (185, 94)。"""
+    if box is None:
+        return False
+    wrect = win_rect if win_rect is not None else _get_dt_main_win_rect()
+    if not wrect:
+        return True
+    L, T, R, B = wrect
+    W = max(1, R - L)
+    H = max(1, B - T)
+    cx = float(box.left) + float(box.width) / 2.0
+    cy = float(box.top) + float(box.height) / 2.0
+    if not (L <= cx <= R and T + H * 0.46 <= cy <= B):
+        return False
+    if tpl_name in ("send_arrow.png", "send_pill.png", "menu_set_silent.png") and cx < L + W * 0.45:
+        return False
+    return True
+
+
 def _locate_template_on_screen(
     tpl_name,
-    scales=(1.0, 1.875, 1.5, 2.0, 1.25, 1.75, 2.25, 0.85),
+    scales=(1.0, 1.875, 1.5, 2.0, 2.25, 2.5, 2.75, 3.0, 1.25, 1.75, 0.85),
     confidences=(0.82, 0.74),
     _screen_img=None,
 ):
-    """调用 pyautogui.locateOnScreen 及多尺度灰度匹配查找模板位置（不使用任何硬编码坐标）。"""
+    """调用 pyautogui.locateOnScreen 及多尺度灰度匹配查找模板位置（真实桌面限定在钉钉底栏发送区域内）。"""
     tpl_path = _find_bundle_asset(Path("templates") / tpl_name)
     if tpl_path is None:
         raise RuntimeError(f"找不到图像匹配模板文件：templates/{tpl_name}")
@@ -2906,23 +7838,45 @@ def _locate_template_on_screen(
     from PIL import ImageOps
     pyautogui.FAILSAFE = False
 
+    win_rect = _get_dt_main_win_rect() if _screen_img is None else None
+    dt_reg = _get_dt_send_region_rect(tpl_name, win_rect=win_rect) if win_rect else None
+    off_x, off_y = (dt_reg[0], dt_reg[1]) if dt_reg is not None else (0, 0)
+    if _screen_img is None and _current_pc_plan.get("scales"):
+        scales = tuple(_current_pc_plan["scales"])
+
+    def _to_screen_box(box):
+        if box is None:
+            return None
+        if dt_reg is None:
+            return box
+        return box.__class__(int(box.left + off_x), int(box.top + off_y), int(box.width), int(box.height))
+
     if _screen_img is None:
         for conf in confidences:
             try:
-                box = pyautogui.locateOnScreen(str(tpl_path), grayscale=True, confidence=conf)
-                if box is not None:
+                kw = {"grayscale": True, "confidence": conf}
+                if dt_reg is not None:
+                    kw["region"] = dt_reg
+                box = pyautogui.locateOnScreen(str(tpl_path), **kw)
+                if box is not None and (win_rect is None or _is_box_in_dt_send_region(box, tpl_name, win_rect=win_rect)):
                     return box
             except TypeError:
                 try:
-                    box = pyautogui.locateOnScreen(str(tpl_path), grayscale=True)
-                    if box is not None:
+                    kw_nc = {"grayscale": True}
+                    if dt_reg is not None:
+                        kw_nc["region"] = dt_reg
+                    box = pyautogui.locateOnScreen(str(tpl_path), **kw_nc)
+                    if box is not None and (win_rect is None or _is_box_in_dt_send_region(box, tpl_name, win_rect=win_rect)):
                         return box
                 except Exception:
                     pass
                 break
             except Exception:
                 pass
-        screen_gray = pyautogui.screenshot().convert("L")
+        if dt_reg is not None:
+            screen_gray = pyautogui.screenshot(region=dt_reg).convert("L")
+        else:
+            screen_gray = pyautogui.screenshot().convert("L")
     else:
         screen_gray = _screen_img.convert("L")
 
@@ -2939,12 +7893,16 @@ def _locate_template_on_screen(
                 try:
                     box = pyautogui.locate(resized, screen_gray, grayscale=True, confidence=conf)
                     if box is not None:
-                        return box
+                        sbox = _to_screen_box(box)
+                        if win_rect is None or _is_box_in_dt_send_region(sbox, tpl_name, win_rect=win_rect):
+                            return sbox
                 except TypeError:
                     try:
                         box = pyautogui.locate(resized, screen_gray, grayscale=True)
                         if box is not None:
-                            return box
+                            sbox = _to_screen_box(box)
+                            if win_rect is None or _is_box_in_dt_send_region(sbox, tpl_name, win_rect=win_rect):
+                                return sbox
                     except Exception:
                         pass
                     break
@@ -2954,13 +7912,18 @@ def _locate_template_on_screen(
 
 
 def _enable_dingtalk_silent_send_image():
-    """兜底模式：当 UIA 抓不到控件时，降级为 pyautogui.locateOnScreen 图像匹配。"""
+    """兜底模式：当 UIA 抓不到控件时，降级为 pyautogui.locateOnScreen 图像匹配，并联动 UIA 菜单项点击。"""
     import pyautogui  # type: ignore[import-not-found]
     pyautogui.FAILSAFE = False
     log("  正在切换为 [静音模式: pyautogui-图像匹配兜底] …")
 
     if _locate_template_on_screen("badge_silent_on.png", confidences=(0.82, 0.76)) is not None:
         log("  [静音模式: pyautogui-图像匹配兜底] 检测到屏幕已存在「静音发送」标签")
+        return True
+
+    if _try_click_open_silent_menu_uia():
+        sleep_check(0.35)
+        log("  ✅ [静音模式: UIA协同] 已从展开菜单选择「静音发送」")
         return True
 
     # 若菜单此刻已处于展开态，直接点击「设为静音」避免二次点击箭头反而收起菜单
@@ -2973,12 +7936,15 @@ def _enable_dingtalk_silent_send_image():
         log("  ✅ [静音模式: pyautogui-图像匹配兜底] 已选择「静音发送」")
         return True
 
+    arrow_clicked = [False]
+
     def _step_img_arrow():
         box = _locate_template_on_screen("send_arrow.png")
         if box is not None:
             cx, cy = pyautogui.center(box)
             log(f"  [静音模式: pyautogui-图像匹配兜底] 模板 send_arrow.png 匹配命中 ({cx}, {cy})")
             pyautogui.click(cx, cy)
+            arrow_clicked[0] = True
             return True
         pill_box = _locate_template_on_screen("send_pill.png")
         if pill_box is not None:
@@ -2986,14 +7952,17 @@ def _enable_dingtalk_silent_send_image():
             cy = int(pill_box.top + pill_box.height / 2)
             log(f"  [静音模式: pyautogui-图像匹配兜底] 模板 send_pill.png 匹配命中，点击右端箭头 ({cx}, {cy})")
             pyautogui.click(cx, cy)
+            arrow_clicked[0] = True
             return True
         return False
 
-    _retry_step("图像匹配下拉箭头", _step_img_arrow, retries=2, interval=1.0)
-    sleep_check(0.5)
-
     def _step_img_menu():
-        box = _locate_template_on_screen("menu_set_silent.png")
+        if _try_click_open_silent_menu_uia():
+            log("  ✅ [静音模式: UIA协同] 已识别并点击「设为静音」")
+            return True
+        if _try_click_qui_menu_by_win32():
+            return True
+        box = _locate_template_on_screen("menu_set_silent.png", confidences=(0.80, 0.70, 0.64))
         if box is None:
             return False
         cx, cy = pyautogui.center(box)
@@ -3001,7 +7970,18 @@ def _enable_dingtalk_silent_send_image():
         pyautogui.click(cx, cy)
         return True
 
-    _retry_step("图像匹配「设为静音」菜单", _step_img_menu, retries=2, interval=1.0)
+    try:
+        _retry_step("图像匹配下拉箭头", _step_img_arrow, retries=2, interval=1.0)
+        sleep_check(0.5)
+        _retry_step("图像匹配「设为静音」菜单", _step_img_menu, retries=2, interval=1.0)
+    except Exception as exc_img:
+        if "手动停止" not in str(exc_img) and arrow_clicked[0]:
+            try:
+                pyautogui.press("esc")
+                time.sleep(0.2)
+            except Exception:
+                pass
+        raise
     sleep_check(0.35)
     log("  ✅ [静音模式: pyautogui-图像匹配兜底] 已选择「静音发送」")
     return True
@@ -3040,11 +8020,20 @@ def _evaluate_compose_focus_ctrl(fc, r):
         return False, f"读取焦点控件失败（{ex}）"
 
 
-def _enable_dingtalk_silent_send():
-    """先校验权限一致性，优先使用 pywinauto(uia) 定位静音按钮，失败自动降级图像匹配。"""
+def _enable_dingtalk_silent_send(silent_order="uia_first"):
+    """先校验权限一致性，按配置顺序执行 UIA 定位或图像箭头先行点开+UIA/图像兜底。"""
     priv = check_dingtalk_privilege_match()
     if not priv["matched"]:
         log(f"  ⚠️ {priv['message']}")
+    if str(silent_order or "uia_first") == "arrow_img_then_uia":
+        try:
+            if _enable_dingtalk_silent_send_image():
+                return True
+        except Exception as e_img:
+            if "手动停止" in str(e_img):
+                raise
+            log(f"  ℹ️ 图像箭头先行未能一步完成（{e_img}），自动切回 UIA 控件树模式…")
+        return _enable_dingtalk_silent_send_uia()
     if _enable_dingtalk_silent_send_uia():
         return True
     return _enable_dingtalk_silent_send_image()
@@ -3085,21 +8074,426 @@ def _disable_dingtalk_silent_send():
     return True
 
 
-def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interactive=True):
-    """把 WPS 复制的表格图片依次发到一个或多个指定钉钉会话，并附上时间戳及对应时段后缀。"""
+def _restore_and_activate_hwnd(hwnd, maximize=True, wake_exe_candidates=None):
+    """将最小化或隐藏到后台的 Win32/Qt 窗口可靠还原并置前激活，必要时触发单实例唤醒。"""
+    import ctypes
+    from ctypes import wintypes
+
+    if not hwnd:
+        return False
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(wintypes.LPARAM),
+    ]
+    user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, wintypes.LPDWORD]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
+    user32.BringWindowToTop.argtypes = [wintypes.HWND]
+    user32.BringWindowToTop.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_ulonglong]
+    user32.keybd_event.restype = None
+    kernel32.GetCurrentThreadId.argtypes = []
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    hwnd = wintypes.HWND(int(hwnd))
+    if user32.IsIconic(hwnd) or not user32.IsWindowVisible(hwnd):
+        try:
+            sm_res = wintypes.LPARAM(0)
+            # WM_SYSCOMMAND=0x0112, SC_RESTORE=0xF120, SMTO_ABORTIFHUNG=0x0002
+            user32.SendMessageTimeoutW(hwnd, 0x0112, 0xF120, 0, 0x0002, 600, ctypes.byref(sm_res))
+        except Exception:
+            pass
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        for _ in range(10):
+            time.sleep(0.12)
+            if not user32.IsIconic(hwnd) and user32.IsWindowVisible(hwnd):
+                break
+
+        if user32.IsIconic(hwnd):
+            cands = wake_exe_candidates or _resolve_dingtalk_exe_candidates()
+            for exe in cands:
+                if exe and os.path.exists(exe):
+                    try:
+                        subprocess.Popen(exe)
+                        break
+                    except Exception:
+                        pass
+            for _ in range(10):
+                time.sleep(0.12)
+                user32.ShowWindow(hwnd, 9)
+                if not user32.IsIconic(hwnd):
+                    break
+
+    cur = kernel32.GetCurrentThreadId()
+    fg = user32.GetForegroundWindow()
+    fg_thr = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    attached = False
+    try:
+        if fg_thr and cur and fg_thr != cur:
+            attached = bool(user32.AttachThreadInput(cur, fg_thr, True))
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(cur, fg_thr, False)
+
+    if int(user32.GetForegroundWindow() or 0) != int(hwnd.value):
+        try:
+            # 轻触 Alt 键释放系统前台锁定限制后再次 SetForegroundWindow
+            user32.keybd_event(0x12, 0, 0, 0)
+            user32.keybd_event(0x12, 0, 0x0002, 0)
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+    if maximize:
+        user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
+        time.sleep(0.25)
+    else:
+        time.sleep(0.12)
+    return not bool(user32.IsIconic(hwnd))
+
+
+def _commit_dingtalk_send(cur_hwnd, send_enter_fn=None, timeout=1.5):
+    """发送消息并针对富文本 Aa 工具栏 / Ctrl+Enter 设置自动补点右下角「发送(S)」按钮。"""
+    from pywinauto import Application, keyboard as _pwa_kbd  # type: ignore[import-not-found]
+
+    hwnd_val = 0
+    if isinstance(cur_hwnd, int):
+        hwnd_val = int(cur_hwnd)
+    elif cur_hwnd is not None:
+        try:
+            hwnd_val = int(getattr(cur_hwnd, "NativeWindowHandle", 0) or 0)
+        except Exception:
+            hwnd_val = 0
+        if not hwnd_val:
+            try:
+                hwnd_val = int(getattr(getattr(cur_hwnd, "element_info", None), "handle", 0) or 0)
+            except Exception:
+                hwnd_val = 0
+
+    if callable(send_enter_fn):
+        send_enter_fn()
+    else:
+        _pwa_kbd.send_keys("{ENTER}")
+    sleep_check(0.45)
+
+    if not hwnd_val:
+        return False
+
+    try:
+        s_app = Application(backend="uia").connect(handle=hwnd_val, timeout=timeout)
+        s_win = s_app.window(handle=hwnd_val)
+        s_wrap = _unwrap_uia(s_win)
+        s_rect = s_wrap.rectangle()
+        w_w = max(1, s_rect.width())
+        w_h = max(1, s_rect.height())
+
+        send_btn = None
+        for ctrl, _d in _iter_dt_uia_pruned(s_wrap, max_depth=22):
+            try:
+                ii = ctrl.element_info
+                aid_l = (ii.automation_id or "").lower()
+                if aid_l.endswith(".leftcontainerwidget"):
+                    for ch, _ in _iter_dt_uia_pruned(ctrl, max_depth=5):
+                        try:
+                            ci = ch.element_info
+                            cnm = (ci.name or "").strip()
+                            if ((ci.control_type or "") == "Button" or cnm.startswith("发送")) and ch.is_enabled():
+                                send_btn = ch
+                                break
+                        except Exception:
+                            pass
+                    if send_btn is not None:
+                        break
+                nm = (ii.name or "").strip()
+                rr = ctrl.rectangle()
+                if (
+                    (ii.control_type or "") == "Button"
+                    and rr.width() >= 24
+                    and rr.height() >= 18
+                    and rr.top >= s_rect.top + int(w_h * 0.55)
+                    and rr.left >= s_rect.left + int(w_w * 0.40)
+                    and (nm.startswith("发送") or nm.lower() == "send" or aid_l.endswith(".sendbutton"))
+                    and "更多" not in nm
+                    and "submenubutton" not in aid_l
+                    and ctrl.is_enabled()
+                ):
+                    send_btn = ctrl
+            except Exception:
+                pass
+
+        if send_btn is not None and send_btn.is_enabled():
+            _uia_click_ctrl(send_btn)
+            sleep_check(0.35)
+            try:
+                if send_enter_fn is None and send_btn.is_enabled():
+                    _pwa_kbd.send_keys("^{ENTER}")
+                    sleep_check(0.25)
+            except Exception:
+                pass
+            return True
+    except Exception as e_btn:
+        if "手动停止" in str(e_btn):
+            raise
+    return False
+
+
+def _capture_dt_input_patch(r):
+    """截取钉钉聊天输入区局部灰度缩略图，用于核对图片粘贴是否真正进入输入框。"""
+    try:
+        from PIL import ImageGrab
+        left = int(r.left)
+        top = int(r.top)
+        right = int(r.right)
+        bottom = int(r.bottom)
+        W = max(1, right - left)
+        H = max(1, bottom - top)
+        x1 = left + int(W * 0.25)
+        y1 = top + int(H * 0.63)
+        x2 = right - int(W * 0.06)
+        y2 = bottom - int(H * 0.08)
+        if x2 - x1 < 40 or y2 - y1 < 24:
+            return None
+        return ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True).convert("L")
+    except Exception:
+        return None
+
+
+def _did_dt_input_change(before_img, after_img):
+    """比对粘贴前后输入区像素差值，判断图片是否真实粘贴进聊天框（无图捕获环境放行）。"""
+    if before_img is None or after_img is None or before_img.size != after_img.size:
+        return True
+    try:
+        from PIL import ImageChops
+        diff = ImageChops.difference(before_img, after_img)
+        w, h = diff.size
+        hist = diff.histogram()
+        changed = sum(hist[16:])
+        return changed >= max(35, int(w * h * 0.0010))
+    except Exception:
+        return True
+
+
+def _collect_dingtalk_search_rows(doc_list, check_stop_fn=None):
+    """带严格超时读取钉钉全局搜索弹窗内的候选行文本，过滤历史记录/文档/聊天记录干扰项。"""
+    import unicodedata
+
+    def _norm(s):
+        return "".join(ch for ch in unicodedata.normalize("NFKC", str(s or "")).casefold() if ch.isalnum())
+
+    items = []
+    empty_flag = False
+    hist_rect = None
+    common_rect = None
+    noise_heads = []
+    good_heads = []
+    deadline = time.monotonic() + 0.95
+    visited = [0]
+
+    def _walk(ctrl, depth):
+        nonlocal empty_flag, hist_rect, common_rect
+        if depth > 10 or visited[0] >= 190 or time.monotonic() > deadline:
+            return
+        for k in ctrl.GetChildren():
+            visited[0] += 1
+            if visited[0] % 20 == 0 and check_stop_fn is not None:
+                check_stop_fn()
+            if visited[0] > 190 or time.monotonic() > deadline:
+                return
+            try:
+                ct = k.ControlTypeName
+                nm = (k.Name or "").strip()
+                rr = k.BoundingRectangle
+                ok_rect = rr.right > rr.left and rr.bottom > rr.top
+                if nm and any(e_k in nm for e_k in ("无搜索结果", "未找到相关", "没有找到", "暂无相关结果")):
+                    empty_flag = True
+                if ok_rect and nm:
+                    if ct == "TextControl":
+                        if nm == "搜索历史" and hist_rect is None:
+                            hist_rect = rr
+                        elif nm == "常用" and common_rect is None:
+                            common_rect = rr
+                        if nm in ("聊天记录", "文档", "云文档", "钉钉文档", "网络查找", "搜索网络", "待办", "邮件"):
+                            noise_heads.append((nm, rr))
+                        elif nm in ("联系人", "群组", "常用", "功能"):
+                            good_heads.append((nm, rr))
+                    if ct in ("TextControl", "ButtonControl", "ListItemControl", "HyperlinkControl"):
+                        items.append((k, nm, rr))
+            except Exception:
+                pass
+            _walk(k, depth + 1)
+
+    for doc in (doc_list or []):
+        if time.monotonic() > deadline:
+            break
+        _walk(doc, 0)
+
+    def _in_hist(r):
+        return (
+            hist_rect is not None
+            and r.top >= hist_rect.top - 4
+            and (
+                (common_rect is not None and r.top < common_rect.top - 4)
+                or (common_rect is None and r.top < hist_rect.bottom + 90)
+            )
+        )
+
+    filtered = []
+    for k, nm, rr in items:
+        if _in_hist(rr):
+            continue
+        if nm in ("综合", "联系人", "群组", "聊天记录", "文档", "云文档", "搜索历史", "常用", "功能", "内部群", "部门群", "更多"):
+            continue
+        if _norm(nm) and not _norm(nm).isdigit():
+            filtered.append((k, nm, rr))
+
+    rows = []
+    for k, nm, rr in sorted(filtered, key=lambda x: ((x[2].top + x[2].bottom) / 2, x[2].left)):
+        cy = (rr.top + rr.bottom) / 2
+        placed = False
+        for row in rows:
+            if abs(cy - row[0]) <= 26:
+                row[1].append((k, nm, rr))
+                row[0] = (row[0] * (len(row[1]) - 1) + cy) / len(row[1])
+                placed = True
+                break
+        if not placed:
+            rows.append([cy, [(k, nm, rr)]])
+
+    out_rows = []
+    for cy, row_items in rows:
+        row_items.sort(key=lambda x: x[2].left)
+        if any(0 < (cy - hr.top) < 160 and abs(hr.left - row_items[0][2].left) < 280 for _, hr in noise_heads if
+               not any(gr.top > hr.top and gr.top < cy for _, gr in good_heads)):
+            continue
+        title = " ".join(nm for _k, nm, _r in row_items[:4]).strip()
+        if not title or len(title) > 80:
+            continue
+        best_item = max(row_items, key=lambda x: x[2].right - x[2].left)
+        sec = ""
+        nearest_d = 9999
+        for g_lbl, g_r in good_heads:
+            if 0 < cy - g_r.top < 260 and (cy - g_r.top) < nearest_d:
+                nearest_d = cy - g_r.top
+                sec = g_lbl
+        out_rows.append({"title": title, "section": sec, "ctrl": best_item[0], "rect": best_item[2]})
+
+    return {"empty_result": bool(empty_flag and not out_rows), "rows": out_rows}
+
+
+def _ai_pick_best_search_row(target_name, candidates, rows, cfg=None):
+    """由本地多维打分与内置 AI 共同确认钉钉下拉搜索框里最贴合目标名称的那一条会话。"""
+    import difflib
+    import unicodedata
+
+    if not rows:
+        return None
+
+    def _norm(s):
+        return "".join(ch for ch in unicodedata.normalize("NFKC", str(s or "")).casefold() if ch.isalnum())
+
+    cand_norms = [_norm(c) for c in ([target_name] + list(candidates or [])) if _norm(c)]
+    t_norm = _norm(target_name)
+    scored = []
+    for idx, row in enumerate(rows):
+        r_title = str(row.get("title") or "")
+        r_base = re.sub(r"[（(][^）)]*[）)]", "", r_title).strip()
+        r_norm = _norm(r_title)
+        r_base_norm = _norm(r_base)
+        sec = str(row.get("section") or "")
+        if not r_norm:
+            continue
+        sc = 0.0
+        if t_norm and (r_norm == t_norm or r_base_norm == t_norm):
+            sc = 100.0
+        else:
+            for ci, cn in enumerate(cand_norms):
+                bonus = max(0, 10 - ci * 2)
+                if cn == r_norm or cn == r_base_norm:
+                    sc = max(sc, 98.0 + bonus)
+                elif r_base_norm.startswith(cn) or r_norm.startswith(cn):
+                    sc = max(sc, 88.0 + bonus * 0.5)
+                elif cn in r_norm or r_norm in cn:
+                    sc = max(sc, 78.0 + bonus * 0.5)
+                else:
+                    sc = max(sc, difflib.SequenceMatcher(None, cn, r_base_norm or r_norm).ratio() * 72.0)
+        if sec in ("联系人", "群组", "常用"):
+            sc += 18.0
+        elif sec in ("文档", "云文档", "钉钉文档", "聊天记录", "待办", "邮件", "网络查找", "搜索网络"):
+            sc -= 50.0
+        elif sec == "功能" and "助手" not in str(target_name or ""):
+            sc -= 28.0
+        if re.search(r"\.(?:xlsx?|docx?|pptx?|pdf|csv|txt|png|jpe?g|zip)$", r_title.strip(), re.I):
+            sc -= 40.0
+        scored.append((sc, idx, row))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x[0])
+    top_sc, _top_i, top_row = scored[0]
+    if top_sc >= 78.0:
+        return top_row
+
+    # 若分值接近或仅为模糊命中，尝试让内置 AI 在当前可见前 6 条真实结果里确认最符合原意的一项
+    if cfg is not None:
+        norm_c = normalize_config(cfg)
+        ai_cfg = norm_c.get("ai_assistant") or {}
+        if ai_cfg.get("enabled", True) and str(ai_cfg.get("provider") or "gemini") != "local_only":
+            try:
+                opts = [{"idx": i, "title": r["title"], "section": r["section"]} for i, r in enumerate(rows[:6])]
+                g_res = _call_gemini_generate(
+                    norm_c,
+                    "你在帮用户在钉钉全局搜索结果中选择最正确的收信人或群聊。只返回JSON：{\"pick\": 序号整数或-1}",
+                    [{"role": "user", "parts": [{"text": f"用户想找：{target_name}（候选词：{candidates[:4]}）\n搜索到的结果：{json.dumps(opts, ensure_ascii=False)}"}]}],
+                    temperature=0.05,
+                    max_tokens=60,
+                    timeout_sec=5,
+                )
+                if g_res.get("ok"):
+                    m_j = re.search(r"\"pick\"\s*:\s*(-?\d+)", str(g_res.get("reply") or ""))
+                    if m_j:
+                        pk = int(m_j.group(1))
+                        if 0 <= pk < len(rows):
+                            return rows[pk]
+            except Exception:
+                pass
+    return top_row if top_sc >= 54.0 else None
+
+
+def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interactive=True, text_only_message=""):
+    """把 WPS 复制的表格图片依次发到一个或多个指定钉钉会话，并附上自定义日期时间戳及后缀。"""
+    global _active_dt_hwnd
     check_stop()
     targets = get_enabled_dt_targets(cfg)
     if not targets:
         log("  ⚠️ 未勾选任何启用的钉钉目标会话，跳过本轮钉钉发送")
         return True
 
-    suffix, suffix_src = resolve_suffix_for_time(cfg, lt=trigger_lt, hm_override=trigger_hm)
+    msg_info = build_dingtalk_message_text(cfg, lt=trigger_lt, hm_override=trigger_hm)
+    text_msg = msg_info["text"]
+    suffix_src = msg_info["suffix_source"]
     do_silent, silent_src = resolve_silent_for_time(cfg, lt=trigger_lt, hm_override=trigger_hm)
     if "dt_silent_send" in (cfg or {}) and silent_src == "全局默认":
         do_silent = bool(cfg.get("dt_silent_send", True))
-    text_msg = time.strftime("%Y-%m-%d %H:%M") + (" " + suffix if suffix else "")
     silent_desc = f"{'静音发送' if do_silent else '常规提醒'}（{silent_src}）"
-    log(f"  消息文案：{text_msg}（后缀来源：{suffix_src}）| {silent_desc} | 目标共 {len(targets)} 个：{'、'.join(targets)}")
+    off_note = f" | 日期偏移{msg_info['day_offset']:+d}天({msg_info['time_source']})" if msg_info["day_offset"] else ""
+    log(f"  消息文案：{text_msg}（后缀来源：{suffix_src}{off_note}）| {silent_desc} | 目标共 {len(targets)} 个：{'、'.join(targets)}")
 
     try:
         import uiautomation as ua  # type: ignore[import-not-found]
@@ -3111,6 +8505,8 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
         log(f"  ⚠️ {priv_info['message']}")
     else:
         log(f"  {priv_info['message']}")
+    pc_plan = probe_pc_and_dingtalk_profile(cfg)
+    log(f"  🖥️ 当前电脑自适应方案：{pc_plan['summary']}")
     tmp_img = app_dir() / "_sheetmate_tmp.png"
     try:
         exe_candidates = _resolve_dingtalk_exe_candidates()
@@ -3118,43 +8514,81 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
         WIN_TITLES = ("钉钉", "DingTalk")
 
         def _find():
-            for hwnd, cls, title in _enum_top_windows(
-                    target_classes=WIN_CLASSES, target_titles=None):
-                ctl = ua.ControlFromHandle(hwnd)
+            global _active_dt_hwnd
+            for hwnd, _pid, _cls, _title, _sc in _enum_dingtalk_im_windows(include_hidden=False):
+                ctl = _safe_control_from_handle(ua, hwnd)
                 if ctl is not None:
-                    return ctl
-            for hwnd, cls, title in _enum_top_windows(
-                    target_classes=None, target_titles=WIN_TITLES):
-                ctl = ua.ControlFromHandle(hwnd)
-                if ctl is not None:
+                    _active_dt_hwnd = int(hwnd)
                     return ctl
             return None
+
+        def _find_hidden_main_hwnd():
+            """当钉钉最小化到系统托盘隐藏主窗时，仅定位真正的钉钉聊天主窗（绝不误拉钉钉-文档）。"""
+            im_all = _enum_dingtalk_im_windows(include_hidden=True)
+            if im_all:
+                return int(im_all[0][0])
+            return 0
 
         def _fresh_ding():
             for _ in range(6):
                 w = _find()
                 if w is not None:
                     try:
+                        hwnd0 = int(w.NativeWindowHandle or 0)
+                        if hwnd0 and user32.IsIconic(hwnd0):
+                            _restore_and_activate_hwnd(hwnd0, maximize=True, wake_exe_candidates=exe_candidates)
+                            w = _find() or w
                         rr = w.BoundingRectangle
                         if rr.right > rr.left and rr.bottom > rr.top:
                             return w
                     except Exception:
                         pass
-                time.sleep(0.5)
+                time.sleep(0.35)
             return None
 
-        # 0) 搜索前先把 WPS 图片存成文件（失败重试与多群发送期间保留 tmp_img 绝不丢失）
-        state0 = save_clipboard_image_if_exists(tmp_img)
-        if state0 == "noimage":
-            raise RuntimeError("剪贴板里没有图片，已停止钉钉发送")
-        if state0 != "saved":
-            raise RuntimeError("表格图片暂存失败，已停止钉钉发送")
-        if cfg.get("save_shot_history", True):
-            hist_p = archive_history_shot(tmp_img, keep=20)
-            if hist_p is not None:
-                log(f"  已归档历史截图：{hist_p.name}")
-        clear_clipboard_windows()
-        log("  已暂存表格图片（中断重连/多群发送不会丢失），开始投递钉钉会话")
+        # 0) 搜索前先把 WPS 图片存成文件（纯文字发送模式跳过剪贴板图片校验）
+        if str(text_only_message or "").strip():
+            text_msg = str(text_only_message).strip()
+            log("  已切换为纯文字直发模式，开始定位钉钉目标会话")
+        else:
+            state0 = save_clipboard_image_if_exists(tmp_img)
+            if state0 == "noimage":
+                raise RuntimeError("剪贴板里没有图片，已停止钉钉发送")
+            if state0 != "saved":
+                raise RuntimeError("表格图片暂存失败，已停止钉钉发送")
+            if cfg.get("save_shot_history", True):
+                hist_p = archive_history_shot(tmp_img, keep=20)
+                if hist_p is not None:
+                    log(f"  已归档历史截图：{hist_p.name}")
+            else:
+                hist_p = None
+            try:
+                rec_a = record_report_archive(cfg, round_label="截图发群", summary_tsv=_last_captured_summary_tsv, shot_path=hist_p)
+                if rec_a is not None:
+                    log(f"  已存入 AI 数据档案（个人 {len(rec_a.get('personal') or [])} 人 / 团队 {len(rec_a.get('teams') or [])} 组）")
+            except Exception:
+                pass
+            clear_clipboard_windows()
+            log("  已暂存表格图片（中断重连/多群发送不会丢失），开始投递钉钉会话")
+
+            # 若开启随图附带 AI 数据简报，自动请 AI 看刚刚截好的表格图并附上一小段重点总结
+            ai_cfg_send = (cfg or {}).get("ai_assistant") if isinstance((cfg or {}).get("ai_assistant"), dict) else {}
+            if ai_cfg_send.get("enabled", True) and ai_cfg_send.get("auto_attach_summary", False):
+                try:
+                    log("  正在请 AI 总结当前表格重点用于随图附发…")
+                    ai_sum = summarize_report_with_ai(
+                        cfg,
+                        style_id=ai_cfg_send.get("attach_style", "brief"),
+                        extra_img_path=tmp_img,
+                    )
+                    if ai_sum.get("source") in ("gemini", "ai_cloud") and str(ai_sum.get("reply") or "").strip():
+                        sum_txt = str(ai_sum["reply"]).strip()
+                        text_msg = f"{text_msg}\n{sum_txt}"
+                        log("  ✅ 已附带 AI 数据简报")
+                    else:
+                        log(f"  ℹ️ AI 随图简报跳过（{ai_sum.get('source', 'unavailable')}），仅发送时间文案")
+                except Exception as e_ai:
+                    log(f"  ℹ️ AI 随图简报生成跳过：{e_ai}")
 
         # 2) 强力置前（AttachThreadInput 解除前台锁定）并最大化
         import ctypes
@@ -3175,52 +8609,149 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
         user32.BringWindowToTop.restype = wintypes.BOOL
         kernel32.GetCurrentThreadId.argtypes = []
         kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
         user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE,
                                        wintypes.DWORD, ctypes.c_ulonglong]
         user32.keybd_event.restype = None
         _KEYUP = 0x0002
         _VK_CTRL, _VK_SHIFT, _VK_F = 0x11, 0x10, 0x46
+        self_pid = os.getpid()
+
+        def _get_win_pid_hwnd(win):
+            if win is None:
+                return 0, 0
+            try:
+                hwnd = int(win.NativeWindowHandle or 0)
+            except Exception:
+                hwnd = 0
+            pid = 0
+            if hwnd:
+                pv = wintypes.DWORD(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pv))
+                pid = int(pv.value or 0)
+            return pid, hwnd
+
+        def _raise_if_interrupted(expected_pid=0, fg_locked=False):
+            check_stop()
+            w_cur = _find()
+            if w_cur is None:
+                for _ in range(2):
+                    time.sleep(0.22)
+                    check_stop()
+                    w_cur = _find()
+                    if w_cur is not None:
+                        break
+                if w_cur is None:
+                    raise DingTalkInterrupted("检测到钉钉窗口已关闭或隐藏到托盘")
+            cur_pid, cur_hwnd = _get_win_pid_hwnd(w_cur)
+            if cur_hwnd and user32.IsIconic(cur_hwnd):
+                # 准备阶段或用户未触碰键鼠时，自动把最小化窗口还原；仅当发送中途用户主动最小化才暂停
+                if not fg_locked or get_user_idle_seconds() >= 2.5:
+                    log("  检测到钉钉处于最小化状态，正在自动唤醒还原到前台…")
+                    restored = _restore_and_activate_hwnd(cur_hwnd, maximize=True, wake_exe_candidates=exe_candidates)
+                    sleep_check(0.8)
+                    w_cur = _find() or w_cur
+                    cur_pid, cur_hwnd = _get_win_pid_hwnd(w_cur)
+                    if restored and not (cur_hwnd and user32.IsIconic(cur_hwnd)):
+                        return w_cur, cur_pid, cur_hwnd
+                raise DingTalkInterrupted("检测到钉钉窗口已被最小化")
+            if fg_locked:
+                fg = int(user32.GetForegroundWindow() or 0)
+                if fg:
+                    fg_pv = wintypes.DWORD(0)
+                    user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pv))
+                    fg_pid = int(fg_pv.value or 0)
+                    ding_pids = {p for p, _ in _list_dingtalk_processes() if p}
+                    allowed_pids = {p for p in (cur_pid, expected_pid, self_pid, *ding_pids) if p}
+                    if fg_pid and allowed_pids and fg_pid not in allowed_pids and get_user_idle_seconds() < 2.5:
+                        # 二次复核，排除窗口最大化重绘/输入法浮窗导致的瞬间焦点跳变
+                        time.sleep(0.25)
+                        fg2 = int(user32.GetForegroundWindow() or 0)
+                        if fg2:
+                            fg_pv2 = wintypes.DWORD(0)
+                            user32.GetWindowThreadProcessId(fg2, ctypes.byref(fg_pv2))
+                            fg_pid2 = int(fg_pv2.value or 0)
+                            if fg_pid2 and fg_pid2 not in allowed_pids and get_user_idle_seconds() < 2.5:
+                                raise DingTalkInterrupted("检测到您主动切换到了其他应用窗口")
+            return w_cur, cur_pid, cur_hwnd
+
+        def _sleep_watch_ding(seconds, expected_pid=0, fg_locked=False):
+            rem = max(0.0, float(seconds))
+            latest = _raise_if_interrupted(expected_pid=expected_pid, fg_locked=fg_locked)
+            while rem > 0:
+                step = min(0.2, rem)
+                sleep_check(step)
+                rem -= step
+                latest = _raise_if_interrupted(expected_pid=expected_pid, fg_locked=fg_locked)
+            return latest
 
         def _force_front():
-            win = _fresh_ding()
-            if win is None:
+            win = _find()
+            hwnd = 0
+            if win is not None:
+                try:
+                    hwnd = int(win.NativeWindowHandle or 0)
+                except Exception:
+                    hwnd = 0
+            if not hwnd:
+                hwnd = _find_hidden_main_hwnd()
+            if not hwnd:
+                for exe in exe_candidates:
+                    if exe and os.path.exists(exe):
+                        try:
+                            subprocess.Popen(exe)
+                            break
+                        except Exception:
+                            pass
+                for _ in range(10):
+                    time.sleep(0.3)
+                    w2 = _find()
+                    if w2 is not None:
+                        try:
+                            hwnd = int(w2.NativeWindowHandle or 0)
+                            win = w2
+                            break
+                        except Exception:
+                            pass
+            if hwnd:
+                _restore_and_activate_hwnd(hwnd, maximize=True, wake_exe_candidates=exe_candidates)
                 return
-            try:
-                hwnd = win.NativeWindowHandle
-                user32.ShowWindow(hwnd, 9)
-                cur = kernel32.GetCurrentThreadId()
-                fg = user32.GetForegroundWindow()
-                fg_thr = user32.GetWindowThreadProcessId(fg, None)
-                user32.AttachThreadInput(cur, fg_thr, True)
-                user32.SetForegroundWindow(hwnd)
-                user32.BringWindowToTop(hwnd)
-                user32.AttachThreadInput(cur, fg_thr, False)
-                user32.ShowWindow(hwnd, 3)  # 最大化
-            except Exception:
+            if win is not None:
                 try:
                     win.SetActive()
                 except Exception:
                     pass
+
+        def _send_paste_shortcut():
+            try:
+                from pywinauto import keyboard as _pwa_kbd  # type: ignore[import-not-found]
+                _pwa_kbd.send_keys("^v")
+                return
+            except Exception:
+                pass
+            ua.SendKeys("{Ctrl}v", waitTime=0.35)
 
         def _paste_text(text, verify=False):
             if verify:
                 ready = False
                 for _ in range(6):
                     set_clipboard_windows(text)
-                    time.sleep(0.2)
+                    time.sleep(0.18)
                     try:
                         if get_clipboard_text_windows().strip() == text.strip():
                             ready = True
                             break
                     except Exception:
                         pass
-                    time.sleep(0.25)
+                    time.sleep(0.2)
                 if not ready:
                     return False
             else:
                 set_clipboard_windows(text)
-            time.sleep(0.3)
-            ua.SendKeys("{Ctrl}v", waitTime=0.3)
+            time.sleep(0.25)
+            _send_paste_shortcut()
+            time.sleep(0.25)
             return True
 
         def _type_unicode(text):
@@ -3341,14 +8872,21 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
             return documents or [doc]
 
         def _has_search_history(doc):
-            """判断搜索弹窗当前是否仍显示“搜索历史”区块（搜索框尚未接收到输入）。"""
+            """有严格超时与节点上限的搜索历史检测，绝不在庞大 CEF 结果树上长时间递归卡死。"""
             found_hist = False
+            deadline = time.monotonic() + 0.45
+            visited = [0]
 
             def _scan(ctrl, depth):
                 nonlocal found_hist
-                if found_hist or depth > 24:
+                if found_hist or depth > 9 or visited[0] >= 75 or time.monotonic() > deadline:
                     return
                 for ch in ctrl.GetChildren():
+                    visited[0] += 1
+                    if visited[0] % 15 == 0:
+                        check_stop()
+                    if visited[0] > 75 or time.monotonic() > deadline:
+                        return
                     try:
                         if ch.ControlTypeName == "TextControl" and (ch.Name or "").strip() == "搜索历史":
                             rect = ch.BoundingRectangle
@@ -3360,13 +8898,16 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                     _scan(ch, depth + 1)
 
             for d in _iter_search_docs(doc):
+                check_stop()
+                if time.monotonic() > deadline:
+                    break
                 _scan(d, 0)
                 if found_hist:
                     break
             return found_hist
 
         def _feature_item(doc, target_name, target_tokens):
-            """解析搜索弹窗文档并精确返回命中的目标行控件矩形或控件。"""
+            """带超时与节点上限解析搜索弹窗文档并精确返回命中的目标行控件矩形或控件。"""
             import unicodedata
 
             def norm(text):
@@ -3380,12 +8921,19 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
             text_items = []
             hist_rect = None
             common_rect = None
+            deadline = time.monotonic() + 1.15
+            visited = [0]
 
             def collect(ctrl, depth):
                 nonlocal hist_rect, common_rect
-                if depth > 24:
+                if depth > 10 or visited[0] >= 180 or time.monotonic() > deadline:
                     return
                 for k in ctrl.GetChildren():
+                    visited[0] += 1
+                    if visited[0] % 20 == 0:
+                        check_stop()
+                    if visited[0] > 180 or time.monotonic() > deadline:
+                        return
                     try:
                         ct = k.ControlTypeName
                         if ct in ("TextControl", "ButtonControl", "ListItemControl", "HyperlinkControl"):
@@ -3410,6 +8958,9 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                     collect(k, depth + 1)
 
             for d in _iter_search_docs(doc):
+                check_stop()
+                if time.monotonic() > deadline:
+                    break
                 collect(d, 0)
 
             def _in_history(r):
@@ -3494,54 +9045,89 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
             return None
 
         def _focus_chat_input(win, r):
+            """优先精准定位 widget_input_wnd / drich_edit 对话输入控件，避开富文本工具栏与底栏按钮。"""
+            check_stop()
             W = r.right - r.left
             H = r.bottom - r.top
+            hwnd_now = 0
             if win is not None:
                 try:
-                    target_rect = None
-                    anchor_btn_rect = None
-
-                    def _scan_input(ctrl, depth=0):
-                        nonlocal target_rect, anchor_btn_rect
-                        if target_rect is not None or depth > 18:
-                            return
-                        for ch in ctrl.GetChildren():
+                    hwnd_now = int(win.NativeWindowHandle or 0)
+                except Exception:
+                    hwnd_now = 0
+            if hwnd_now:
+                try:
+                    from pywinauto import Application  # type: ignore[import-not-found]
+                    papp = Application(backend="uia").connect(handle=hwnd_now, timeout=2.0)
+                    pwin = papp.window(handle=hwnd_now)
+                    pwin.set_focus()
+                    pwrap = _unwrap_uia(pwin)
+                    input_wnd = None
+                    ed_hit = None
+                    rich_low = DT_RICH_EDIT_AUTO_ID.lower()
+                    for ctrl, _ in _iter_dt_uia_pruned(pwrap, max_depth=18):
+                        aid_l = (ctrl.element_info.automation_id or "").lower()
+                        if input_wnd is None and (aid_l.endswith(".widget_input_wnd") or aid_l.endswith(".widgetinputwnd")):
                             try:
-                                ct = ch.ControlTypeName
-                                rr = ch.BoundingRectangle
-                                nm = (ch.Name or "").strip()
-                                nlow = nm.lower()
-                                if (rr.right - rr.left > 120 and rr.bottom - rr.top > 28
-                                        and rr.left >= r.left + W * 0.28
-                                        and rr.top >= r.top + H * 0.62):
-                                    if "搜索" not in nlow and "search" not in nlow:
-                                        if ct in ("EditControl", "DocumentControl"):
-                                            target_rect = rr
-                                            return
-                                if (anchor_btn_rect is None and rr.top >= r.top + H * 0.62
-                                        and rr.right > rr.left and rr.bottom > rr.top
-                                        and ("发送" in nm or "静音" in nm)):
-                                    anchor_btn_rect = rr
+                                ir = ctrl.rectangle()
+                                if ir.width() > 100 and ir.height() > 36:
+                                    input_wnd = ctrl
                             except Exception:
                                 pass
-                            _scan_input(ch, depth + 1)
-
-                    _scan_input(win, 0)
-                    if target_rect is not None:
-                        cx = int((target_rect.left + target_rect.right) / 2)
-                        cy = int(min(target_rect.bottom - 18, max(target_rect.top + 18, (target_rect.top + target_rect.bottom) / 2)))
-                        ua.Click(cx, cy, waitTime=0.4)
+                        if ed_hit is None and (aid_l == rich_low or aid_l.endswith(".drich_edit")):
+                            ed_hit = ctrl
+                        if input_wnd is not None and ed_hit is not None:
+                            break
+                    target_container = input_wnd if input_wnd is not None else ed_hit
+                    if target_container is not None:
+                        for ch, _ in _iter_dt_uia_pruned(target_container, max_depth=8):
+                            try:
+                                ii = ch.element_info
+                                aid_c = (ii.automation_id or "").lower()
+                                if "bottombar" in aid_c:
+                                    continue
+                                rr = ch.rectangle()
+                                nm_l = (ii.name or "").lower()
+                                if ((ii.control_type or "") in ("Edit", "Document")
+                                        and rr.width() > 100 and rr.height() > 22
+                                        and "搜索" not in nm_l and "search" not in nm_l):
+                                    _uia_click_ctrl(ch)
+                                    time.sleep(0.22)
+                                    return
+                            except Exception:
+                                pass
+                        if input_wnd is not None:
+                            try:
+                                ir = input_wnd.rectangle()
+                                if ir.width() > 100 and ir.height() > 36:
+                                    input_wnd.click_input(coords=(max(20, ir.width() // 2), max(14, int(ir.height() * 0.38))))
+                                    time.sleep(0.22)
+                                    return
+                            except Exception:
+                                pass
+                        _uia_click_ctrl(target_container)
+                        time.sleep(0.22)
                         return
-                    if anchor_btn_rect is not None:
-                        cx = max(int(r.left + W * 0.42), int(anchor_btn_rect.left - 80))
-                        cy = max(int(r.top + H * 0.72), int(anchor_btn_rect.top - 48))
-                        ua.Click(cx, cy, waitTime=0.4)
-                        return
+                    for ctrl, _ in _iter_dt_uia_pruned(pwrap, max_depth=14):
+                        try:
+                            ii = ctrl.element_info
+                            rr = ctrl.rectangle()
+                            nm_l = (ii.name or "").lower()
+                            if ((ii.control_type or "") in ("Edit", "Document")
+                                    and rr.width() > 120 and rr.height() > 24
+                                    and rr.top >= r.top + int(H * 0.52)
+                                    and rr.left >= r.left + int(W * 0.24)
+                                    and "搜索" not in nm_l and "search" not in nm_l):
+                                _uia_click_ctrl(ctrl)
+                                time.sleep(0.22)
+                                return
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             in_x = int(r.left + W * 0.56)
-            in_y = int(r.top + H * 0.80)
-            ua.Click(in_x, in_y, waitTime=0.4)
+            in_y = int(r.top + H * 0.78)
+            ua.Click(in_x, in_y, waitTime=0.35)
 
         def _is_win_in_menu_mode(hwnd):
             """调用 Win32 GetGUIThreadInfo 检测目标窗口线程是否仍处于弹出菜单模式。"""
@@ -3651,12 +9237,12 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
             if bad2:
                 raise RuntimeError(f"检测到焦点仍在钉钉搜索框（{reason2}），已安全拦截粘贴")
 
-        def _wait_search_closed(loops=10, step=0.25):
+        def _wait_search_closed(loops=10, step=0.22):
             for _ in range(loops):
                 check_stop()
-                time.sleep(step)
+                sleep_check(step)
                 if not _is_search_popup_open():
-                    time.sleep(0.2)
+                    sleep_check(0.18)
                     if not _is_search_popup_open():
                         return True
             return False
@@ -3669,26 +9255,111 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 log(f"  正在打开钉钉，搜索「{search_name}」…")
 
             search_candidates, search_tokens = _extract_search_keywords(search_name)
-            direct_candidates = [search_name] + [c for c in search_candidates if c and c != search_name]
+            smart_cand_map = cfg.get("_smart_target_candidates") if isinstance(cfg, dict) else None
+            extra_cands = list(smart_cand_map.get(search_name) or []) if isinstance(smart_cand_map, dict) else []
+            if not extra_cands:
+                try:
+                    sm_r = resolve_smart_dingtalk_target(search_name, cfg=cfg, use_ai=True)
+                    extra_cands = list(sm_r.get("candidates") or [])
+                except Exception:
+                    extra_cands = []
+            direct_candidates = list(dict.fromkeys(
+                [search_name] + [c for c in extra_cands if c] + [c for c in search_candidates if c]
+            ))
             skip_search = False
+            ding_was_open = (_find() is not None)
+            allow_auto_launch = not ding_was_open
+            awakened_once = False
+            resumed_by_user = False
+            auto_heal_used = {"search": False, "paste": False}
+
+            def _pause_for_dingtalk_interruption(reason_msg):
+                nonlocal skip_search, resumed_by_user, allow_auto_launch
+                if not recover_interactive:
+                    raise RuntimeError(f"{reason_msg}，已停止发送")
+                issue = diagnose_issue(
+                    "dingtalk_interrupted",
+                    RuntimeError(reason_msg),
+                    extra={
+                        "search_name": search_name,
+                        "idx": idx,
+                        "total": total,
+                        "can_skip_target": (total > 1),
+                        "reason": reason_msg,
+                    },
+                )
+                choice = wait_for_recovery(
+                    issue["title"], issue["detail"], issue["hint"], issue["actions"], timeout_sec=3600
+                )
+                resumed_by_user = True
+                allow_auto_launch = True
+                if choice == "skip_target":
+                    return "skipped"
+                skip_search = (choice in ("skip_search", "retry_paste"))
+                return "continue"
+
             while True:
                 check_stop()
-                # 1) 唤起钉钉并确认已扫码登录进入主窗
+                # 1) 检查钉钉窗口状态：若为最小化/后台先自动还原；仅当用户主动操作钉钉或中途关闭才暂停避让
                 ding = _find()
-                if ding is None:
-                    for exe in exe_candidates:
-                        if os.path.exists(exe):
+                if ding is not None:
+                    ding_was_open = True
+                    allow_auto_launch = False
+                    d_pid0, d_hwnd0 = _get_win_pid_hwnd(ding)
+                    is_iconic_now = bool(d_hwnd0 and user32.IsIconic(d_hwnd0))
+                    if is_iconic_now:
+                        log("  检测到钉钉主窗口处于最小化状态，正在自动还原并置顶…")
+                        _restore_and_activate_hwnd(d_hwnd0, maximize=True, wake_exe_candidates=exe_candidates)
+                        sleep_check(0.8)
+                        ding = _find() or ding
+                    elif recover_interactive and not resumed_by_user:
+                        fg0 = int(user32.GetForegroundWindow() or 0)
+                        if fg0 and fg0 == d_hwnd0 and get_user_idle_seconds() < 2.0:
+                            act_res = _pause_for_dingtalk_interruption("检测到您当前正在使用钉钉窗口")
+                            if act_res == "skipped":
+                                return "skipped"
+                            continue
+                        elif fg0 and d_hwnd0 and fg0 != d_hwnd0:
                             try:
-                                subprocess.Popen(exe)
-                                log("  钉钉窗口在托盘或未启动，已尝试唤起，请稍候…")
+                                c0 = ctypes.create_unicode_buffer(128)
+                                t0 = ctypes.create_unicode_buffer(256)
+                                user32.GetClassNameW(fg0, c0, 128)
+                                user32.GetWindowTextW(fg0, t0, 256)
+                                if _is_dingtalk_aux_window(c0.value, t0.value):
+                                    log(f"  检测到当前前置为「{t0.value or c0.value}」，正自动切回钉钉聊天主窗…")
+                                    _restore_and_activate_hwnd(d_hwnd0, maximize=True, wake_exe_candidates=exe_candidates)
+                                    ding = _find() or ding
                             except Exception:
                                 pass
-                            break
-                    for _ in range(18):
-                        sleep_check(1)
+                elif ding_was_open and awakened_once and not allow_auto_launch and recover_interactive:
+                    act_res = _pause_for_dingtalk_interruption("检测到您关闭或隐藏了钉钉窗口")
+                    if act_res == "skipped":
+                        return "skipped"
+                    continue
+                else:
+                    hidden_h = _find_hidden_main_hwnd()
+                    if hidden_h:
+                        log("  检测到钉钉隐藏在后台托盘，正在尝试直接唤醒窗口…")
+                        _restore_and_activate_hwnd(hidden_h, maximize=True, wake_exe_candidates=exe_candidates)
+                        sleep_check(0.8)
                         ding = _find()
-                        if ding:
-                            break
+                    if ding is None:
+                        for exe in exe_candidates:
+                            if exe and os.path.exists(exe):
+                                try:
+                                    subprocess.Popen(exe)
+                                    log("  钉钉窗口在托盘或未启动，已尝试唤起，请稍候…")
+                                except Exception:
+                                    pass
+                                break
+                        for _ in range(18):
+                            sleep_check(1)
+                            ding = _find()
+                            if ding:
+                                break
+                    if ding is not None:
+                        ding_was_open = True
+                        allow_auto_launch = False
 
                 if ding is None or _is_dingtalk_login_window(ding):
                     if not recover_interactive:
@@ -3696,92 +9367,165 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                     issue = diagnose_issue("dingtalk_login")
                     wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
                     skip_search = False
+                    resumed_by_user = True
+                    allow_auto_launch = True
                     continue
+
+                ding_pid, _ = _get_win_pid_hwnd(ding)
 
                 if not skip_search:
                     chat_ready = False
-                    for _attempt in range(3):
-                        check_stop()
-                        _force_front()
-                        sleep_check(0.45)
-                        if _link_box() is not None:
-                            _close_link_box()
-                        _open_global_search()
+                    interrupted_act = None
+                    try:
+                        with hands_off_guard(f"钉钉搜索并打开会话「{search_name}」，随后粘贴数据"):
+                            for _attempt in range(3):
+                                check_stop()
+                                _force_front()
+                                awakened_once = True
+                                _, ding_pid, _ = _sleep_watch_ding(0.42, expected_pid=ding_pid, fg_locked=False)
+                                if _link_box() is not None:
+                                    _close_link_box()
+                                _open_global_search()
 
-                        opened = False
-                        for _ in range(14):
-                            check_stop()
-                            if _is_search_popup_open():
-                                opened = True
-                                break
-                            time.sleep(0.25)
-                        popup_ctl, doc = (None, None) if opened else _search_doc()
-                        if not opened and doc is None:
-                            log("  搜索窗口没打开，正在重试…")
-                            continue
-                        sleep_check(0.3)
+                                opened = False
+                                for _ in range(14):
+                                    _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                                    if _is_search_popup_open():
+                                        opened = True
+                                        break
+                                    sleep_check(0.22)
+                                popup_ctl, doc = (None, None) if opened else _search_doc()
+                                if not opened and doc is None:
+                                    log("  搜索窗口没打开，正在重试…")
+                                    continue
+                                _sleep_watch_ding(0.28, expected_pid=ding_pid, fg_locked=True)
 
-                        for kw_idx, kw in enumerate(direct_candidates):
-                            check_stop()
-                            if kw_idx > 0:
-                                if not _is_search_popup_open():
-                                    _open_global_search()
-                                    for _ in range(14):
-                                        check_stop()
-                                        if _is_search_popup_open():
-                                            break
-                                        time.sleep(0.25)
-                                    sleep_check(0.25)
-                                popup_ctl, doc = _search_doc()
-                                if doc is not None:
-                                    _focus_search_input(popup_ctl, doc)
-                                    time.sleep(0.15)
+                                set_cands = list(direct_candidates)
+                                settle_wait = float((pc_plan or {}).get("search_settle_sec") or 0.9)
+                                kw_idx = 0
+                                while kw_idx < len(set_cands):
+                                    kw = set_cands[kw_idx]
+                                    _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                                    if kw_idx > 0:
+                                        if not _is_search_popup_open():
+                                            _open_global_search()
+                                            for _ in range(14):
+                                                _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                                                if _is_search_popup_open():
+                                                    break
+                                                sleep_check(0.22)
+                                            _sleep_watch_ding(0.25, expected_pid=ding_pid, fg_locked=True)
+                                        popup_ctl, doc = _search_doc()
+                                        if doc is not None:
+                                            _focus_search_input(popup_ctl, doc)
+                                            sleep_check(0.15)
 
-                            ua.SendKeys("{Ctrl}a", waitTime=0.08)
-                            ua.SendKeys("{Back}", waitTime=0.08)
-                            if not _paste_text(kw, verify=True):
-                                log(f"  关键词「{kw}」写入剪贴板未就绪，跳过重试…")
-                                continue
-                            sleep_check(0.85)
+                                    ua.SendKeys("{Ctrl}a", waitTime=0.08)
+                                    ua.SendKeys("{Back}", waitTime=0.08)
+                                    if not _paste_text(kw, verify=True):
+                                        log(f"  关键词「{kw}」写入剪贴板未就绪，跳过重试…")
+                                        kw_idx += 1
+                                        continue
+                                    _sleep_watch_ding(settle_wait, expected_pid=ding_pid, fg_locked=True)
 
-                            # 极端情况下若搜索历史仍未消失，重新聚焦搜索框再贴一遍兜底
-                            popup_ctl, doc = _search_doc()
-                            if doc is not None and _has_search_history(doc):
-                                log(f"  检测到搜索框尚未接收内容，重新聚焦并粘贴「{kw}」…")
-                                _focus_search_input(popup_ctl, doc)
-                                time.sleep(0.15)
-                                ua.SendKeys("{Ctrl}a", waitTime=0.08)
-                                ua.SendKeys("{Back}", waitTime=0.08)
-                                if _paste_text(kw, verify=True):
-                                    sleep_check(0.85)
+                                    # 智能候选确认：先检测列表是否“无结果”或存在多条匹配并由 AI 确认点击最准确那条
+                                    _popup_now, doc_now = _search_doc()
+                                    if doc_now is not None:
+                                        scan_res = _collect_dingtalk_search_rows(_iter_search_docs(doc_now), check_stop)
+                                        if scan_res.get("empty_result"):
+                                            log(f"  搜索「{kw}」无结果，AI 自动切换简称/关联名字继续检索…")
+                                            if len(kw) >= 3:
+                                                for sub_kw in (kw[-2:], kw[:2]):
+                                                    if sub_kw not in set_cands:
+                                                        set_cands.append(sub_kw)
+                                            kw_idx += 1
+                                            continue
+                                        best_row = _ai_pick_best_search_row(search_name, set_cands, scan_res.get("rows") or [], cfg=cfg)
+                                        if best_row is not None and best_row.get("rect") is not None:
+                                            br = best_row["rect"]
+                                            cx = int((br.left + br.right) / 2)
+                                            cy = int((br.top + br.bottom) / 2)
+                                            ua.Click(cx, cy, waitTime=0.28)
+                                            if _wait_search_closed(loops=8, step=0.2):
+                                                _save_verified_dingtalk_target(search_name, best_row.get("title", ""))
+                                                log(f"  ✅ AI 已识别并确认钉钉目标：「{search_name}」→「{best_row.get('title', search_name)}」")
+                                                chat_ready = True
+                                                break
 
-                            # 直接按 Enter 打开首选/高亮会话
-                            ua.SendKeys("{Enter}", waitTime=0.3)
-                            if _wait_search_closed(loops=10, step=0.25):
-                                chat_ready = True
-                                break
-
-                            # 若回车后弹窗未退，且列表已有搜索结果，尝试精准点击命中行兜底
-                            popup_ctl, doc = _search_doc()
-                            if doc is not None and not _has_search_history(doc):
-                                matched = _feature_item(doc, search_name, search_tokens)
-                                if matched is not None:
-                                    _item_ctl, item_rect = matched
-                                    cx = int((item_rect.left + item_rect.right) / 2)
-                                    cy = int((item_rect.top + item_rect.bottom) / 2)
-                                    ua.Click(cx, cy, waitTime=0.3)
-                                    if _wait_search_closed(loops=10, step=0.25):
+                                    # 零阻塞直通：输入搜索词后直接按 Enter，不先递归遍历整个搜索结果树防卡死！
+                                    _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                                    ua.SendKeys("{Enter}", waitTime=0.25)
+                                    if _wait_search_closed(loops=8, step=0.2):
                                         chat_ready = True
                                         break
-                            log(f"  关键词「{kw}」未直接进入会话，尝试下一候选词…")
 
-                        if chat_ready:
-                            break
-                        log("  本轮未进入目标会话，关闭搜索框后重试…")
-                        ua.SendKeys("{Esc}", waitTime=0.25)
-                        sleep_check(0.5)
+                                    # 兜底1：部分钉钉版本需要先按一次 ↓ 高亮第一项再按 Enter
+                                    _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                                    ua.SendKeys("{Down}", waitTime=0.12)
+                                    ua.SendKeys("{Enter}", waitTime=0.25)
+                                    if _wait_search_closed(loops=6, step=0.2):
+                                        chat_ready = True
+                                        break
+
+                                    # 兜底2：仅在前两招未进群时才做带超时的搜索框焦点检测与列表匹配点击
+                                    popup_ctl, doc = _search_doc()
+                                    if doc is not None and _has_search_history(doc):
+                                        log(f"  检测到搜索框尚未接收内容，重新聚焦并粘贴「{kw}」…")
+                                        _focus_search_input(popup_ctl, doc)
+                                        sleep_check(0.15)
+                                        ua.SendKeys("{Ctrl}a", waitTime=0.08)
+                                        ua.SendKeys("{Back}", waitTime=0.08)
+                                        if _paste_text(kw, verify=True):
+                                            _sleep_watch_ding(settle_wait, expected_pid=ding_pid, fg_locked=True)
+                                            ua.SendKeys("{Enter}", waitTime=0.25)
+                                            if _wait_search_closed(loops=6, step=0.2):
+                                                chat_ready = True
+                                                break
+
+                                    if doc is not None:
+                                        matched = _feature_item(doc, search_name, search_tokens)
+                                        if matched is not None:
+                                            _item_ctl, item_rect = matched
+                                            cx = int((item_rect.left + item_rect.right) / 2)
+                                            cy = int((item_rect.top + item_rect.bottom) / 2)
+                                            ua.Click(cx, cy, waitTime=0.28)
+                                            if _wait_search_closed(loops=6, step=0.2):
+                                                chat_ready = True
+                                                break
+                                    log(f"  关键词「{kw}」未直接进入会话，尝试下一候选词…")
+                                    kw_idx += 1
+
+                                if chat_ready:
+                                    break
+                                log("  本轮未进入目标会话，关闭搜索框后重试…")
+                                ua.SendKeys("{Esc}", waitTime=0.22)
+                                _sleep_watch_ding(0.45, expected_pid=ding_pid, fg_locked=True)
+                    except DingTalkInterrupted as e_intr:
+                        interrupted_act = _pause_for_dingtalk_interruption(str(e_intr))
+                        if interrupted_act == "skipped":
+                            return "skipped"
+                        continue
 
                     if not chat_ready:
+                        if not auto_heal_used["search"]:
+                            auto_heal_used["search"] = True
+                            heal_s = ai_auto_debug_and_heal(
+                                cfg,
+                                "dingtalk_search",
+                                RuntimeError(f"未能自动搜索进入群聊「{search_name}」"),
+                                extra={"search_name": search_name},
+                            )
+                            if heal_s.get("can_auto_fix"):
+                                if "dismiss_popups" in heal_s.get("actions", []):
+                                    try:
+                                        ua.SendKeys("{Esc}", waitTime=0.2)
+                                        _close_link_box()
+                                    except Exception:
+                                        pass
+                                if "activate_dingtalk_im" in heal_s.get("actions", []):
+                                    _force_front()
+                                    sleep_check(0.35)
+                                continue
                         if not recover_interactive:
                             raise RuntimeError(f"没能定位到钉钉会话「{search_name}」，已停止发送")
                         issue = diagnose_issue(
@@ -3789,6 +9533,8 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             extra={"search_name": search_name, "can_skip_target": (total > 1)},
                         )
                         choice = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                        resumed_by_user = True
+                        allow_auto_launch = True
                         if choice == "skip_target":
                             return "skipped"
                         if choice == "skip_search":
@@ -3799,97 +9545,264 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 else:
                     log("  用户已手动打开目标群聊，跳过自动搜索，直接定位发送框…")
 
+                image_pasted_ok = False
+                text_pasted_ok = False
                 try:
-                    _force_front()
-                    sleep_check(0.35)
-                    clear_clipboard_windows()
-                    log("  已打开目标会话，准备粘贴图片")
+                    with hands_off_guard(f"钉钉「{search_name}」中进行粘贴数据与静音发送"):
+                        check_stop()
+                        _force_front()
+                        awakened_once = True
+                        _, ding_pid, _ = _sleep_watch_ding(0.35, expected_pid=ding_pid, fg_locked=False)
+                        clear_clipboard_windows()
+                        log("  已打开目标会话，准备粘贴图片")
 
-                    # 4) 聚焦底部聊天输入框并先清空残留内容，再把图片写入剪贴板并粘贴
-                    ding_now = _fresh_ding()
-                    if ding_now is None:
-                        raise RuntimeError("找不到钉钉窗口，已停止粘贴")
-                    r = ding_now.BoundingRectangle
-                    _focus_chat_input(ding_now, r)
-                    sleep_check(0.35)
-                    _ensure_not_in_search_box(r)
+                        # 若有残留的弹出菜单（如上一轮静音下拉未退出），先按 Esc 收起避免抢占键盘输入
+                        ding_pre, ding_pid, ding_hwnd_pre = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=False)
+                        if (ding_hwnd_pre and _is_win_in_menu_mode(ding_hwnd_pre)) or _enum_top_windows(
+                            target_classes=("im_chat::QuiMenu",), target_titles=None
+                        ):
+                            try:
+                                ua.SendKeys("{Esc}", waitTime=0.2)
+                                sleep_check(0.22)
+                            except Exception:
+                                pass
 
-                    if cfg.get("dt_clear_before_send", True):
-                        ua.SendKeys("{Ctrl}a", waitTime=0.15)
-                        ua.SendKeys("{Back}", waitTime=0.15)
-                        ua.SendKeys("{Delete}", waitTime=0.15)
-                        ua.SendKeys("{Ctrl}a", waitTime=0.1)
-                        ua.SendKeys("{Back}", waitTime=0.2)
-                        log("  已清空发送框内原有内容")
+                        # 按用户设定等待 N 秒让钉钉聊天框加载完成再粘贴（防加载未就绪漏贴）
+                        try:
+                            paste_delay = max(0, min(20, int(round(float(cfg.get("dt_paste_delay_sec", 3))))))
+                        except Exception:
+                            paste_delay = 3
+                        if paste_delay > 0:
+                            log(f"  ⏳ 等待 {paste_delay} 秒让钉钉聊天框加载就绪后再粘贴（可在「钉钉投递」调整秒数）…")
+                            _sleep_watch_ding(paste_delay, expected_pid=ding_pid, fg_locked=False)
 
-                    if not set_clipboard_image_from_file(tmp_img):
-                        raise RuntimeError("图片恢复失败，已停止粘贴")
+                        # 4) 聚焦底部聊天输入框并一次性先清空旧草稿
+                        ding_now, ding_pid, ding_hwnd_cur = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                        r = ding_now.BoundingRectangle
+                        _focus_chat_input(ding_now, r)
+                        _sleep_watch_ding(0.35, expected_pid=ding_pid, fg_locked=True)
+                        _ensure_not_in_search_box(r)
 
-                    # 5) 粘贴图片前硬核查焦点，绝不把图片贴入顶部搜索框
-                    _ensure_not_in_search_box(r)
-                    ua.SendKeys("{Ctrl}v", waitTime=0.5)
+                        if cfg.get("dt_clear_before_send", True):
+                            try:
+                                from pywinauto import keyboard as _pwa_kbd  # type: ignore[import-not-found]
+                                _pwa_kbd.send_keys("^a{BACKSPACE}{DELETE}")
+                            except Exception:
+                                ua.SendKeys("{Ctrl}a", waitTime=0.12)
+                                ua.SendKeys("{Back}", waitTime=0.12)
+                                ua.SendKeys("{Delete}", waitTime=0.12)
+                            sleep_check(0.22)
+                            log("  已清空发送框内原有内容")
 
-                    # 6) 弹窗兜底：检查“选择粘贴的形式”，出现就点「转为图片」
-                    converted = False
-                    for _ in range(12):
-                        time.sleep(0.25)
-                        tops = _enum_top_windows(
-                            target_classes=("ddesign::ComplexModal",), target_titles=None)
-                        if tops:
-                            modal = ua.ControlFromHandle(tops[0][0])
-                            if modal is not None:
-                                btn = modal.ButtonControl(searchDepth=12, Name="转为图片")
-                                if btn.Exists(2):
-                                    btn.Click()
-                                    converted = True
-                                    time.sleep(0.6)
-                            break
-                    if converted:
-                        log("  已自动点「转为图片」")
-                    else:
-                        log("  图片已直接粘贴（无需转换）")
+                        pt_cfg = cfg.get("pipeline_tuning") if isinstance(cfg.get("pipeline_tuning"), dict) else {}
+                        compose_order = str(pt_cfg.get("compose_step_order") or "image_text_silent")
+                        silent_order = str(pt_cfg.get("silent_step_order") or "uia_first")
+                        paste_key_order = str(pt_cfg.get("paste_key_order") or "pywinauto_first")
 
-                    # 7) 粘贴文字前再次确认焦点在底部编辑区，最后再按当前节点策略开启/关闭静音与发送
-                    ding_now2 = _fresh_ding()
-                    if ding_now2 is None:
-                        raise RuntimeError("钉钉窗口异常，消息尚未发送，请检查后手动发送")
-                    r2 = ding_now2.BoundingRectangle
-                    _focus_chat_input(ding_now2, r2)
-                    sleep_check(0.25)
-                    ua.SendKeys("{End}", waitTime=0.15)
-                    _ensure_not_in_search_box(r2)
-                    if not _paste_text(text_msg, verify=True):
-                        raise RuntimeError("钉钉文字未就绪，已停止自动发送，请检查后手动按 Enter")
-                    sleep_check(0.5)
+                        def _do_paste_image_step():
+                            nonlocal image_pasted_ok
+                            ding_cur, _, hwnd_cur = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                            r_img = ding_cur.BoundingRectangle
+                            _focus_chat_input(ding_cur, r_img)
+                            _sleep_watch_ding(0.25, expected_pid=ding_pid, fg_locked=True)
+                            if compose_order == "text_silent_image":
+                                try:
+                                    ua.SendKeys("{End}", waitTime=0.12)
+                                except Exception:
+                                    pass
+                            _ensure_not_in_search_box(r_img)
+                            before_patch = (
+                                _capture_dt_input_patch(r_img)
+                                if (hwnd_cur and int(user32.GetForegroundWindow() or 0) == hwnd_cur)
+                                else None
+                            )
+                            use_pwa_first = (paste_key_order != "uia_first")
+                            for paste_try in range(3):
+                                if not set_clipboard_image_from_file(tmp_img):
+                                    raise RuntimeError("图片恢复失败，已停止粘贴")
+                                if paste_try > 0:
+                                    ding_cur, _, hwnd_cur = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                                    r_img = ding_cur.BoundingRectangle
+                                    _focus_chat_input(ding_cur, r_img)
+                                    _sleep_watch_ding(0.3, expected_pid=ding_pid, fg_locked=True)
+                                else:
+                                    _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                                _ensure_not_in_search_box(r_img)
+                                if before_patch is None and hwnd_cur and int(user32.GetForegroundWindow() or 0) == hwnd_cur:
+                                    before_patch = _capture_dt_input_patch(r_img)
 
-                    if do_silent:
-                        _enable_dingtalk_silent_send()
-                        sleep_check(0.35)
-                    else:
-                        _disable_dingtalk_silent_send()
-                        sleep_check(0.25)
+                                if (paste_try % 2 == 0) == use_pwa_first:
+                                    _send_paste_shortcut()
+                                else:
+                                    try:
+                                        ua.SendKeys("{Ctrl}v", waitTime=0.35)
+                                    except Exception:
+                                        _send_paste_shortcut()
+                                sleep_check(0.9)
 
-                    # 点完静音/取消静音后强制校验光标是否位于对话输入内容窗口，确认后再按下 Enter
-                    _verify_and_focus_chat_input(retries=2)
+                                converted = False
+                                for _ in range(5):
+                                    sleep_check(0.2)
+                                    _raise_if_interrupted(expected_pid=ding_pid, fg_locked=False)
+                                    tops = _enum_top_windows(
+                                        target_classes=("ddesign::ComplexModal",), target_titles=None)
+                                    if tops:
+                                        modal = _safe_control_from_handle(ua, tops[0][0])
+                                        if modal is not None:
+                                            btn = modal.ButtonControl(searchDepth=12, Name="转为图片")
+                                            if btn.Exists(1.5):
+                                                btn.Click()
+                                                converted = True
+                                                sleep_check(0.5)
+                                        break
+                                sleep_check(0.35)
+                                after_patch = _capture_dt_input_patch(r_img) if before_patch is not None else None
+                                if converted or _did_dt_input_change(before_patch, after_patch):
+                                    if converted:
+                                        log("  ✅ 已自动点「转为图片」并确认图片粘贴进入钉钉输入框")
+                                    else:
+                                        log("  ✅ 已确认图片粘贴进入钉钉输入框")
+                                    image_pasted_ok = True
+                                    break
+                                if paste_try < 2:
+                                    log("  ⚠️ 检测到粘贴后输入区画面无变化（钉钉可能仍在加载），等待 2 秒后自动补粘…")
+                                    sleep_check(2.0)
 
-                    if cfg.get("dt_auto_send", False):
-                        ua.SendKeys("{Enter}", waitTime=0.4)
-                        silent_word = "静音" if do_silent else "常规"
-                        log(f"  已{silent_word}发送图片和文字到「{search_name}」：{text_msg}")
-                    else:
-                        silent_tip = "并设为「静音发送」" if do_silent else "（常规提醒）"
-                        clear_tip = "已清空旧草稿、" if cfg.get("dt_clear_before_send", True) else ""
-                        log(f"  ✅ {clear_tip}在「{search_name}」贴好图片与「{text_msg}」{silent_tip}，光标已就位，按设置暂不发送，请检查后按 Enter")
-                    return "sent"
+                            if not image_pasted_ok:
+                                raise RuntimeError("图片粘贴后输入框画面未变化，请把「打开会话后等待秒数」调大一点或手动打开会话重试")
+
+                        def _do_paste_text_step():
+                            nonlocal text_pasted_ok
+                            ding_txt, _, _ = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                            r_txt = ding_txt.BoundingRectangle
+                            _focus_chat_input(ding_txt, r_txt)
+                            _sleep_watch_ding(0.22, expected_pid=ding_pid, fg_locked=True)
+                            try:
+                                from pywinauto import keyboard as _pwa_kbd  # type: ignore[import-not-found]
+                                _pwa_kbd.send_keys("{END}")
+                            except Exception:
+                                ua.SendKeys("{End}", waitTime=0.15)
+                            _ensure_not_in_search_box(r_txt)
+                            if not _paste_text(text_msg, verify=True):
+                                raise RuntimeError("钉钉文字未就绪，已停止自动发送，请检查后手动按 Enter")
+                            text_pasted_ok = True
+                            _sleep_watch_ding(0.6, expected_pid=ding_pid, fg_locked=True)
+
+                        def _do_toggle_silent_step():
+                            if do_silent:
+                                _enable_dingtalk_silent_send(silent_order=silent_order)
+                            else:
+                                _disable_dingtalk_silent_send()
+
+                        if str(text_only_message or "").strip():
+                            image_pasted_ok = True
+                            _do_paste_text_step()
+                            _do_toggle_silent_step()
+                        elif compose_order == "text_silent_image":
+                            log("  🔄 当前启用防卡顿顺序：先贴文字唤醒输入栏 -> 点设静音 -> 最后贴大图")
+                            _do_paste_text_step()
+                            _do_toggle_silent_step()
+                            _do_paste_image_step()
+                        else:
+                            _do_paste_image_step()
+                            _do_paste_text_step()
+                            _do_toggle_silent_step()
+
+                        # 点完设为静音/取消静音与贴图后等待 1 秒，确保不误落入搜索栏后直接发送
+                        _sleep_watch_ding(1.0, expected_pid=ding_pid, fg_locked=False)
+                        if _is_search_popup_open():
+                            _ensure_not_in_search_box(r)
+                        ding_commit, ding_pid, _ = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+
+                        if cfg.get("dt_auto_send", False):
+                            _focus_chat_input(ding_commit, ding_commit.BoundingRectangle)
+                            sleep_check(0.18)
+                            sent_via_btn = _commit_dingtalk_send(ding_commit)
+                            silent_word = "静音" if do_silent else "常规"
+                            extra_tip = "（含发送按钮补发确认）" if sent_via_btn else ""
+                            log(f"  已{silent_word}发送图片和文字到「{search_name}」：{text_msg}{extra_tip}")
+                        else:
+                            silent_tip = "并设为「静音发送」" if do_silent else "（常规提醒）"
+                            clear_tip = "已清空旧草稿、" if cfg.get("dt_clear_before_send", True) else ""
+                            log(f"  ✅ {clear_tip}在「{search_name}」贴好图片与「{text_msg}」{silent_tip}，光标已就位，按设置暂不发送，请检查后按 Enter")
+                        return "sent"
+                except DingTalkInterrupted as e_intr:
+                    act_res = _pause_for_dingtalk_interruption(str(e_intr))
+                    if act_res == "skipped":
+                        return "skipped"
+                    continue
                 except Exception as e_paste:
-                    if "手动停止" in str(e_paste) or not recover_interactive:
+                    if "手动停止" in str(e_paste):
                         raise
+                    if not auto_heal_used["paste"]:
+                        auto_heal_used["paste"] = True
+                        heal_p = ai_auto_debug_and_heal(
+                            cfg,
+                            "dingtalk_paste",
+                            e_paste,
+                            extra={
+                                "search_name": search_name,
+                                "image_pasted": image_pasted_ok,
+                                "text_pasted": text_pasted_ok,
+                            },
+                        )
+                        if heal_p.get("can_auto_fix"):
+                            acts_p = heal_p.get("actions", [])
+                            if "dismiss_popups" in acts_p:
+                                try:
+                                    ua.SendKeys("{Esc}", waitTime=0.2)
+                                    _close_link_box()
+                                except Exception:
+                                    pass
+                            if "activate_dingtalk_im" in acts_p:
+                                _force_front()
+                                sleep_check(0.35)
+                            if (
+                                image_pasted_ok
+                                and text_pasted_ok
+                                and any(a in acts_p for a in ("enable_silent_uia", "click_send_now", "focus_chat_input"))
+                            ):
+                                try:
+                                    ding_h, ding_pid, _ = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=False)
+                                    _focus_chat_input(ding_h, ding_h.BoundingRectangle)
+                                    sleep_check(0.2)
+                                    if do_silent:
+                                        _enable_dingtalk_silent_send()
+                                    else:
+                                        _disable_dingtalk_silent_send()
+                                    _sleep_watch_ding(1.0, expected_pid=ding_pid, fg_locked=False)
+                                    ding_h2, ding_pid, _ = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                                    if cfg.get("dt_auto_send", False):
+                                        _focus_chat_input(ding_h2, ding_h2.BoundingRectangle)
+                                        sleep_check(0.18)
+                                        sent_b2 = _commit_dingtalk_send(ding_h2)
+                                        silent_w2 = "静音" if do_silent else "常规"
+                                        tip_b2 = "（含发送按钮补发确认）" if sent_b2 else ""
+                                        log(f"  ✅ [AI 自动调试] 已自动排障并{silent_w2}发送到「{search_name}」：{text_msg}{tip_b2}")
+                                    else:
+                                        log(f"  ✅ [AI 自动调试] 已排障并完成贴图设静音，请检查后按 Enter")
+                                    return "sent"
+                                except Exception as e_heal_fail:
+                                    if "手动停止" in str(e_heal_fail):
+                                        raise
+                                    log(f"  ℹ️ [AI 自动调试] 补发尝试未一次完成（{human_error(e_heal_fail)}），转入常规重贴流程…")
+                            skip_search = ("retry_paste" in acts_p) or (image_pasted_ok is False)
+                            continue
+                    if not recover_interactive:
+                        raise
+                    if _find() is None:
+                        act_res = _pause_for_dingtalk_interruption("检测到钉钉窗口已关闭或隐藏")
+                        if act_res == "skipped":
+                            return "skipped"
+                        continue
                     issue = diagnose_issue(
                         "dingtalk_paste",
                         e_paste,
                         extra={"search_name": search_name, "can_skip_target": (total > 1)},
                     )
                     choice = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                    resumed_by_user = True
+                    allow_auto_launch = True
                     if choice == "skip_target":
                         return "skipped"
                     if choice == "retry_paste":
@@ -3917,11 +9830,24 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 log(f"  多会话投递完成：成功 {len(sent_targets)} 个（{'、'.join(sent_targets)}），跳过 {len(skipped_targets)} 个（{'、'.join(skipped_targets)}）")
             else:
                 log(f"  ✅ 多会话投递完成：全部 {len(sent_targets)} 个目标已处理")
+
+        if sent_targets and cfg.get("dt_auto_send", False) and cfg.get("dt_minimize_after_send", True):
+            sleep_check(0.8)
+            w_min = _find()
+            if w_min is not None:
+                try:
+                    min_hwnd = int(w_min.NativeWindowHandle or 0)
+                except Exception:
+                    min_hwnd = 0
+                if min_hwnd:
+                    user32.ShowWindow(min_hwnd, 6)  # SW_MINIMIZE
+                    log("  ✅ 发送完成，已自动最小化钉钉窗口")
         return True
     except Exception as e:
         log(f"  钉钉操作失败：{human_error(e)}")
         raise
     finally:
+        _active_dt_hwnd = 0
         try:
             if tmp_img.exists():
                 tmp_img.unlink()
@@ -3930,6 +9856,26 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 send_tmp.unlink()
         except Exception:
             pass
+
+
+def send_dingtalk_text_message(cfg, target_names, message_text, silent=True, recover_interactive=False):
+    """直接将指定纯文字汇报静音发送到一个或多个钉钉联系人/群聊（支持 AI 搜索自确认）。"""
+    import copy
+    c = normalize_config(copy.deepcopy(cfg if isinstance(cfg, dict) else {}))
+    raw_list = target_names if isinstance(target_names, (list, tuple)) else [target_names]
+    tgts = [str(t).strip() for t in raw_list if str(t).strip()]
+    if not tgts:
+        tgts = get_enabled_dt_targets(c) or ["文件小助手"]
+    c["enable_dingtalk"] = True
+    c["dt_auto_send"] = True
+    c["dt_silent_send"] = bool(silent)
+    c["dt_targets"] = [{"name": t, "enabled": True} for t in tgts]
+    c["dt_search"] = tgts[0]
+    return send_dingtalk_image(
+        c,
+        recover_interactive=recover_interactive,
+        text_only_message=str(message_text or "").strip(),
+    )
 
 
 def _open_and_login_wps(context, page, wps_url, recover_interactive=True):
@@ -3955,8 +9901,10 @@ def _open_and_login_wps(context, page, wps_url, recover_interactive=True):
 
 
 def _capture_summary_with_recovery(page, temp_dir=None, enable_capture=True, recover_interactive=True,
-                                   failures=None, log_prefix="5/5"):
-    """切到「数据汇总」表并框选复制为图片，保持浏览器打开直至成功、手动复制兜底或跳过。"""
+                                   failures=None, log_prefix="5/5", cfg=None, trigger_lt=None, trigger_hm=None,
+                                   after_data_paste=False):
+    """切到「数据汇总」表、校准筛选项并框选复制为图片，保持浏览器打开直至成功、手动复制兜底或跳过。"""
+    wps_heal_used = False
     while True:
         check_stop()
         try:
@@ -3964,9 +9912,18 @@ def _capture_summary_with_recovery(page, temp_dir=None, enable_capture=True, rec
             log(f"{log_prefix} 切到数据汇总表...")
             if not switch_wps_sheet(page, "数据汇总"):
                 raise RuntimeError("切换到数据汇总表失败，请检查底部标签栏")
+            use_cfg = cfg if isinstance(cfg, dict) else load_config()
+            set_step("正在校准汇总表筛选项…")
+            apply_wps_summary_presets(page, use_cfg, lt=trigger_lt, hm_override=trigger_hm, after_data_paste=after_data_paste)
+            apply_wps_update_timestamp(page, use_cfg, after_data_paste=after_data_paste)
+            pt_wps = use_cfg.get("pipeline_tuning") if isinstance(use_cfg.get("pipeline_tuning"), dict) else {}
+            try:
+                wps_wait_s = max(3, min(15, int(round(float(pt_wps.get("wps_refresh_wait_sec", 5))))))
+            except Exception:
+                wps_wait_s = 5
             set_step("正在等待汇总表刷新…")
-            log("  等待 5 秒，让数据汇总表完成刷新…")
-            sleep_check(5.0)
+            log(f"  等待 {wps_wait_s} 秒，让数据汇总表完成刷新…")
+            sleep_check(float(wps_wait_s))
 
             if temp_dir is not None:
                 screenshot_path = temp_dir / "数据汇总.png"
@@ -3981,6 +9938,17 @@ def _capture_summary_with_recovery(page, temp_dir=None, enable_capture=True, rec
         except Exception as e_cap:
             if "手动停止" in str(e_cap):
                 raise
+            if not wps_heal_used:
+                wps_heal_used = True
+                use_cfg_heal = cfg if isinstance(cfg, dict) else load_config()
+                heal_w = ai_auto_debug_and_heal(use_cfg_heal, "wps_capture", e_cap, page=page)
+                if heal_w.get("can_auto_fix"):
+                    try:
+                        page.keyboard.press("Escape")
+                        sleep_check(1.0)
+                    except Exception:
+                        pass
+                    continue
             if not recover_interactive:
                 if failures is not None:
                     tip = human_error(e_cap)
@@ -4011,13 +9979,18 @@ def _capture_summary_with_recovery(page, temp_dir=None, enable_capture=True, rec
 
 
 def _with_keep_awake(cfg, reason, fn):
-    """按配置在任务执行期间持有防休眠状态并在结束或异常退出时安全释放。"""
+    """按配置在任务执行期间持有防休眠状态及全局快捷键监听，结束或异常退出时安全释放。"""
     keep_awake = bool((cfg or {}).get("prevent_sleep", True))
+    hotkeys_on = reason in ("run_once", "capture_only")
     if keep_awake:
         set_keep_awake(True, reason=reason)
+    if hotkeys_on:
+        _HOTKEY_MGR.start()
     try:
         return fn()
     finally:
+        if hotkeys_on:
+            _HOTKEY_MGR.stop()
         if keep_awake:
             set_keep_awake(False, reason=reason)
 
@@ -4236,9 +10209,14 @@ def _run_once_impl(round_num, cfg=None, trigger_lt=None, trigger_hm=None, recove
                 recover_interactive=recover_interactive,
                 failures=failures,
                 log_prefix="5/5",
+                cfg=cfg,
+                trigger_lt=trigger_lt,
+                trigger_hm=trigger_hm,
+                after_data_paste=True,
             )
             cleanup_wps_tabs(context, wps_url=wps_url)
         finally:
+            _set_active_pw_context(None)
             set_step("正在关闭后台浏览器…")
             log("关闭后台浏览器...")
             try:
@@ -4268,9 +10246,17 @@ def _run_once_impl(round_num, cfg=None, trigger_lt=None, trigger_hm=None, recove
     if failures:
         raise RuntimeError("；".join(failures))
 
+    try:
+        record_report_archive(cfg, round_label=f"第{round_num}轮", summary_tsv=_last_captured_summary_tsv)
+    except Exception:
+        pass
     notify_last_run()
     end_time = time.time()
     duration = int(end_time - start_time)
+    try:
+        record_run_journal(cfg, status="ok", mode="full", round_label=f"第{round_num}轮", duration_sec=duration)
+    except Exception:
+        pass
     set_step("✅ 本轮跑完")
     log(f"✅ 本轮全部完成，用时 {duration} 秒")
 
@@ -4342,8 +10328,11 @@ def _run_capture_only_impl(round_num="截图", cfg=None, recover_interactive=Tru
                 recover_interactive=recover_interactive,
                 failures=None,
                 log_prefix="2/3",
+                cfg=cfg,
+                trigger_lt=trigger_lt,
             )
         finally:
+            _set_active_pw_context(None)
             try:
                 context.close()
             except Exception:
@@ -4354,10 +10343,30 @@ def _run_capture_only_impl(round_num="截图", cfg=None, recover_interactive=Tru
         log("3/3 正在粘贴到钉钉并发送…")
         set_step("正在发送到钉钉…")
         send_dingtalk_image(cfg, trigger_lt=trigger_lt, recover_interactive=recover_interactive)
+    else:
+        try:
+            record_report_archive(cfg, round_label="仅截图", summary_tsv=_last_captured_summary_tsv)
+        except Exception:
+            pass
+    try:
+        record_report_archive(cfg, round_label="仅截图", summary_tsv=_last_captured_summary_tsv)
+    except Exception:
+        pass
     notify_last_run()
     end_time = time.time()
+    dur_s = int(end_time - start_time)
+    try:
+        record_run_journal(
+            cfg,
+            status="ok" if not capture_failed else "skipped_capture",
+            mode="capture_only",
+            round_label="独立截图",
+            duration_sec=dur_s,
+        )
+    except Exception:
+        pass
     set_step("✅ 本轮跑完")
-    log(f"✅ 独立截图流程完成，用时 {int(end_time - start_time)} 秒")
+    log(f"✅ 独立截图流程完成，用时 {dur_s} 秒")
     return end_time
 
 
@@ -4368,7 +10377,13 @@ def show_splash():
     import neu_ui as neu
     SPLASH_BASE = "#e3e8ef"
     win = tk.Tk()
-    win.title("📊暗号表助手")
+    win.title("暗号表助手")
+    try:
+        ico_p = _find_bundle_asset("icon.ico")
+        if ico_p is not None:
+            win.iconbitmap(str(ico_p))
+    except Exception:
+        pass
     win.geometry("420x288")
     win.resizable(False, False)
     try:
@@ -5198,13 +11213,14 @@ if __name__ == "__main__":
     if not acquire_single_instance():
         sys.exit(0)
     try:
-        priv = check_dingtalk_privilege_match()
-        log(f"⚠️ {priv['message']}" if not priv.get("matched", True) else priv["message"])
-    except Exception:
-        pass
-    try:
-        import threading
-        threading.Thread(target=ensure_browser_installed, daemon=True).start()
+        def _delayed_browser_check():
+            time.sleep(2.5)
+            try:
+                ensure_browser_installed()
+            except Exception:
+                pass
+
+        threading.Thread(target=_delayed_browser_check, daemon=True).start()
         show_settings_window()
     except Exception as e:
         log_error(e, "启动失败")
