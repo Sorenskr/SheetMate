@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.8.5 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.8.6 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -4395,9 +4395,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.8.5" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.8.6" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.8.5</span>
+          <span class="ver-pill" id="verBadge">v2.8.6</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -5233,7 +5233,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
               </div>
               <div class="ios-group" id="timetableList" style="max-height:540px;overflow-y:auto;"></div>
-              <div class="section-footer">点击任意时间行可单独定制该节点「表格查询减几天」、「钉钉消息只发日期或减几天」、静音与后缀</div>
+              <div class="section-footer">点击任意一行，可单独设置这个时间点「发不发钉钉」、「查哪天表格」和「群消息文字」</div>
             </div>
           </div>
         </div>
@@ -5448,100 +5448,110 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- 双列增强版单点时间策略弹窗 -->
+  <!-- 大白话单点时间设置弹窗（与排期列表 0ms 实时联动） -->
   <div class="sheet-mask" id="pointMask">
     <div class="ios-sheet wide">
       <div class="sheet-handle"></div>
       <div class="sheet-header">
         <button class="sheet-btn" id="pointCancel" type="button">取消</button>
-        <div class="sheet-title" id="pointSheetTitle">调整 12:00 策略</div>
+        <div class="sheet-title" id="pointSheetTitle">12:00 时间点设置</div>
         <button class="sheet-btn done" id="pointDone" type="button">完成</button>
       </div>
       <div class="sheet-body-pad">
         <div class="point-preview-strip">
-          <div>表格填入日期：<strong id="pointSheetPrevText">—</strong></div>
-          <div>钉钉发出文案：<strong id="pointMsgPrevText">—</strong></div>
+          <div>本轮动作：<strong id="pointActionPrevText">—</strong></div>
+          <div>表格日期：<strong id="pointSheetPrevText">—</strong></div>
+          <div id="pointMsgPrevRow">群消息词：<strong id="pointMsgPrevText">—</strong></div>
         </div>
 
         <div class="point-grid-2">
           <div>
-            <div class="sheet-field-label">1. 执行动作</div>
+            <div class="sheet-field-label">
+              <span>是否发钉钉</span>
+              <span id="pointModeDefaultSub" style="font-weight:400;margin-left:4px;font-size:11px;"></span>
+            </div>
             <div class="segmented segmented-3" id="pointModeSeg">
               <div class="seg-thumb" id="pointModeThumb"></div>
-              <button class="seg-btn" type="button" data-val="default">跟随规则</button>
-              <button class="seg-btn" type="button" data-val="send">截图发群</button>
-              <button class="seg-btn" type="button" data-val="table_only">仅更表</button>
+              <button class="seg-btn" type="button" data-val="default">按默认</button>
+              <button class="seg-btn" type="button" data-val="send">发钉钉</button>
+              <button class="seg-btn" type="button" data-val="table_only">不发钉钉</button>
             </div>
           </div>
 
           <div>
-            <div class="sheet-field-label">
-              <span>2. 静音发送策略</span>
-              <span id="pointSilentDefaultSub" style="font-weight:400;margin-left:4px;font-size:11px;"></span>
-            </div>
-            <div class="segmented segmented-3" id="pointSilentSeg">
-              <div class="seg-thumb" id="pointSilentThumb"></div>
-              <button class="seg-btn" type="button" data-val="default">跟随全局</button>
-              <button class="seg-btn" type="button" data-val="on">静音</button>
-              <button class="seg-btn" type="button" data-val="off">常规</button>
-            </div>
-          </div>
-
-          <div>
-            <div class="sheet-field-label">3. 该节点表格查询日期 (如 D2)</div>
+            <div class="sheet-field-label">表格查哪天数据</div>
             <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
               <div class="mini-seg" id="pointSheetOffSeg">
-                <button type="button" class="mini-seg-btn" data-val="default">跟全局</button>
-                <button type="button" class="mini-seg-btn" data-val="0">当天</button>
-                <button type="button" class="mini-seg-btn" data-val="-1">前1天</button>
+                <button type="button" class="mini-seg-btn" data-val="default">按默认</button>
+                <button type="button" class="mini-seg-btn" data-val="0">今天</button>
+                <button type="button" class="mini-seg-btn" data-val="-1">昨天</button>
               </div>
               <div class="stepper-grp">
                 <button type="button" class="step-btn" id="ptSheetMinusBtn">-</button>
-                <span class="step-val" id="ptSheetOffVal">跟全局</span>
+                <span class="step-val" id="ptSheetOffVal">按默认</span>
                 <button type="button" class="step-btn" id="ptSheetPlusBtn">+</button>
               </div>
             </div>
           </div>
+        </div>
 
-          <div>
-            <div class="sheet-field-label">4. 该节点钉钉文案时间格式</div>
-            <div class="mini-seg" id="pointMsgModeSeg" style="margin-bottom:6px;">
-              <button type="button" class="mini-seg-btn" data-val="default">跟全局</button>
-              <button type="button" class="mini-seg-btn" data-val="datetime">日期+时间</button>
-              <button type="button" class="mini-seg-btn" data-val="date_only">仅日期</button>
-              <button type="button" class="mini-seg-btn" data-val="none">不加日期</button>
-            </div>
-            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-              <div class="mini-seg" id="pointMsgOffSeg">
-                <button type="button" class="mini-seg-btn" data-val="default">跟全局</button>
-                <button type="button" class="mini-seg-btn" data-val="0">当天</button>
-                <button type="button" class="mini-seg-btn" data-val="-1">前1天</button>
+        <div id="pointNoDingtalkTip" class="point-preview-strip" style="display:none;color:var(--sub);">当前时间点只更新在线表格，不会往钉钉发图或发消息。</div>
+
+        <div id="pointDingtalkSettingsWrap" style="display:flex;flex-direction:column;gap:12px;">
+          <div class="point-grid-2">
+            <div>
+              <div class="sheet-field-label">
+                <span>发送提醒</span>
+                <span id="pointSilentDefaultSub" style="font-weight:400;margin-left:4px;font-size:11px;"></span>
               </div>
-              <div class="stepper-grp">
-                <button type="button" class="step-btn" id="ptMsgMinusBtn">-</button>
-                <span class="step-val" id="ptMsgOffVal">跟全局</span>
-                <button type="button" class="step-btn" id="ptMsgPlusBtn">+</button>
+              <div class="segmented segmented-3" id="pointSilentSeg">
+                <div class="seg-thumb" id="pointSilentThumb"></div>
+                <button class="seg-btn" type="button" data-val="default">按默认</button>
+                <button class="seg-btn" type="button" data-val="on">静音发送</button>
+                <button class="seg-btn" type="button" data-val="off">正常提醒</button>
+              </div>
+            </div>
+
+            <div>
+              <div class="sheet-field-label">群消息时间</div>
+              <div class="mini-seg" id="pointMsgModeSeg" style="margin-bottom:6px;">
+                <button type="button" class="mini-seg-btn" data-val="default">按默认</button>
+                <button type="button" class="mini-seg-btn" data-val="datetime">日期+时间</button>
+                <button type="button" class="mini-seg-btn" data-val="date_only">只发日期</button>
+                <button type="button" class="mini-seg-btn" data-val="none">不加时间</button>
+              </div>
+              <div id="pointMsgDateRow" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                <div class="mini-seg" id="pointMsgOffSeg">
+                  <button type="button" class="mini-seg-btn" data-val="default">按默认</button>
+                  <button type="button" class="mini-seg-btn" data-val="0">今天</button>
+                  <button type="button" class="mini-seg-btn" data-val="-1">昨天</button>
+                </div>
+                <div class="stepper-grp">
+                  <button type="button" class="step-btn" id="ptMsgMinusBtn">-</button>
+                  <span class="step-val" id="ptMsgOffVal">按默认</span>
+                  <button type="button" class="step-btn" id="ptMsgPlusBtn">+</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="ios-group" style="box-shadow:none;">
+            <div class="ios-row" style="min-height:42px;">
+              <div class="row-main">
+                <div class="row-title">单独修改结尾词</div>
+                <div class="row-sub" id="pointSufHint">不改时默认按全局设置；留空代表不加结尾词</div>
+              </div>
+              <label class="ios-switch sm"><input type="checkbox" id="pointCustomSufOn" /><span class="ios-slider"></span></label>
+            </div>
+            <div class="ios-row no-icon-sep" id="pointCustomSufWrap" style="display:none;min-height:42px;">
+              <div class="rule-input-box" style="width:100%;">
+                <input type="text" id="pointCustomSufInput" placeholder="输入结尾文字，留空代表不加结尾词" />
               </div>
             </div>
           </div>
         </div>
 
-        <div class="ios-group" style="box-shadow:none;">
-          <div class="ios-row" style="min-height:42px;">
-            <div class="row-main">
-              <div class="row-title">单独指定该点时间后缀</div>
-              <div class="row-sub" id="pointSufHint">开启后可覆盖全局/时段规则；留空即强制不加</div>
-            </div>
-            <label class="ios-switch sm"><input type="checkbox" id="pointCustomSufOn" /><span class="ios-slider"></span></label>
-          </div>
-          <div class="ios-row no-icon-sep" id="pointCustomSufWrap" style="display:none;min-height:42px;">
-            <div class="rule-input-box" style="width:100%;">
-              <input type="text" id="pointCustomSufInput" placeholder="输入该点后缀，留空代表强制不加后缀" />
-            </div>
-          </div>
-        </div>
-
-        <button class="danger-card-btn" id="pointResetBtn" type="button" style="box-shadow:none;">清除该点全部单独覆盖</button>
+        <button class="danger-card-btn" id="pointResetBtn" type="button" style="box-shadow:none;">恢复默认设置</button>
       </div>
     </div>
   </div>
@@ -5935,6 +5945,7 @@ let editingPointSilent = "default";
 let editingPtSheetOff = null;
 let editingPtMsgMode = "default";
 let editingPtMsgOff = null;
+let editingPointOrigOv = null;
 let lastRecSignature = "";
 let lastBusyState = false;
 let lastNativeHotkeys = [];
@@ -6010,9 +6021,17 @@ function clampOff(v, def = 0) {
 }
 function formatOffsetLabel(off) {
   const n = clampOff(off, 0);
-  if (n === 0) return "当天 (0)";
-  if (n < 0) return `前${Math.abs(n)}天 (${n})`;
-  return `后${n}天 (+${n})`;
+  if (n === 0) return "今天";
+  if (n === -1) return "昨天";
+  if (n === -2) return "前天";
+  if (n < -2) return `前${Math.abs(n)}天`;
+  if (n === 1) return "明天";
+  return `后${n}天`;
+}
+function formatShortMdLocal(dayOffset = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + clampOff(dayOffset, 0));
+  return `${d.getMonth() + 1}月${d.getDate()}日`;
 }
 function formatGapText(ih, im) {
   const h = Number(ih) || 0;
@@ -6037,6 +6056,30 @@ function slotsOverlap(s1, e1, s2, e2) {
     }
   }
   return false;
+}
+function isCaptureWindowAllowedLocal(hm) {
+  const cp = cfg && cfg.capture_plan ? cfg.capture_plan : {};
+  const enabled = (typeof $ === "function" && $("cpEnabled")) ? $("cpEnabled").checked : Boolean(cp.enabled);
+  if (!enabled) return true;
+  const wins = Array.isArray(cp.windows) ? cp.windows : [];
+  const curMin = slotMinutes(hm);
+  for (const w of wins) {
+    if (w && w.enabled !== false && inTimeWindowLocal(curMin, w.start || "09:00", w.end || "18:00", true)) {
+      return true;
+    }
+  }
+  return false;
+}
+function resolvePointActionStateLocal(hm, modeOverride = "default") {
+  const m = modeOverride || "default";
+  const gCap = (typeof $ === "function" && $("enableCapture")) ? $("enableCapture").checked : (cfg.enable_capture !== false);
+  const gDt = (typeof $ === "function" && $("enableDingtalk")) ? $("enableDingtalk").checked : Boolean(cfg.enable_dingtalk);
+  const allowed = isCaptureWindowAllowedLocal(hm);
+  const defaultCapture = Boolean(gCap && allowed);
+  const defaultDingtalk = Boolean(gDt && allowed && defaultCapture);
+  if (m === "send") return { doCapture: true, doDingtalk: true, defaultCapture, defaultDingtalk };
+  if (m === "table_only") return { doCapture: false, doDingtalk: false, defaultCapture, defaultDingtalk };
+  return { doCapture: defaultCapture, doDingtalk: defaultDingtalk, defaultCapture, defaultDingtalk };
 }
 function isRunDayAllowedLocal(c) {
   const mode = (c && c.day_mode) || "daily";
@@ -7058,68 +7101,88 @@ function renderTimetable(tt) {
     timeCol.appendChild(hmEl);
     timeCol.appendChild(perEl);
 
+    const rawOv = cfg.point_overrides && cfg.point_overrides[item.time];
+    const hasPointOv = Boolean(rawOv && !_isPointOverrideEmpty(rawOv));
+    const sOff = Number(item.sheet_offset_effective || 0);
+    const relDay = formatOffsetLabel(sOff);
+    const mdText = formatShortMdLocal(sOff);
+
     const badges = document.createElement("div");
     badges.className = "tt-badges";
-    const capPill = document.createElement("span");
-    capPill.className = `tt-pill ${item.do_capture ? "cap-on" : "off"}`;
-    capPill.textContent = item.do_capture ? "截图" : "不截";
-    badges.appendChild(capPill);
 
-    const dtPill = document.createElement("span");
-    dtPill.className = `tt-pill ${item.do_dingtalk ? "dt-on" : "off"}`;
-    dtPill.textContent = item.do_dingtalk ? (enabledTargetCount > 1 ? `发${enabledTargetCount}群` : "发钉钉") : "不发群";
-    badges.appendChild(dtPill);
+    if (item.do_dingtalk) {
+      const dtPill = document.createElement("span");
+      dtPill.className = "tt-pill dt-on";
+      dtPill.textContent = enabledTargetCount > 1 ? `发钉钉(${enabledTargetCount}群)` : "发钉钉";
+      badges.appendChild(dtPill);
 
-    const sOff = Number(item.sheet_offset_effective || 0);
-    if (sOff !== 0 || (cfg.point_overrides && cfg.point_overrides[item.time] && cfg.point_overrides[item.time].sheet_day_offset !== null && cfg.point_overrides[item.time].sheet_day_offset !== undefined)) {
       const shPill = document.createElement("span");
       shPill.className = "tt-pill date-on";
-      shPill.textContent = `表:${item.sheet_date_preview || ""} (${sOff === 0 ? "当天" : sOff + "天"})`;
+      shPill.textContent = `查${relDay} (${mdText})`;
+      badges.appendChild(shPill);
+
+      const msgPrev = String(item.msg_preview || "").trim();
+      const sufPill = document.createElement("span");
+      sufPill.className = "tt-pill suf-on";
+      sufPill.textContent = msgPrev ? `配文：${msgPrev}` : "配文：仅图片";
+      badges.appendChild(sufPill);
+    } else {
+      const noDtPill = document.createElement("span");
+      noDtPill.className = "tt-pill off";
+      noDtPill.textContent = item.do_capture ? "不发钉钉 · 只存图" : "不发钉钉 · 只更表";
+      badges.appendChild(noDtPill);
+
+      const shPill = document.createElement("span");
+      shPill.className = "tt-pill date-on";
+      shPill.textContent = `查${relDay} (${mdText})`;
       badges.appendChild(shPill);
     }
 
-    const msgPrev = String(item.msg_preview || "").trim();
-    const sufText = String(item.suffix || "").trim();
-    const sufPill = document.createElement("span");
-    sufPill.className = `tt-pill ${(sufText || item.msg_time_mode === "date_only" || Number(item.msg_day_offset || 0) !== 0) ? "suf-on" : "off"}`;
-    sufPill.textContent = msgPrev ? `文案:${msgPrev}` : (sufText ? `后缀:${sufText}` : "仅时间戳");
-    badges.appendChild(sufPill);
+    if (hasPointOv) {
+      const ovPill = document.createElement("span");
+      ovPill.className = "tt-pill off";
+      ovPill.textContent = "单独设";
+      badges.appendChild(ovPill);
+    }
 
     const rightCtrl = document.createElement("div");
     rightCtrl.className = "tt-right-ctrl";
-    const silWrap = document.createElement("div");
-    silWrap.className = "tt-sil-wrap" + (!item.do_dingtalk ? " muted-dim" : "");
-    silWrap.onclick = (e) => e.stopPropagation();
+    if (item.do_dingtalk) {
+      const silWrap = document.createElement("div");
+      silWrap.className = "tt-sil-wrap";
+      silWrap.onclick = (e) => e.stopPropagation();
 
-    const silLbl = document.createElement("span");
-    silLbl.className = "tt-sil-lbl" + (item.do_dingtalk && item.do_silent ? " sil" : "");
-    silLbl.textContent = !item.do_dingtalk ? "不发" : (item.do_silent ? "静音" : "常规");
+      const silLbl = document.createElement("span");
+      silLbl.className = "tt-sil-lbl" + (item.do_silent ? " sil" : "");
+      silLbl.textContent = item.do_silent ? "静音" : "提醒";
 
-    const silSw = document.createElement("label");
-    silSw.className = "ios-switch xs";
-    const silChk = document.createElement("input");
-    silChk.type = "checkbox";
-    silChk.checked = Boolean(item.do_silent);
-    silChk.onchange = () => {
-      if (!cfg.point_overrides) cfg.point_overrides = {};
-      const globalSil = $("dtSilentSend").checked;
-      const curOv = cfg.point_overrides[item.time] ? { ...cfg.point_overrides[item.time] } : { mode: "default", suffix: null, silent: null, sheet_day_offset: null, msg_time_mode: null, msg_day_offset: null };
-      curOv.silent = silChk.checked === globalSil ? null : silChk.checked;
-      if (_isPointOverrideEmpty(curOv)) delete cfg.point_overrides[item.time];
-      else cfg.point_overrides[item.time] = curOv;
-      scheduleSave(true);
-    };
-    const silSlider = document.createElement("span");
-    silSlider.className = "ios-slider";
-    silSw.appendChild(silChk);
-    silSw.appendChild(silSlider);
-    silWrap.appendChild(silLbl);
-    silWrap.appendChild(silSw);
+      const silSw = document.createElement("label");
+      silSw.className = "ios-switch xs";
+      const silChk = document.createElement("input");
+      silChk.type = "checkbox";
+      silChk.checked = Boolean(item.do_silent);
+      silChk.onchange = () => {
+        if (!cfg.point_overrides) cfg.point_overrides = {};
+        const globalSil = $("dtSilentSend").checked;
+        const curOv = cfg.point_overrides[item.time] ? { ...cfg.point_overrides[item.time] } : { mode: "default", suffix: null, silent: null, sheet_day_offset: null, msg_time_mode: null, msg_day_offset: null };
+        curOv.silent = silChk.checked === globalSil ? null : silChk.checked;
+        if (_isPointOverrideEmpty(curOv)) delete cfg.point_overrides[item.time];
+        else cfg.point_overrides[item.time] = curOv;
+        _applyOvToLiveTimetable(item.time, cfg.point_overrides[item.time] || null);
+        scheduleSave(true);
+      };
+      const silSlider = document.createElement("span");
+      silSlider.className = "ios-slider";
+      silSw.appendChild(silChk);
+      silSw.appendChild(silSlider);
+      silWrap.appendChild(silLbl);
+      silWrap.appendChild(silSw);
+      rightCtrl.appendChild(silWrap);
+    }
 
     const chevWrap = document.createElement("div");
     chevWrap.style.cssText = "display:flex;align-items:center;";
     chevWrap.innerHTML = SVG_CHEVRON;
-    rightCtrl.appendChild(silWrap);
     rightCtrl.appendChild(chevWrap);
 
     row.appendChild(timeCol);
@@ -7130,33 +7193,102 @@ function renderTimetable(tt) {
   });
 }
 
+function _applyOvToLiveTimetable(hm, ovObj) {
+  const livePt = Array.isArray(latestTimetable) ? latestTimetable.find((it) => it && it.time === hm) : null;
+  if (!livePt) return;
+  const ov = ovObj && typeof ovObj === "object" ? ovObj : {};
+  const mode = ov.mode || "default";
+  const act = resolvePointActionStateLocal(hm, mode);
+  livePt.override_mode = mode;
+  livePt.do_capture = act.doCapture;
+  livePt.do_dingtalk = act.doDingtalk;
+
+  const gSil = $("dtSilentSend") ? $("dtSilentSend").checked : (cfg.dt_silent_send !== false);
+  const silVal = typeof ov.silent === "boolean" ? ov.silent : null;
+  livePt.do_silent = (silVal !== null) ? silVal : gSil;
+  livePt.silent_override = silVal;
+
+  const dateItem = (ensureSummaryPresetsStruct().items || []).find((x) => x && x.enabled !== false && x.action === "today");
+  let sOff = 0;
+  if (ov.sheet_day_offset !== null && ov.sheet_day_offset !== undefined) sOff = clampOff(ov.sheet_day_offset, 0);
+  else if (dateItem) sOff = resolvePresetDayOffsetLocal(dateItem, hm).off;
+  const sFmt = dateItem ? (dateItem.date_fmt || "YYYY年M月D日") : "YYYY年M月D日";
+  livePt.sheet_offset_effective = sOff;
+  livePt.sheet_date_preview = formatShiftedDateLocal(sFmt, sOff);
+
+  const msgPrev = buildMessagePreviewLocal(hm);
+  livePt.suffix = msgPrev.suf;
+  livePt.has_custom_suffix = ov.suffix !== null && ov.suffix !== undefined;
+  livePt.msg_time_mode = msgPrev.tMode;
+  livePt.msg_day_offset = msgPrev.dOff;
+  livePt.msg_preview = msgPrev.text;
+  renderTimetable(latestTimetable);
+}
+
+function _syncEditingPointLive(immediateSave = false) {
+  if (!editingPointHm) return;
+  if (!cfg.point_overrides) cfg.point_overrides = {};
+  const hasCustom = $("pointCustomSufOn").checked;
+  const silVal = editingPointSilent === "on" ? true : (editingPointSilent === "off" ? false : null);
+  const sufVal = hasCustom ? $("pointCustomSufInput").value.trim() : null;
+  const msgModeVal = editingPtMsgMode === "default" ? null : editingPtMsgMode;
+  const ovObj = {
+    mode: editingPointMode,
+    suffix: sufVal,
+    silent: silVal,
+    sheet_day_offset: editingPtSheetOff,
+    msg_time_mode: msgModeVal,
+    msg_day_offset: editingPtMsgOff,
+  };
+  if (_isPointOverrideEmpty(ovObj)) delete cfg.point_overrides[editingPointHm];
+  else cfg.point_overrides[editingPointHm] = ovObj;
+  _applyOvToLiveTimetable(editingPointHm, cfg.point_overrides[editingPointHm] || null);
+  scheduleSave(immediateSave);
+}
+
 function _refreshPointModalPreview() {
   if (!editingPointHm) return;
+  const actState = resolvePointActionStateLocal(editingPointHm, editingPointMode);
+  if ($("pointModeDefaultSub")) {
+    $("pointModeDefaultSub").textContent = `默认：${actState.defaultDingtalk ? "发钉钉" : "不发钉钉"}`;
+  }
+  if ($("pointActionPrevText")) {
+    $("pointActionPrevText").textContent = actState.doDingtalk ? "更新表格 + 发钉钉" : "只更新表格（不发钉钉）";
+  }
+
   // 表格日期预览
   const dateItem = (ensureSummaryPresetsStruct().items || []).find((x) => x && x.enabled !== false && x.action === "today");
   let sOff = 0;
-  let sSrc = "全局";
+  let sSrc = "按默认";
   if (editingPtSheetOff !== null && editingPtSheetOff !== undefined) {
     sOff = clampOff(editingPtSheetOff, 0);
-    sSrc = "该点单独设定";
+    sSrc = "单独设";
   } else if (dateItem) {
     const r = resolvePresetDayOffsetLocal(dateItem, editingPointHm);
     sOff = r.off;
     sSrc = r.src;
   }
   const sFmt = dateItem ? (dateItem.date_fmt || "YYYY年M月D日") : "YYYY年M月D日";
-  $("pointSheetPrevText").textContent = `${formatShiftedDateLocal(sFmt, sOff)}（${formatOffsetLabel(sOff)} · ${sSrc}）`;
+  $("pointSheetPrevText").textContent = `${formatOffsetLabel(sOff)} · ${formatShiftedDateLocal(sFmt, sOff)}（${sSrc}）`;
 
-  // 钉钉文案预览
+  // 根据本轮是否发钉钉动态显隐群消息/静音等钉钉专属区域
+  if ($("pointMsgPrevRow")) $("pointMsgPrevRow").style.display = actState.doDingtalk ? "block" : "none";
+  if ($("pointDingtalkSettingsWrap")) $("pointDingtalkSettingsWrap").style.display = actState.doDingtalk ? "flex" : "none";
+  if ($("pointNoDingtalkTip")) $("pointNoDingtalkTip").style.display = actState.doDingtalk ? "none" : "block";
+
+  // 钉钉文案预览与提醒方式
+  const gSil = $("dtSilentSend") ? $("dtSilentSend").checked : true;
+  const effSil = editingPointSilent === "on" ? true : (editingPointSilent === "off" ? false : gSil);
   const baseTp = resolveDingtalkTimeLocal(editingPointHm);
   const mMode = editingPtMsgMode === "default" ? (cfg.dt_time_mode || "datetime") : editingPtMsgMode;
+  if ($("pointMsgDateRow")) $("pointMsgDateRow").style.display = (mMode === "none") ? "none" : "flex";
   const mOff = (editingPtMsgOff !== null && editingPtMsgOff !== undefined) ? clampOff(editingPtMsgOff, 0) : baseTp.dOff;
   const datePart = formatShiftedDateLocal(baseTp.dFmt, mOff);
   const stamp = mMode === "datetime" ? `${datePart} ${editingPointHm}` : (mMode === "date_only" ? datePart : "");
   const hasSuf = $("pointCustomSufOn").checked;
   const sufVal = hasSuf ? $("pointCustomSufInput").value.trim() : resolveSuffixByRulesOnly(editingPointHm).suf;
   const full = [stamp, sufVal].filter(Boolean).join(" ") || datePart;
-  $("pointMsgPrevText").textContent = `「${full}」`;
+  $("pointMsgPrevText").textContent = `「${full}」 · ${effSil ? "静音发送" : "正常提醒"}`;
 
   // 更新按钮选中高亮与步进示数
   for (const b of $("pointSheetOffSeg").querySelectorAll(".mini-seg-btn")) {
@@ -7164,7 +7296,7 @@ function _refreshPointModalPreview() {
     const active = v === "default" ? (editingPtSheetOff === null) : (editingPtSheetOff !== null && Number(v) === editingPtSheetOff);
     b.classList.toggle("active", active);
   }
-  $("ptSheetOffVal").textContent = editingPtSheetOff === null ? "跟全局" : formatOffsetLabel(editingPtSheetOff);
+  $("ptSheetOffVal").textContent = editingPtSheetOff === null ? "按默认" : formatOffsetLabel(editingPtSheetOff);
 
   for (const b of $("pointMsgModeSeg").querySelectorAll(".mini-seg-btn")) {
     b.classList.toggle("active", b.dataset.val === editingPtMsgMode);
@@ -7174,19 +7306,22 @@ function _refreshPointModalPreview() {
     const active = v === "default" ? (editingPtMsgOff === null) : (editingPtMsgOff !== null && Number(v) === editingPtMsgOff);
     b.classList.toggle("active", active);
   }
-  $("ptMsgOffVal").textContent = editingPtMsgOff === null ? "跟全局" : formatOffsetLabel(editingPtMsgOff);
+  $("ptMsgOffVal").textContent = editingPtMsgOff === null ? "按默认" : formatOffsetLabel(editingPtMsgOff);
 }
 
 function openPointModal(item) {
   editingPointHm = item.time;
-  $("pointSheetTitle").textContent = `调整 ${item.time} 执行与日期策略`;
+  $("pointSheetTitle").textContent = `${item.time} 时间点设置`;
   const ov = (cfg.point_overrides && cfg.point_overrides[item.time]) || {};
+  editingPointOrigOv = cfg.point_overrides && cfg.point_overrides[item.time]
+    ? JSON.parse(JSON.stringify(cfg.point_overrides[item.time]))
+    : null;
   editingPointMode = ov.mode || "default";
   applySegmented("pointModeSeg", "pointModeThumb", editingPointMode);
 
   editingPointSilent = ov.silent === true ? "on" : (ov.silent === false ? "off" : "default");
   applySegmented("pointSilentSeg", "pointSilentThumb", editingPointSilent);
-  $("pointSilentDefaultSub").textContent = "全局：" + ($("dtSilentSend").checked ? "静音" : "常规");
+  $("pointSilentDefaultSub").textContent = "默认：" + ($("dtSilentSend").checked ? "静音发送" : "正常提醒");
 
   editingPtSheetOff = (ov.sheet_day_offset !== null && ov.sheet_day_offset !== undefined) ? clampOff(ov.sheet_day_offset, 0) : null;
   editingPtMsgMode = ["datetime", "date_only", "none"].includes(ov.msg_time_mode) ? ov.msg_time_mode : "default";
@@ -7194,8 +7329,8 @@ function openPointModal(item) {
 
   const baseRes = resolveSuffixByRulesOnly(item.time);
   $("pointSufHint").textContent = baseRes.suf
-    ? `不单独指定时将使用：「${baseRes.suf}」（${baseRes.src}）`
-    : "当前全局与时段规则均未给该点配置后缀";
+    ? `不单独修改时将使用：「${baseRes.suf}」`
+    : "不单独修改时按默认（无结尾词）";
 
   const hasCustom = ov.suffix !== undefined && ov.suffix !== null;
   $("pointCustomSufOn").checked = hasCustom;
@@ -7300,7 +7435,7 @@ function updateSummaries() {
   const curHm = hmStr(now.getHours(), now.getMinutes());
   const prev = buildMessagePreviewLocal(curHm);
   const modeLbl = prev.tMode === "datetime" ? "日期+时间" : (prev.tMode === "date_only" ? "仅发日期" : "不加日期");
-  const offLbl = prev.dOff === 0 ? "当天" : `${prev.dOff}天`;
+  const offLbl = formatOffsetLabel(prev.dOff);
   $("msgPreview").textContent = `此刻(${curHm})钉钉气泡预览：「${prev.text}」（${modeLbl} · ${offLbl}）`;
 
   const policyParts = [];
@@ -8297,57 +8432,105 @@ function bindEvents() {
     onConfirm(h, m);
   };
 
-  // 单点微调弹窗事件
+  // 单点设置弹窗事件（点击即刻刷新弹窗本身与背后的排期列表）
   for (const btn of $("pointModeSeg").querySelectorAll(".seg-btn")) {
-    btn.onclick = () => { editingPointMode = btn.dataset.val; applySegmented("pointModeSeg", "pointModeThumb", editingPointMode); };
+    btn.onclick = () => {
+      editingPointMode = btn.dataset.val;
+      applySegmented("pointModeSeg", "pointModeThumb", editingPointMode);
+      _refreshPointModalPreview();
+      _syncEditingPointLive(true);
+    };
   }
   for (const btn of $("pointSilentSeg").querySelectorAll(".seg-btn")) {
-    btn.onclick = () => { editingPointSilent = btn.dataset.val; applySegmented("pointSilentSeg", "pointSilentThumb", editingPointSilent); };
+    btn.onclick = () => {
+      editingPointSilent = btn.dataset.val;
+      applySegmented("pointSilentSeg", "pointSilentThumb", editingPointSilent);
+      _refreshPointModalPreview();
+      _syncEditingPointLive(true);
+    };
   }
   for (const b of $("pointSheetOffSeg").querySelectorAll(".mini-seg-btn")) {
-    b.onclick = () => { editingPtSheetOff = b.dataset.val === "default" ? null : Number(b.dataset.val); _refreshPointModalPreview(); };
+    b.onclick = () => {
+      editingPtSheetOff = b.dataset.val === "default" ? null : Number(b.dataset.val);
+      _refreshPointModalPreview();
+      _syncEditingPointLive(true);
+    };
   }
-  $("ptSheetMinusBtn").onclick = () => { editingPtSheetOff = clampOff((editingPtSheetOff === null ? 0 : editingPtSheetOff) - 1, -1); _refreshPointModalPreview(); };
-  $("ptSheetPlusBtn").onclick = () => { editingPtSheetOff = clampOff((editingPtSheetOff === null ? 0 : editingPtSheetOff) + 1, 0); _refreshPointModalPreview(); };
+  $("ptSheetMinusBtn").onclick = () => {
+    editingPtSheetOff = clampOff((editingPtSheetOff === null ? 0 : editingPtSheetOff) - 1, -1);
+    _refreshPointModalPreview();
+    _syncEditingPointLive(true);
+  };
+  $("ptSheetPlusBtn").onclick = () => {
+    editingPtSheetOff = clampOff((editingPtSheetOff === null ? 0 : editingPtSheetOff) + 1, 0);
+    _refreshPointModalPreview();
+    _syncEditingPointLive(true);
+  };
 
   for (const b of $("pointMsgModeSeg").querySelectorAll(".mini-seg-btn")) {
-    b.onclick = () => { editingPtMsgMode = b.dataset.val; _refreshPointModalPreview(); };
+    b.onclick = () => {
+      editingPtMsgMode = b.dataset.val;
+      _refreshPointModalPreview();
+      _syncEditingPointLive(true);
+    };
   }
   for (const b of $("pointMsgOffSeg").querySelectorAll(".mini-seg-btn")) {
-    b.onclick = () => { editingPtMsgOff = b.dataset.val === "default" ? null : Number(b.dataset.val); _refreshPointModalPreview(); };
+    b.onclick = () => {
+      editingPtMsgOff = b.dataset.val === "default" ? null : Number(b.dataset.val);
+      _refreshPointModalPreview();
+      _syncEditingPointLive(true);
+    };
   }
-  $("ptMsgMinusBtn").onclick = () => { editingPtMsgOff = clampOff((editingPtMsgOff === null ? 0 : editingPtMsgOff) - 1, -1); _refreshPointModalPreview(); };
-  $("ptMsgPlusBtn").onclick = () => { editingPtMsgOff = clampOff((editingPtMsgOff === null ? 0 : editingPtMsgOff) + 1, 0); _refreshPointModalPreview(); };
+  $("ptMsgMinusBtn").onclick = () => {
+    editingPtMsgOff = clampOff((editingPtMsgOff === null ? 0 : editingPtMsgOff) - 1, -1);
+    _refreshPointModalPreview();
+    _syncEditingPointLive(true);
+  };
+  $("ptMsgPlusBtn").onclick = () => {
+    editingPtMsgOff = clampOff((editingPtMsgOff === null ? 0 : editingPtMsgOff) + 1, 0);
+    _refreshPointModalPreview();
+    _syncEditingPointLive(true);
+  };
 
   $("pointCustomSufOn").addEventListener("change", () => {
     $("pointCustomSufWrap").style.display = $("pointCustomSufOn").checked ? "flex" : "none";
     _refreshPointModalPreview();
+    _syncEditingPointLive(true);
   });
-  $("pointCustomSufInput").addEventListener("input", () => _refreshPointModalPreview());
-  $("pointCancel").onclick = () => $("pointMask").classList.remove("show");
-  $("pointMask").onclick = (e) => { if (e.target === $("pointMask")) $("pointMask").classList.remove("show"); };
-  $("pointDone").onclick = () => {
-    if (!editingPointHm) return;
-    if (!cfg.point_overrides) cfg.point_overrides = {};
-    const hasCustom = $("pointCustomSufOn").checked;
-    const silVal = editingPointSilent === "on" ? true : (editingPointSilent === "off" ? false : null);
-    const sufVal = hasCustom ? $("pointCustomSufInput").value.trim() : null;
-    const msgModeVal = editingPtMsgMode === "default" ? null : editingPtMsgMode;
-    const ovObj = {
-      mode: editingPointMode,
-      suffix: sufVal,
-      silent: silVal,
-      sheet_day_offset: editingPtSheetOff,
-      msg_time_mode: msgModeVal,
-      msg_day_offset: editingPtMsgOff,
-    };
-    if (_isPointOverrideEmpty(ovObj)) delete cfg.point_overrides[editingPointHm];
-    else cfg.point_overrides[editingPointHm] = ovObj;
+  $("pointCustomSufInput").addEventListener("input", () => {
+    _refreshPointModalPreview();
+    _syncEditingPointLive(false);
+  });
+  $("pointCancel").onclick = () => {
+    if (editingPointHm) {
+      if (!cfg.point_overrides) cfg.point_overrides = {};
+      if (editingPointOrigOv && !_isPointOverrideEmpty(editingPointOrigOv)) {
+        cfg.point_overrides[editingPointHm] = JSON.parse(JSON.stringify(editingPointOrigOv));
+      } else {
+        delete cfg.point_overrides[editingPointHm];
+      }
+      _applyOvToLiveTimetable(editingPointHm, cfg.point_overrides[editingPointHm] || null);
+      scheduleSave(true);
+    }
+    editingPointHm = "";
+    editingPointOrigOv = null;
     $("pointMask").classList.remove("show");
-    scheduleSave(true);
   };
+  const finishPointModal = () => {
+    if (editingPointHm) _syncEditingPointLive(true);
+    editingPointHm = "";
+    editingPointOrigOv = null;
+    $("pointMask").classList.remove("show");
+  };
+  $("pointMask").onclick = (e) => { if (e.target === $("pointMask")) finishPointModal(); };
+  $("pointDone").onclick = finishPointModal;
   $("pointResetBtn").onclick = () => {
-    if (editingPointHm && cfg.point_overrides) delete cfg.point_overrides[editingPointHm];
+    if (editingPointHm && cfg.point_overrides) {
+      delete cfg.point_overrides[editingPointHm];
+      _applyOvToLiveTimetable(editingPointHm, null);
+    }
+    editingPointHm = "";
+    editingPointOrigOv = null;
     $("pointMask").classList.remove("show");
     scheduleSave(true);
   };
