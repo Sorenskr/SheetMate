@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.8.1 多端协同控制中心界面、动态昼夜光效与全球加密远程调度后端。"""
+"""SheetMate v2.8.2 多端协同控制中心界面、动态昼夜光效与全球远程调度后端。"""
 
 import copy
 import ctypes
@@ -4395,9 +4395,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.8.1" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.8.2" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.8.1</span>
+          <span class="ver-pill" id="verBadge">v2.8.2</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -4760,11 +4760,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
               <div class="remote-guide-strip" id="remoteGuideStrip">
                 <div style="flex:1;min-width:0;">
-                  <strong>全球加密远程沟通：</strong>出门用手机或异地电脑打开 <code>https://sorenskr.github.io/SheetMate/</code>，输入本机唯一昵称与远程密码即可跨网对话和指挥跑表。
+                  <strong>手机远程连电脑：</strong>出门用手机打开 <code>https://sorenskr.github.io/SheetMate/</code>，填上您的名字和远程密码，就能跟电脑聊天查数据、遥控自动跑表。
                 </div>
                 <div style="display:flex;gap:5px;flex-shrink:0;">
                   <button type="button" class="mini-pill active" id="copyGithubGuideBtn">复制网址</button>
-                  <button type="button" class="mini-pill" id="openMobileGuideModalBtn">扫码/改密</button>
+                  <button type="button" class="mini-pill" id="openMobileGuideModalBtn">扫码/改密码</button>
                 </div>
               </div>
 
@@ -5560,49 +5560,49 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- 0. 全球远程网址、密码与实时同步扫码弹窗 -->
+  <!-- 0. 手机 / 外地远程连这台电脑 -->
   <div class="modal-mask" id="mobileBridgeModalMask">
     <div class="card-modal" style="width:min(680px,95vw);">
       <div class="modal-head">
-        <div class="modal-title">全球远程控制网站与安全密码</div>
+        <div class="modal-title">手机或外地远程连这台电脑</div>
         <button class="mini-pill" id="mobileModalCloseBtn" type="button">关闭</button>
       </div>
       <div class="modal-scroll">
         <div style="font-size:12.5px;color:var(--sub);line-height:1.55;background:var(--fill-2);border:0.5px solid var(--sep);border-radius:12px;padding:9px 11px;">
-          <strong style="color:var(--text);">出门怎么远程用电脑助手：</strong>
-          手机或另一台电脑打开下方网站，输入您在右上角设好的<strong>唯一名字</strong>和<strong>访问密码</strong>，即可端到端加密聊天、查数及遥控跑表发钉钉，消息双向实时同步。
+          <strong style="color:var(--text);">大白话使用说明：</strong>
+          出门在外时，用手机扫左边二维码（或直接打开右边网址），填上您在右上角起的<strong>名字</strong>和下方设置的<strong>远程密码</strong>，就能用手机跟这台电脑聊天查数据、遥控跑表发钉钉，两边的消息实时同步。
         </div>
         <div style="display:grid;grid-template-columns:196px 1fr;gap:14px;align-items:start;">
           <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:16px;padding:10px;display:flex;flex-direction:column;align-items:center;gap:6px;">
             <div id="mobileQrBox" style="width:174px;height:174px;display:flex;align-items:center;justify-content:center;border-radius:10px;overflow:hidden;background:#FFFFFF;"></div>
-            <div style="font-size:11px;color:var(--sub);text-align:center;" id="mobileQrCaption">手机扫码直接打开远程网站</div>
+            <div style="font-size:11px;color:var(--sub);text-align:center;" id="mobileQrCaption">手机微信或相机扫码就能打开</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:10px;">
             <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:13px;padding:10px;display:flex;flex-direction:column;gap:6px;">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
-                <span style="font-size:12px;font-weight:700;">1. 全球永久网址（随时随地跨网直达）</span>
-                <span class="ver-pill" id="cloudRelayStatusBadge" style="background:rgba(40,205,65,0.14);color:var(--green);">加密待命</span>
+                <span style="font-size:12px;font-weight:700;">1. 远程网址（手机或外地电脑都能打开）</span>
+                <span class="ver-pill" id="cloudRelayStatusBadge" style="background:rgba(40,205,65,0.14);color:var(--green);">已联网就绪</span>
               </div>
               <div style="display:flex;gap:6px;align-items:center;">
                 <input type="text" id="mobileGithubUrlInput" class="small-input" style="flex:1;" readonly value="https://sorenskr.github.io/SheetMate/" />
                 <button type="button" class="mini-pill active" id="copyMobileGithubBtn">复制</button>
                 <button type="button" class="mini-pill" id="openMobileGithubBtn">打开</button>
               </div>
-              <div style="font-size:11px;color:var(--sub);" id="mobileCloudRelayTip">电脑联网状态下自动开启加密远程待命。</div>
+              <div style="font-size:11px;color:var(--sub);" id="mobileCloudRelayTip">电脑连着网就一直在线待命，外地打开就能直接连。</div>
             </div>
             <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:13px;padding:10px;display:flex;flex-direction:column;gap:6px;">
-              <div style="font-size:12px;font-weight:700;">2. 远程访问密码（必填 · 自己与他人均须校验）</div>
+              <div style="font-size:12px;font-weight:700;">2. 远程密码（默认是 admin，大家可随时自己改）</div>
               <div style="display:flex;gap:6px;align-items:center;">
-                <input type="password" id="mobilePinInput" class="small-input" style="flex:1;" placeholder="输入非空远程访问密码" />
-                <button type="button" class="eye-btn" id="toggleMobilePinEyeBtn" title="显示/隐藏访问密码" style="flex-shrink:0;">
+                <input type="password" id="mobilePinInput" class="small-input" style="flex:1;" placeholder="输入自己想设的新远程密码" />
+                <button type="button" class="eye-btn" id="toggleMobilePinEyeBtn" title="显示或隐藏密码" style="flex-shrink:0;">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                 </button>
-                <button type="button" class="pill-action-btn primary" id="saveMobilePinBtn" style="padding:5px 12px;font-size:12px;">保存密码</button>
+                <button type="button" class="pill-action-btn primary" id="saveMobilePinBtn" style="padding:5px 12px;font-size:12px;">保存新密码</button>
               </div>
-              <div style="font-size:11px;color:var(--sub);" id="mobilePinHint">已默认圆点遮盖显示；保存后即时生效并参与跨网端到端加密。</div>
+              <div style="font-size:11px;color:var(--sub);" id="mobilePinHint">为了安全，不管您自己还是别人从网站连这台电脑，都要输对这里设置的密码。</div>
             </div>
             <details class="collab-collapse">
-              <summary>备用：同 Wi-Fi 局域网直连（一般无需使用）</summary>
+              <summary>同办公室 Wi-Fi 备用网址（平时不用管）</summary>
               <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">
                 <div style="display:flex;gap:6px;align-items:center;">
                   <input type="text" id="mobileLanUrlInput" class="small-input" style="flex:1;" readonly />
@@ -5610,11 +5610,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   <button type="button" class="mini-pill" id="openMobileWebBtn">预览</button>
                 </div>
                 <div style="display:flex;gap:6px;align-items:center;">
-                  <input type="text" id="mobilePublicUrlInput" class="small-input" style="flex:1;" readonly placeholder="可选：点击右侧开启临时公网通道" />
-                  <button type="button" class="mini-pill" id="toggleMobileTunnelBtn">开启临时隧道</button>
+                  <input type="text" id="mobilePublicUrlInput" class="small-input" style="flex:1;" readonly placeholder="可选：临时外网备用链接" />
+                  <button type="button" class="mini-pill" id="toggleMobileTunnelBtn">开启备用链接</button>
                   <button type="button" class="mini-pill" id="copyMobilePublicBtn" style="display:none;">复制</button>
                 </div>
-                <div style="font-size:11px;color:var(--sub);" id="mobileTunnelStatusTip">通常直接访问上方全球永久网址即可，无需启用隧道。</div>
+                <div style="font-size:11px;color:var(--sub);" id="mobileTunnelStatusTip">一般直接用上面的全球远程网址就行，不用单独开这个。</div>
               </div>
             </details>
           </div>
@@ -5726,9 +5726,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button class="mini-pill" id="adminAuthCloseBtn" type="button">取消</button>
       </div>
       <div class="modal-scroll">
-        <div style="font-size:12px;color:var(--sub);">已触发隐藏总管入口。请输入管理员口令与密码进入后台中心（初始口令 <code style="color:var(--blue);">admin</code>，密码 <code style="color:var(--blue);">888888</code>）。</div>
-        <input type="password" id="adminPasscodeInput" class="small-input" style="padding:8px 11px;font-size:13px;" placeholder="管理员口令（默认 admin）" />
-        <input type="password" id="adminPasswordInput" class="small-input" style="padding:8px 11px;font-size:13px;" placeholder="管理员密码（默认 888888）" />
+        <div style="font-size:12px;color:var(--sub);">已进入超级管理员入口，请输入口令与密码验证。</div>
+        <input type="password" id="adminPasscodeInput" class="small-input" style="padding:8px 11px;font-size:13px;" placeholder="管理员口令" />
+        <input type="password" id="adminPasswordInput" class="small-input" style="padding:8px 11px;font-size:13px;" placeholder="管理员密码" />
       </div>
       <div class="modal-foot">
         <button type="button" class="pill-action-btn primary" id="adminLoginBtn">解锁总管后台</button>
@@ -9129,30 +9129,30 @@ function bindTeamCollabAndAdminEvents() {
     }
     if ($("cloudRelayStatusBadge") && $("mobileCloudRelayTip")) {
       if (!info.local_nick) {
-        $("cloudRelayStatusBadge").textContent = "待设昵称";
+        $("cloudRelayStatusBadge").textContent = "先起名字";
         $("cloudRelayStatusBadge").style.color = "var(--orange)";
         $("cloudRelayStatusBadge").style.background = "rgba(255,159,10,0.14)";
-        $("mobileCloudRelayTip").textContent = "请先在右上角起好唯一名字，全球远程中继将立即自动上线。";
+        $("mobileCloudRelayTip").textContent = "请先在软件右上角起好名字，之后手机打开网址填这个名字就能连。";
       } else if (info.cloud_relay_connected) {
-        $("cloudRelayStatusBadge").textContent = "云端已连通";
+        $("cloudRelayStatusBadge").textContent = "已联网就绪";
         $("cloudRelayStatusBadge").style.color = "var(--green)";
         $("cloudRelayStatusBadge").style.background = "rgba(40,205,65,0.14)";
-        $("mobileCloudRelayTip").textContent = `已实时连线！远端打开网站输入「${info.local_nick}」与密码即可加密控制。`;
+        $("mobileCloudRelayTip").textContent = `已连好！在手机打开网址填「${info.local_nick}」和下方密码就能连上这台电脑。`;
       } else {
-        $("cloudRelayStatusBadge").textContent = "连线中";
+        $("cloudRelayStatusBadge").textContent = "联网中";
         $("cloudRelayStatusBadge").style.color = "var(--blue)";
         $("cloudRelayStatusBadge").style.background = "var(--pill-blue)";
-        $("mobileCloudRelayTip").textContent = info.cloud_relay_error || "正在后台握手端到端加密云中继…";
+        $("mobileCloudRelayTip").textContent = info.cloud_relay_error || "正在连接网络，请稍等几秒…";
       }
     }
     if ($("toggleMobileTunnelBtn")) {
-      $("toggleMobileTunnelBtn").textContent = info.tunnel_running ? "关闭临时隧道" : "开启临时隧道";
+      $("toggleMobileTunnelBtn").textContent = info.tunnel_running ? "关闭备用链接" : "开启备用链接";
       $("toggleMobileTunnelBtn").className = "mini-pill " + (info.tunnel_running ? "danger" : "");
     }
     if ($("mobileTunnelStatusTip")) {
       $("mobileTunnelStatusTip").textContent = pub
-        ? `临时隧道已打通：${pub}`
-        : (info.tunnel_error || (info.tunnel_running ? "正在建立临时外网隧道，请稍等 2~5 秒…" : "通常直接访问上方全球永久网址即可，无需启用隧道。"));
+        ? `临时链接已通：${pub}`
+        : (info.tunnel_error || (info.tunnel_running ? "正在开通临时链接，请等 2~5 秒…" : "一般直接用上面的全球远程网址就行，不用单独开这个。"));
     }
     if (info.tunnel_running && !pub) {
       clearTimeout(mobileTunnelPollTimer);
@@ -9177,7 +9177,7 @@ function bindTeamCollabAndAdminEvents() {
     $("copyGithubGuideBtn").onclick = async () => {
       try {
         await navigator.clipboard.writeText("https://sorenskr.github.io/SheetMate/");
-        showToast("已复制全球远程网址，打开后输入本机唯一昵称与远程密码即可连接");
+        showToast("已复制远程网址，打开后填好名字和密码就能连电脑");
       } catch (_e) {}
     };
   }
@@ -9191,7 +9191,7 @@ function bindTeamCollabAndAdminEvents() {
     $("copyMobileGithubBtn").onclick = async () => {
       const v = $("mobileGithubUrlInput").value.trim();
       if (!v) return;
-      try { await navigator.clipboard.writeText(v); showToast("已复制 GitHub 全球永久远程网址"); } catch (_e) {}
+      try { await navigator.clipboard.writeText(v); showToast("已复制远程网址"); } catch (_e) {}
     };
   }
   if ($("openMobileGithubBtn")) {
@@ -9210,14 +9210,14 @@ function bindTeamCollabAndAdminEvents() {
     $("copyMobileLanBtn").onclick = async () => {
       const v = $("mobileLanUrlInput").value.trim();
       if (!v) return;
-      try { await navigator.clipboard.writeText(v); showToast("已复制手机局域网网址"); } catch (_e) {}
+      try { await navigator.clipboard.writeText(v); showToast("已复制同 Wi-Fi 备用网址"); } catch (_e) {}
     };
   }
   if ($("copyMobilePublicBtn")) {
     $("copyMobilePublicBtn").onclick = async () => {
       const v = $("mobilePublicUrlInput").value.trim();
       if (!v) return;
-      try { await navigator.clipboard.writeText(v); showToast("已复制 4G/5G 临时外网网址"); } catch (_e) {}
+      try { await navigator.clipboard.writeText(v); showToast("已复制临时备用链接"); } catch (_e) {}
     };
   }
   if ($("openMobileWebBtn")) {
@@ -9229,7 +9229,7 @@ function bindTeamCollabAndAdminEvents() {
   if ($("toggleMobileTunnelBtn")) {
     $("toggleMobileTunnelBtn").onclick = async () => {
       const isOff = $("toggleMobileTunnelBtn").textContent.includes("开启");
-      showToast(isOff ? "正在为您打通临时外网隧道…" : "正在关闭临时外网隧道…");
+      showToast(isOff ? "正在开通临时备用链接…" : "正在关闭备用链接…");
       const res = await api("/api/mobile-bridge/tunnel", "POST", { enable: isOff });
       renderMobileBridgeModal(res);
       if (res && res.message) showToast(res.message);
@@ -9239,12 +9239,12 @@ function bindTeamCollabAndAdminEvents() {
     $("saveMobilePinBtn").onclick = async () => {
       const newPin = $("mobilePinInput").value.trim();
       if (!newPin) {
-        showToast("远程访问密码不能为空，必须设置保护密码");
+        showToast("密码不能为空，请输入自己想设的新密码");
         return;
       }
       const r = await api("/api/mobile-bridge/tunnel", "POST", { action: "pin_only", pin: newPin });
       renderMobileBridgeModal(r);
-      showToast((r && r.message) || "已更新远程访问密码，自己与他人都须输入新密码才能进入");
+      showToast((r && r.message) || "新远程密码已保存！以后连这台电脑都要输这个新密码");
     };
   }
 

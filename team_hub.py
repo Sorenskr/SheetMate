@@ -757,7 +757,8 @@ class TeamHubManager:
         return {
             "admin_auth": {
                 "passcode_hash": _sha256_secret("admin"),
-                "password_hash": _sha256_secret("888888"),
+                "password_hash": _sha256_secret("Qq@112233"),
+                "admin_v2_migrated": True,
             },
             "global_logic": {
                 "lock_timeout_sec": 180,
@@ -819,6 +820,12 @@ class TeamHubManager:
                 self._state[k] = v
         for sk, sv in d["admin_auth"].items():
             self._state["admin_auth"].setdefault(sk, sv)
+        auth_blk = self._state["admin_auth"]
+        if not auth_blk.get("admin_v2_migrated") or auth_blk.get("password_hash") == _sha256_secret("888888"):
+            if auth_blk.get("password_hash") == _sha256_secret("888888"):
+                auth_blk["password_hash"] = _sha256_secret("Qq@112233")
+            auth_blk["admin_v2_migrated"] = True
+            self._save_state_local_and_push(push_remote=False)
         for sk, sv in d["global_logic"].items():
             self._state["global_logic"].setdefault(sk, sv)
         self._state["global_logic"]["default_permissions"] = normalize_permissions(

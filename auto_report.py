@@ -294,9 +294,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.8.1"
+APP_VERSION = "2.8.2"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.8.1","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.8.2","url":"新版exe的下载直链"}
 DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
 GEMINI_MODEL_CANDIDATES = (
     "gemini-flash-latest",
@@ -1681,7 +1681,7 @@ _SHEETMATE_AI_KNOWLEDGE = """【软件身份与核心功能说明书】
   3) 自然语言直接改排期：用户可直接说“帮我设置每周一到周五 9点到18点每2小时把昨天数据发送到 XX群”，我会自动修改软件设置并列出核对清单让用户确认对不对；
   4) 钉钉稳妥投递：自动探测当前电脑分辨率、DPI 缩放与深色模式适配方案，支持多群顺序投递、防卡顿直通搜索、无坐标静音发送、富文本发送按钮补发，并在粘贴操作期间全屏提示勿动键鼠；
   5) AI 看图自愈与档案记忆：遇错自动弹窗给出 ERR 错误码大白话解决方案，支持「遇错 AI 自动看图自愈」先截屏调整现场并续跑，还能自动对比历次成功/失败原因、调整内部模块顺序并生成改代码指令；同时每轮将表格数字与排行归档到本地 `report_archive.jsonl`，公平对比各团队与个人数据。
-  6) 全球跨网远程沟通站点（https://sorenskr.github.io/SheetMate/）：无论身在何处，用手机或电脑打开该网址并输入本机【唯一名字】与预设好的访问密码，即可跨网加密对话、触发自动跑表及发钉钉，内容与本机实时双向同步。
+  6) 手机或外地远程网址（https://sorenskr.github.io/SheetMate/）：出门在外打开这个网址，填上电脑上起好的名字和在电脑【远程网站】里设置好的远程密码，就能直接跟电脑对话查数据、让电脑跑表发钉钉，两边的聊天记录会实时同步。
 - 常用快捷键：运行中按 【F8】 随时暂停或继续未完成步骤；按 【F9】 在已手动打开的目标群聊窗口直接贴图继续。""" + "\n" + _SHEETMATE_CODE_ARCHITECTURE
 
 _KNOWN_TEAM_NAMES = ("慕杰组", "潘立浩组", "宋磊组", "刘全泉组", "李俊鑫组", "江峰组", "娄慧珍组")

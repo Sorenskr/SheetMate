@@ -29,7 +29,7 @@ import urllib.error
 from urllib.parse import parse_qs, urlparse
 import urllib.request
 
-DEFAULT_REMOTE_PASSWORD = "Qq@112233"
+DEFAULT_REMOTE_PASSWORD = "admin"
 GITHUB_PAGES_URL = "https://sorenskr.github.io/SheetMate/"
 NTFY_BASE_URL = "https://ntfy.sh"
 MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024
@@ -814,35 +814,35 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         </svg>
       </div>
       <div style="min-width:0;">
-        <div class="m-title">暗号表助手 · 全球远程智能协同站</div>
-        <div class="m-sub" id="mHeaderSub">输入唯一名字与访问密码，随时随地安全同步电脑伙伴</div>
+        <div class="m-title">暗号表助手 · 手机远程版</div>
+        <div class="m-sub" id="mHeaderSub">连上您的电脑，随时查数据、聊工作、遥控跑表</div>
       </div>
     </div>
-    <button type="button" class="m-pill" id="mSwitchUserBtn" style="display:none;">退出/切换</button>
+    <button type="button" class="m-pill" id="mSwitchUserBtn" style="display:none;">切换电脑</button>
   </header>
 
   <div class="m-login-wrap" id="mLoginGate">
     <div class="m-card">
       <div class="m-intro-box">
-        <div class="m-intro-title">远程连线说明（Soren Drake 设计）</div>
+        <div class="m-intro-title">怎么连上您的电脑（Soren Drake 设计）</div>
         <div>
-          输入目标电脑在「暗号表助手」里设好的<strong>唯一名字</strong>与<strong>访问密码</strong>，就能加密连接电脑上的专属智能伙伴——随时对话查数、遥控跑表或静默发钉钉，聊天记录两端实时同步。
+          填上您在电脑软件右上角起好的<strong>名字</strong>和<strong>远程密码</strong>，点下面按钮就能连上——随时跟它聊、查每天数据、让电脑自己跑表发钉钉，手机和电脑两边的对话会实时同步。
         </div>
       </div>
 
-      <div class="m-label">1. 目标电脑唯一名字</div>
-      <input type="text" class="m-input" id="mLoginNameInput" placeholder="输入在电脑端【设置昵称】里起好的名字" autocomplete="username" />
+      <div class="m-label">1. 电脑上起好的名字</div>
+      <input type="text" class="m-input" id="mLoginNameInput" placeholder="填电脑右上角设置的名字" autocomplete="username" />
 
-      <div class="m-label">2. 远程访问密码</div>
-      <input type="password" class="m-input" id="mLoginPinInput" placeholder="请输入远程访问密码" autocomplete="current-password" />
+      <div class="m-label">2. 远程密码</div>
+      <input type="password" class="m-input" id="mLoginPinInput" placeholder="填电脑【远程网站】里设置的密码" autocomplete="current-password" />
 
       <details id="mBaseDetails" style="font-size:11.5px;color:var(--sub);">
-        <summary style="cursor:pointer;">同 Wi-Fi 备用设置（外地跨网无需填写）</summary>
-        <input type="text" class="m-input" id="mServerBaseInput" style="margin-top:8px;font-size:13px;" placeholder="局域网内网网址（选填，留空自动加密连线）" />
+        <summary style="cursor:pointer;">同 Wi-Fi 备用设置（平时不用填）</summary>
+        <input type="text" class="m-input" id="mServerBaseInput" style="margin-top:8px;font-size:13px;" placeholder="同 Wi-Fi 内网网址（选填，留空自动连）" />
       </details>
 
       <div id="mLoginErr" style="font-size:12.5px;color:var(--red);display:none;line-height:1.45;"></div>
-      <button type="button" class="m-btn-primary" id="mLoginSubmitBtn">验证并连接电脑</button>
+      <button type="button" class="m-btn-primary" id="mLoginSubmitBtn">连接我的电脑</button>
     </div>
   </div>
 
@@ -1563,6 +1563,12 @@ class MobileBridgeManager:
                 data = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     pw = str(data.get("remote_password") or "").strip()
+                    schema_v = _safe_int(data.get("schema_v"), default=1)
+                    if schema_v < 2 and pw == "Qq@112233":
+                        self.mobile_pin = DEFAULT_REMOTE_PASSWORD
+                        self.cloud_relay_enabled = bool(data.get("cloud_relay_enabled", True))
+                        self._save_remote_cfg()
+                        return
                     self.mobile_pin = pw or DEFAULT_REMOTE_PASSWORD
                     self.cloud_relay_enabled = bool(data.get("cloud_relay_enabled", True))
                     return
@@ -1578,6 +1584,7 @@ class MobileBridgeManager:
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(".tmp")
             tmp.write_text(json.dumps({
+                "schema_v": 2,
                 "remote_password": self.mobile_pin,
                 "cloud_relay_enabled": bool(self.cloud_relay_enabled),
             }, ensure_ascii=False, indent=2), encoding="utf-8")
