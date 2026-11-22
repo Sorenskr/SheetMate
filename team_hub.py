@@ -24,6 +24,7 @@ import re
 import secrets
 import socket
 import ssl
+import struct
 import tempfile
 import threading
 import time
@@ -282,6 +283,119 @@ _AUTO_CLOUD_KEY = hashlib.pbkdf2_hmac(
     2000,
     dklen=32,
 )
+_AUTO_CLOUD_BROKERS = (
+    ("broker-cn.emqx.io", 8883),
+    ("broker.emqx.io", 8883),
+)
+
+
+def _th_mqtt_enc_varlen(n):
+    out = bytearray()
+    while True:
+        b = n % 128
+        n //= 128
+        if n > 0:
+            b |= 0x80
+        out.append(b)
+        if n == 0:
+            break
+    return bytes(out)
+
+
+def _th_mqtt_str(s):
+    b = str(s or "").encode("utf-8")
+    return struct.pack("!H", len(b)) + b
+
+
+def _th_mqtt_recv_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("EOF")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _th_mqtt_read_packet(sock):
+    hdr = _th_mqtt_recv_exact(sock, 1)[0]
+    mult = 1
+    rem = 0
+    for _ in range(4):
+        b = _th_mqtt_recv_exact(sock, 1)[0]
+        rem += (b & 0x7F) * mult
+        if (b & 0x80) == 0:
+            break
+        mult *= 128
+    if rem > MAX_HUB_BODY_BYTES:
+        raise ValueError("MQTT payload too large")
+    body = _th_mqtt_recv_exact(sock, rem) if rem else b""
+    return hdr, body
+
+
+def _th_mqtt_retained_pull(topic, timeout=2.8):
+    ctx = ssl.create_default_context()
+    for host, port in _AUTO_CLOUD_BROKERS:
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+                with ctx.wrap_socket(raw_sock, server_hostname=host) as ss:
+                    ss.settimeout(timeout)
+                    cid = f"smth_r_{os.getpid()}_{secrets.token_hex(3)}"
+                    vh = _th_mqtt_str("MQTT") + bytes([4, 2, 0, 20])
+                    pl = _th_mqtt_str(cid)
+                    ss.sendall(b"\x10" + _th_mqtt_enc_varlen(len(vh) + len(pl)) + vh + pl)
+                    hdr0, _ = _th_mqtt_read_packet(ss)
+                    if (hdr0 & 0xF0) != 0x20:
+                        continue
+                    s_vh = struct.pack("!H", 1)
+                    s_pl = _th_mqtt_str(topic) + b"\x00"
+                    ss.sendall(b"\x82" + _th_mqtt_enc_varlen(len(s_vh) + len(s_pl)) + s_vh + s_pl)
+                    ss.settimeout(1.2)
+                    deadline = time.monotonic() + 1.5
+                    while time.monotonic() < deadline:
+                        try:
+                            hdr, body = _th_mqtt_read_packet(ss)
+                        except (socket.timeout, TimeoutError, ConnectionError, OSError):
+                            break
+                        if (hdr & 0xF0) == 0x30 and len(body) >= 2:
+                            tlen = struct.unpack("!H", body[:2])[0]
+                            pos = 2 + tlen + (2 if (hdr & 0x06) != 0 else 0)
+                            if pos <= len(body):
+                                try:
+                                    ss.sendall(b"\xe0\x00")
+                                except Exception:
+                                    pass
+                                return body[pos:].decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+    return None
+
+
+def _th_mqtt_retained_push(topic, text, timeout=3.0):
+    ctx = ssl.create_default_context()
+    data_b = str(text or "").encode("utf-8")
+    vh_p = _th_mqtt_str(topic)
+    pub_pkt = b"\x31" + _th_mqtt_enc_varlen(len(vh_p) + len(data_b)) + vh_p + data_b
+    ok_any = False
+    for host, port in _AUTO_CLOUD_BROKERS:
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+                with ctx.wrap_socket(raw_sock, server_hostname=host) as ss:
+                    ss.settimeout(timeout)
+                    cid = f"smth_w_{os.getpid()}_{secrets.token_hex(3)}"
+                    vh = _th_mqtt_str("MQTT") + bytes([4, 2, 0, 20])
+                    pl = _th_mqtt_str(cid)
+                    ss.sendall(b"\x10" + _th_mqtt_enc_varlen(len(vh) + len(pl)) + vh + pl)
+                    hdr0, _ = _th_mqtt_read_packet(ss)
+                    if (hdr0 & 0xF0) != 0x20:
+                        continue
+                    ss.sendall(pub_pkt)
+                    ss.sendall(b"\xe0\x00")
+                    ok_any = True
+                    break
+        except Exception:
+            continue
+    return ok_any
 _SAFE_AVATAR_RE = re.compile(r"^data:image/(?:png|jpeg|jpg|webp|svg\+xml);base64,[A-Za-z0-9+/=]+$", re.ASCII)
 
 
@@ -959,29 +1073,12 @@ class TeamHubManager:
                     return False
                 self._last_auto_pull_ts = now_m
                 try:
-                    req = urllib.request.Request(
-                        f"https://ntfy.sh/{_AUTO_CLOUD_TOPIC}/json?poll=1&since=6h",
-                        headers={"User-Agent": "SheetMate-AutoHub/2.8.1"},
-                    )
-                    ctx = ssl.create_default_context()
-                    with urllib.request.urlopen(req, timeout=2.0, context=ctx) as resp:
-                        lines = resp.read().decode("utf-8", errors="ignore").splitlines()
-                    latest_obj = None
-                    for ln in lines:
-                        s = ln.strip()
-                        if not s:
-                            continue
-                        try:
-                            ev = json.loads(s)
-                            if ev.get("event") == "message":
-                                cand = _auto_cloud_unpack(ev.get("message", ""))
-                                if isinstance(cand, dict) and "members" in cand:
-                                    latest_obj = cand
-                        except Exception:
-                            continue
-                    if latest_obj is not None:
-                        self._merge_remote_state(latest_obj)
-                        return True
+                    raw_msg = _th_mqtt_retained_pull(_AUTO_CLOUD_TOPIC, timeout=2.5)
+                    if raw_msg:
+                        latest_obj = _auto_cloud_unpack(raw_msg)
+                        if isinstance(latest_obj, dict) and "members" in latest_obj:
+                            self._merge_remote_state(latest_obj)
+                            return True
                 except Exception:
                     return False
         return False
@@ -1125,15 +1222,7 @@ class TeamHubManager:
                         "feedbacks": redact_sensitive_config((payload_data.get("feedbacks") or [])[-12:]),
                     }
                     pkt = _auto_cloud_pack(compact_obj)
-                    req = urllib.request.Request(
-                        f"https://ntfy.sh/{_AUTO_CLOUD_TOPIC}",
-                        data=pkt.encode("utf-8"),
-                        headers={"Content-Type": "text/plain; charset=utf-8", "User-Agent": "SheetMate-AutoHub/2.8.1"},
-                        method="POST",
-                    )
-                    ctx = ssl.create_default_context()
-                    with urllib.request.urlopen(req, timeout=3.0, context=ctx):
-                        pass
+                    _th_mqtt_retained_push(_AUTO_CLOUD_TOPIC, pkt, timeout=3.0)
                 except Exception:
                     pass
 

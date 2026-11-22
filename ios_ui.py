@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.8.8 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.8.9 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -1183,6 +1183,11 @@ class _SheetMateController:
         prof = (res.get("profile") if isinstance(res, dict) else None) or res
         self._refresh_operator_name()
         self._sync_snapshot_safe()
+        if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_credentials_changed"):
+            try:
+                self.mobile_bridge.notify_credentials_changed()
+            except Exception:
+                pass
         return {
             "ok": True,
             "profile": prof,
@@ -2018,8 +2023,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/png" href="/icon.png?v=2.8.8" />
-<link rel="shortcut icon" href="/favicon.ico?v=2.8.8" />
+<link rel="icon" type="image/png" href="/icon.png?v=2.8.9" />
+<link rel="shortcut icon" href="/favicon.ico?v=2.8.9" />
 <style>
   :root {
     --bg: #EAF0F8;
@@ -4395,9 +4400,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.8.8" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.8.9" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.8.8</span>
+          <span class="ver-pill" id="verBadge">v2.8.9</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -4741,7 +4746,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </button>
                     <div class="row-main">
                       <div class="row-title">数据管家</div>
-                      <div class="row-sub">Soren Drake 设计 · 会自动播报变动、查档案也能陪你聊天解闷</div>
+                      <div class="row-sub">会自动播报变动、查档案也能陪你聊天解闷</div>
                     </div>
                   </div>
                   <div style="display:flex;align-items:center;gap:5px;flex-shrink:0;">
@@ -4789,7 +4794,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
               <div class="ai-qa-bar" id="aiQuickQaBar">
                 <button class="ai-style-chip accent" type="button" data-ai-q="你是谁？用的是什么AI，能帮我做什么？">你是谁/能干嘛</button>
-                <button class="ai-style-chip accent" type="button" data-ai-q="这个软件是谁设计开发的？">是谁设计的</button>
                 <button class="ai-style-chip accent" type="button" data-ai-q="请结合历史运行记录，分析最近一次为什么失败、和之前成功有什么不同，并给我一段直接发给 Antigravity 改代码和调整模块顺序的指令">复盘报错 &amp; 写 Antigravity 指令</button>
                 <button class="ai-style-chip accent" type="button" data-ai-q="怎么自己定义在表格哪个单元格里写什么内容？">怎么自定义单元格</button>
                 <button class="ai-style-chip accent" type="button" data-ai-q="汇报一下当前软件配置状态与最新数据概况">当前状态概览</button>
@@ -4798,7 +4802,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
               <div class="ai-chat-feed" id="aiChatFeed">
                 <div class="ai-empty-guide" id="aiEmptyGuide">
-                  我是「暗号表助手」内置智能助手（由 Soren Drake 设计）。您可以：<br/>
+                  我是「暗号表助手」内置智能助手。您可以：<br/>
                   1. 点上方任意总结模板或快捷提问胶囊，也可点击左上角小猫头像让我陪你聊句元气工作鼓励；<br/>
                   2. 直接提问软件用法（如“怎么在 I4 格自动填入内容”）、当前状态或排障问题，每次跑完表我也会第一时间告诉你关键数据涨跌变化；<br/>
                   3. 点名追问任意团队或成员数据（或在上方输入/掷骰子选组名），我会自动结合历次归档档案公平分析。
@@ -5588,6 +5592,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div style="font-size:11px;color:var(--sub);text-align:center;" id="mobileQrCaption">手机微信或相机扫码就能打开</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:10px;">
+            <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:13px;padding:9px 10px;display:flex;align-items:center;justify-content:space-between;gap:8px;">
+              <div style="font-size:12px;color:var(--text);">
+                <span style="color:var(--sub);">当前电脑名字：</span>
+                <strong id="mobileModalNickVal" style="color:var(--blue);">—</strong>
+              </div>
+              <button type="button" class="mini-pill" id="mobileModalChangeNickBtn">去改名字</button>
+            </div>
             <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:13px;padding:10px;display:flex;flex-direction:column;gap:6px;">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
                 <span style="font-size:12px;font-weight:700;">1. 云端异地访问网址（在任何地方都能打开）</span>
@@ -9218,12 +9229,54 @@ function bindTeamCollabAndAdminEvents() {
     $("aiClearTeamBtn").onclick = () => applyFocusTeamUpdate("", "已清空组名筛选，恢复全部团队公平分析");
   }
 
-  // 成员身份头像与编号
+  // 成员身份头像与编号（支持随机自动落盘与关窗前自动保存未存修改）
+  const saveProfileSelection = async ({ closeOnSuccess = true, silentIfUnchanged = false } = {}) => {
+    const nick = $("profileNicknameInput").value.trim();
+    const curProf = memberProfile || {};
+    const curNick = (curProf.nickname || "").trim();
+    const curAv = safeAvatarUrl(curProf.avatar);
+    if (silentIfUnchanged && nick === curNick && selectedAvatarUrl === curAv) {
+      if (closeOnSuccess) $("profileModalMask").classList.remove("show");
+      return true;
+    }
+    const r = await api("/api/profile", "POST", {
+      nickname: nick,
+      skip_name: !nick,
+      avatar: selectedAvatarUrl,
+    });
+    if (r && r.ok) {
+      memberProfile = r.profile;
+      updateMemberTopChip(r.profile);
+      if (closeOnSuccess) $("profileModalMask").classList.remove("show");
+      showToast(r.message);
+      return true;
+    }
+    showToast((r && r.message) || "该名字已经被占用，每个人的名字不能重复，请换一个");
+    $("profileNicknameInput").focus();
+    $("profileNicknameInput").select();
+    return false;
+  };
+  const closeProfileModalSmart = async () => {
+    const inp = $("profileNicknameInput").value.trim();
+    const curNick = ((memberProfile && memberProfile.nickname) || "").trim();
+    const curAv = safeAvatarUrl(memberProfile && memberProfile.avatar);
+    if ((inp && inp !== curNick) || selectedAvatarUrl !== curAv) {
+      await saveProfileSelection({ closeOnSuccess: true, silentIfUnchanged: true });
+      return;
+    }
+    $("profileModalMask").classList.remove("show");
+  };
   $("memberProfileBtn").onclick = openProfileModal;
-  $("profileCloseBtn").onclick = () => $("profileModalMask").classList.remove("show");
+  $("profileCloseBtn").onclick = closeProfileModalSmart;
+  $("profileModalMask").addEventListener("click", (ev) => {
+    if (ev.target === $("profileModalMask")) closeProfileModalSmart();
+  });
   $("profileDiceBtn").onclick = async () => {
     const r = await api(`/api/profile/random-name?exclude=${encodeURIComponent($("profileNicknameInput").value.trim())}`);
-    if (r && r.nickname) $("profileNicknameInput").value = r.nickname;
+    if (r && r.nickname) {
+      $("profileNicknameInput").value = r.nickname;
+      await saveProfileSelection({ closeOnSuccess: false, silentIfUnchanged: false });
+    }
   };
   $("profileSkipNameBtn").onclick = async () => {
     const r = await api("/api/profile", "POST", { skip_name: true, avatar: selectedAvatarUrl });
@@ -9242,24 +9295,7 @@ function bindTeamCollabAndAdminEvents() {
     for (const ch of $("avatarPresetsGrid").querySelectorAll(".avatar-preset-opt")) ch.classList.remove("active");
     showToast("已导入自定义头像");
   };
-  $("profileSaveBtn").onclick = async () => {
-    const nick = $("profileNicknameInput").value.trim();
-    const r = await api("/api/profile", "POST", {
-      nickname: nick,
-      skip_name: !nick,
-      avatar: selectedAvatarUrl,
-    });
-    if (r && r.ok) {
-      memberProfile = r.profile;
-      updateMemberTopChip(r.profile);
-      $("profileModalMask").classList.remove("show");
-      showToast(r.message);
-    } else {
-      showToast((r && r.message) || "该名字已经被占用，每个人的名字不能重复，请换一个");
-      $("profileNicknameInput").focus();
-      $("profileNicknameInput").select();
-    }
-  };
+  $("profileSaveBtn").onclick = () => saveProfileSelection({ closeOnSuccess: true, silentIfUnchanged: false });
 
   // 全球远程控制网站扫码、端到端加密云中继与密码设置
   let mobileTunnelPollTimer = null;
@@ -9268,6 +9304,9 @@ function bindTeamCollabAndAdminEvents() {
     const ghUrl = info.github_pages_url || "https://sorenskr.github.io/SheetMate/";
     const lanList = Array.isArray(info.lan_urls) ? info.lan_urls : [];
     const pub = info.public_url || "";
+    if ($("mobileModalNickVal")) {
+      $("mobileModalNickVal").textContent = info.local_nick || "（暂未设置，请点右边起名字）";
+    }
     if ($("mobileGithubUrlInput")) $("mobileGithubUrlInput").value = ghUrl;
     if ($("mobileLanUrlInput")) $("mobileLanUrlInput").value = lanList[0] || "";
     if ($("mobilePublicUrlInput")) $("mobilePublicUrlInput").value = pub;
@@ -9288,12 +9327,12 @@ function bindTeamCollabAndAdminEvents() {
         $("cloudRelayStatusBadge").textContent = "已联网就绪";
         $("cloudRelayStatusBadge").style.color = "var(--green)";
         $("cloudRelayStatusBadge").style.background = "rgba(40,205,65,0.14)";
-        $("mobileCloudRelayTip").textContent = `已连好！在手机打开网址填「${info.local_nick}」和下方密码就能连上这台电脑。`;
+        $("mobileCloudRelayTip").textContent = `已连好！在手机或网站填名字「${info.local_nick}」和下方远程密码就能连上这台电脑。`;
       } else {
         $("cloudRelayStatusBadge").textContent = "联网中";
         $("cloudRelayStatusBadge").style.color = "var(--blue)";
         $("cloudRelayStatusBadge").style.background = "var(--pill-blue)";
-        $("mobileCloudRelayTip").textContent = info.cloud_relay_error || "正在连接网络，请稍等几秒…";
+        $("mobileCloudRelayTip").textContent = info.cloud_relay_error || "正在连接云端实时通道，请稍等 1~2 秒…";
       }
     }
     if ($("toggleMobileTunnelBtn")) {
@@ -9305,7 +9344,8 @@ function bindTeamCollabAndAdminEvents() {
         ? `临时链接已通：${pub}`
         : (info.tunnel_error || (info.tunnel_running ? "正在开通临时链接，请等 2~5 秒…" : "一般直接用上面的全球远程网址就行，不用单独开这个。"));
     }
-    if (info.tunnel_running && !pub) {
+    const needPoll = (info.tunnel_running && !pub) || (info.local_nick && !info.cloud_relay_connected);
+    if (needPoll) {
       clearTimeout(mobileTunnelPollTimer);
       mobileTunnelPollTimer = setTimeout(async () => {
         if ($("mobileBridgeModalMask") && $("mobileBridgeModalMask").classList.contains("show")) {
@@ -9317,6 +9357,13 @@ function bindTeamCollabAndAdminEvents() {
       clearTimeout(mobileTunnelPollTimer);
     }
   };
+  if ($("mobileModalChangeNickBtn")) {
+    $("mobileModalChangeNickBtn").onclick = () => {
+      clearTimeout(mobileTunnelPollTimer);
+      $("mobileBridgeModalMask").classList.remove("show");
+      openProfileModal();
+    };
+  }
   const openRemoteGuideModal = async () => {
     $("mobileBridgeModalMask").classList.add("show");
     const info = await api("/api/mobile-bridge/info");

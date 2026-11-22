@@ -1,10 +1,10 @@
-# 暗号表助手（SheetMate）v2.8.8
+# 暗号表助手（SheetMate）v2.8.9
 
-[![最新版本](https://img.shields.io/badge/Release-v2.8.8-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
+[![最新版本](https://img.shields.io/badge/Release-v2.8.9-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![运行平台](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-34C759?style=flat-square&logo=windows)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![云端远程入口](https://img.shields.io/badge/Cloud%20Web-点击打开远程控制台-5856D6?style=flat-square&logo=googlechrome)](https://sorenskr.github.io/SheetMate/)
 
-> 由 **Soren Drake** 设计研发的办公数据自动化与多端协同助手：自动登录后台抓数、一键清洗写入 WPS 在线汇总表、高清智能截图、无坐标钉钉静音发群，支持手机与异地网页端到端加密聊天遥控。
+> 办公数据自动化与多端协同桌面助手：自动登录后台抓数、一键清洗写入 WPS 在线汇总表、高清智能截图、无坐标钉钉静音发群，支持手机与异地网页端到端加密聊天遥控。
 
 ---
 
@@ -21,7 +21,7 @@
 
 ---
 
-## ✨ v2.8.8 核心功能一览
+## ✨ v2.8.9 核心功能一览
 
 - **全自动抓数写表 & 自定义格位**
   - 自动登录后台拉取三份源数据，自动规范格式并精准写入 WPS 金山在线汇总表，同步自动清理多余旧标签页。

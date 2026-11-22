@@ -22,6 +22,7 @@ import secrets
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import threading
 import time
@@ -32,11 +33,113 @@ import urllib.request
 
 DEFAULT_REMOTE_PASSWORD = "admin"
 GITHUB_PAGES_URL = "https://sorenskr.github.io/SheetMate/"
-NTFY_BASE_URL = "https://ntfy.sh"
+MQTT_TLS_BROKERS = (
+    ("broker-cn.emqx.io", 8883),
+    ("broker.emqx.io", 8883),
+)
 MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024
 AUTH_MAX_FAILS = 5
 AUTH_LOCKOUT_SEC = 60.0
 RELAY_REPLAY_WINDOW_SEC = 180
+
+
+def _mqtt_enc_varlen(n):
+    out = bytearray()
+    n = int(n)
+    while True:
+        b = n % 128
+        n //= 128
+        if n > 0:
+            b |= 0x80
+        out.append(b)
+        if n == 0:
+            break
+    return bytes(out)
+
+
+def _mqtt_str(s):
+    b = str(s or "").encode("utf-8")
+    return struct.pack("!H", len(b)) + b
+
+
+def _mqtt_build_connect(client_id, keepalive=45):
+    vh = _mqtt_str("MQTT") + bytes([4, 2, (keepalive >> 8) & 0xFF, keepalive & 0xFF])
+    pl = _mqtt_str(client_id)
+    return b"\x10" + _mqtt_enc_varlen(len(vh) + len(pl)) + vh + pl
+
+
+def _mqtt_build_subscribe(pkt_id, topic):
+    vh = struct.pack("!H", pkt_id)
+    pl = _mqtt_str(topic) + b"\x00"
+    return b"\x82" + _mqtt_enc_varlen(len(vh) + len(pl)) + vh + pl
+
+
+def _mqtt_build_publish(topic, payload_bytes, retain=False):
+    hdr = 0x31 if retain else 0x30
+    vh = _mqtt_str(topic)
+    return bytes([hdr]) + _mqtt_enc_varlen(len(vh) + len(payload_bytes)) + vh + payload_bytes
+
+
+def _mqtt_recv_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("MQTT EOF")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _mqtt_read_packet(sock):
+    hdr = _mqtt_recv_exact(sock, 1)[0]
+    mult = 1
+    rem = 0
+    for _ in range(4):
+        b = _mqtt_recv_exact(sock, 1)[0]
+        rem += (b & 0x7F) * mult
+        if (b & 0x80) == 0:
+            break
+        mult *= 128
+    if rem > MAX_HTTP_BODY_BYTES:
+        raise ValueError("MQTT packet exceeds size limit")
+    body = _mqtt_recv_exact(sock, rem) if rem else b""
+    return hdr, body
+
+
+def _mqtt_parse_publish(hdr, body):
+    if len(body) < 2:
+        return "", b""
+    tlen = struct.unpack("!H", body[:2])[0]
+    topic = body[2: 2 + tlen].decode("utf-8", errors="replace")
+    pos = 2 + tlen
+    if (hdr & 0x06) != 0:
+        pos += 2
+    return topic, body[pos:]
+
+
+def _mqtt_publish_once(topic, payload_bytes, brokers=MQTT_TLS_BROKERS, timeout=4.0):
+    pkt = _mqtt_build_publish(topic, payload_bytes, retain=False)
+    ctx = ssl.create_default_context()
+    last_err = ""
+    for host, port in brokers:
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+                with ctx.wrap_socket(raw_sock, server_hostname=host) as ss:
+                    ss.settimeout(timeout)
+                    ss.sendall(_mqtt_build_connect(f"smtmp_{os.getpid()}_{secrets.token_hex(3)}", keepalive=20))
+                    hdr, _ = _mqtt_read_packet(ss)
+                    if (hdr & 0xF0) != 0x20:
+                        continue
+                    ss.sendall(pkt)
+                    try:
+                        ss.sendall(b"\xe0\x00")
+                    except Exception:
+                        pass
+                    return True, ""
+        except Exception as exc:
+            last_err = str(exc)[:100]
+            continue
+    return False, last_err
 
 
 def _safe_int(val, default=0, min_val=None, max_val=None):
@@ -915,7 +1018,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="m-login-wrap" id="mLoginGate">
     <div class="m-card">
       <div class="m-intro-box">
-        <div class="m-intro-title">云端连电脑（Soren Drake 设计）</div>
+        <div class="m-intro-title">云端异地连电脑</div>
         <div>
           无论您在家、出差还是用手机流量，只要填上在电脑右上角起的<strong>名字</strong>和<strong>远程密码</strong>，就能直接从云端连回电脑——随时问数据、遥控自动跑表发钉钉，两边的聊天记录会实时同步。
         </div>
@@ -934,7 +1037,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="m-dl-card" id="mDownloadCard">
       <div class="m-dl-head">
         <div class="m-dl-title">电脑还没装软件？免费下载客户端</div>
-        <span class="m-dl-badge">v2.8.8 Windows</span>
+        <span class="m-dl-badge">v2.8.9 Windows</span>
       </div>
       <div class="m-dl-desc">
         下载到 Windows 电脑双击即可使用（无需配置任何运行环境），支持自动抓数写入 WPS 表格、智能截图、钉钉静音发群与云端异地遥控。
@@ -1170,9 +1273,227 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     return { deriveRoomAndKey, encryptPacket, decryptPacket, normalizeNickKey };
   })();
   if (typeof globalThis !== "undefined") globalThis.SMCrypto = SMCrypto;
+
+  const SMRelay = (function() {
+    const WS_BROKERS = [
+      "wss://broker-cn.emqx.io:8084/mqtt",
+      "wss://broker.emqx.io:8084/mqtt"
+    ];
+    const te = new TextEncoder();
+    const td = new TextDecoder();
+    let activeDownTopic = "";
+    let onMessageCb = null;
+    let manualClosed = true;
+    let conns = [];
+    let waitResolvers = [];
+
+    function encVarLen(n) {
+      const out = [];
+      let v = n >>> 0;
+      do {
+        let b = v % 128;
+        v = Math.floor(v / 128);
+        if (v > 0) b |= 0x80;
+        out.push(b);
+      } while (v > 0);
+      return out;
+    }
+    function strBytes(s) {
+      const b = te.encode(String(s || ""));
+      return new Uint8Array([(b.length >> 8) & 0xff, b.length & 0xff, ...b]);
+    }
+    function joinU8(arrs) {
+      let tot = 0;
+      for (const a of arrs) tot += a.length;
+      const res = new Uint8Array(tot);
+      let off = 0;
+      for (const a of arrs) { res.set(a, off); off += a.length; }
+      return res;
+    }
+    function buildConnect(cid) {
+      const vh = joinU8([strBytes("MQTT"), new Uint8Array([4, 2, 0, 45])]);
+      const pl = strBytes(cid);
+      const lenB = new Uint8Array(encVarLen(vh.length + pl.length));
+      return joinU8([new Uint8Array([0x10]), lenB, vh, pl]);
+    }
+    function buildSubscribe(pid, topic) {
+      const vh = new Uint8Array([(pid >> 8) & 0xff, pid & 0xff]);
+      const pl = joinU8([strBytes(topic), new Uint8Array([0])]);
+      const lenB = new Uint8Array(encVarLen(vh.length + pl.length));
+      return joinU8([new Uint8Array([0x82]), lenB, vh, pl]);
+    }
+    function buildPublish(topic, payloadStr) {
+      const vh = strBytes(topic);
+      const pl = te.encode(String(payloadStr || ""));
+      const lenB = new Uint8Array(encVarLen(vh.length + pl.length));
+      return joinU8([new Uint8Array([0x30]), lenB, vh, pl]);
+    }
+    function notifyReady() {
+      if (!waitResolvers.length) return;
+      const list = waitResolvers.splice(0, waitResolvers.length);
+      for (const fn of list) fn(true);
+    }
+    function drainRx(entry) {
+      while (entry.rxBuf.length >= 2) {
+        const hdr = entry.rxBuf[0];
+        let pos = 1;
+        let mult = 1;
+        let rem = 0;
+        let doneLen = false;
+        while (pos < entry.rxBuf.length && pos <= 4) {
+          const b = entry.rxBuf[pos++];
+          rem += (b & 0x7f) * mult;
+          if ((b & 0x80) === 0) { doneLen = true; break; }
+          mult *= 128;
+        }
+        if (!doneLen) {
+          if (pos > 4) {
+            try { entry.ws.close(); } catch (_e) {}
+          }
+          return;
+        }
+        if (entry.rxBuf.length < pos + rem) return;
+        const body = entry.rxBuf.slice(pos, pos + rem);
+        entry.rxBuf = entry.rxBuf.slice(pos + rem);
+        const ptype = hdr & 0xf0;
+        if (ptype === 0x20) {
+          if (body.length >= 2 && body[1] === 0 && activeDownTopic) {
+            try { entry.ws.send(buildSubscribe(1, activeDownTopic)); } catch (_e) {}
+          }
+        } else if (ptype === 0x90) {
+          entry.ready = true;
+          notifyReady();
+        } else if (ptype === 0x30 && body.length >= 2) {
+          const tlen = (body[0] << 8) | body[1];
+          let pOff = 2 + tlen;
+          if ((hdr & 0x06) !== 0) pOff += 2;
+          if (pOff <= body.length && onMessageCb) {
+            try { onMessageCb(td.decode(body.slice(pOff))); } catch (_e) {}
+          }
+        }
+      }
+    }
+    function spawnBroker(url, topicSnap) {
+      const entry = {
+        url,
+        ws: null,
+        ready: false,
+        rxBuf: new Uint8Array(0),
+        pingTm: null,
+        reconTm: null,
+      };
+      function connectOne() {
+        if (manualClosed || activeDownTopic !== topicSnap) return;
+        if (typeof WebSocket === "undefined") return;
+        let ws;
+        try {
+          ws = new WebSocket(url, "mqtt");
+        } catch (_e) {
+          entry.reconTm = setTimeout(connectOne, 2500);
+          return;
+        }
+        ws.binaryType = "arraybuffer";
+        entry.ws = ws;
+        entry.ready = false;
+        entry.rxBuf = new Uint8Array(0);
+        ws.onopen = () => {
+          if (manualClosed || activeDownTopic !== topicSnap) {
+            try { ws.close(); } catch (_e) {}
+            return;
+          }
+          const cid = "smweb_" + Math.random().toString(36).slice(2, 9) + "_" + Date.now().toString(36);
+          try { ws.send(buildConnect(cid)); } catch (_e) {}
+          clearInterval(entry.pingTm);
+          entry.pingTm = setInterval(() => {
+            if (ws.readyState === 1 && entry.ready) {
+              try { ws.send(new Uint8Array([0xc0, 0x00])); } catch (_e) {}
+            }
+          }, 22000);
+        };
+        ws.onmessage = (ev) => {
+          try {
+            const chunk = ev.data instanceof ArrayBuffer
+              ? new Uint8Array(ev.data)
+              : (ev.data ? te.encode(String(ev.data)) : new Uint8Array(0));
+            if (!chunk.length) return;
+            entry.rxBuf = joinU8([entry.rxBuf, chunk]);
+            drainRx(entry);
+          } catch (_e) {}
+        };
+        ws.onerror = () => {};
+        ws.onclose = () => {
+          entry.ready = false;
+          clearInterval(entry.pingTm);
+          if (!manualClosed && activeDownTopic === topicSnap) {
+            clearTimeout(entry.reconTm);
+            entry.reconTm = setTimeout(connectOne, 2200);
+          }
+        };
+      }
+      connectOne();
+      return entry;
+    }
+    function closeAll() {
+      manualClosed = true;
+      activeDownTopic = "";
+      for (const e of conns) {
+        clearInterval(e.pingTm);
+        clearTimeout(e.reconTm);
+        e.ready = false;
+        if (e.ws) {
+          try {
+            if (e.ws.readyState === 1) e.ws.send(new Uint8Array([0xe0, 0x00]));
+            e.ws.close();
+          } catch (_e) {}
+        }
+      }
+      conns = [];
+      const list = waitResolvers.splice(0, waitResolvers.length);
+      for (const fn of list) fn(false);
+    }
+    function hasReady() {
+      return conns.some((e) => e.ready && e.ws && e.ws.readyState === 1);
+    }
+    async function connectAndSub(downTopic, cb, timeoutMs = 5500) {
+      if (cb) onMessageCb = cb;
+      if (!manualClosed && activeDownTopic === downTopic && hasReady()) return true;
+      closeAll();
+      manualClosed = false;
+      activeDownTopic = downTopic;
+      conns = WS_BROKERS.map((u) => spawnBroker(u, downTopic));
+      const firstReady = await new Promise((resolve) => {
+        if (hasReady()) { resolve(true); return; }
+        const tm = setTimeout(() => {
+          const idx = waitResolvers.indexOf(onReady);
+          if (idx >= 0) waitResolvers.splice(idx, 1);
+          resolve(hasReady());
+        }, timeoutMs);
+        function onReady(ok) {
+          clearTimeout(tm);
+          resolve(ok);
+        }
+        waitResolvers.push(onReady);
+      });
+      if (firstReady && !conns.every((e) => e.ready)) {
+        await new Promise((r) => setTimeout(r, 320));
+      }
+      return hasReady();
+    }
+    function publish(upTopic, packetStr) {
+      const frame = buildPublish(upTopic, packetStr);
+      let sent = 0;
+      for (const e of conns) {
+        if (e.ready && e.ws && e.ws.readyState === 1) {
+          try { e.ws.send(frame); sent += 1; } catch (_e) {}
+        }
+      }
+      return sent;
+    }
+    return { connectAndSub, publish, closeAll, hasReady, WS_BROKERS };
+  })();
+  if (typeof globalThis !== "undefined") globalThis.SMRelay = SMRelay;
   if (typeof window === "undefined" || typeof document === "undefined") return;
 
-  const NTFY_BASE = "https://ntfy.sh";
   const qs = new URLSearchParams(window.location.search);
   const $ = (id) => document.getElementById(id);
   let mobileToken = localStorage.getItem("sm_mobile_token") || "";
@@ -1180,8 +1501,6 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   let serverBase = localStorage.getItem("sm_mobile_base") || qs.get("hub") || "";
   let connMode = localStorage.getItem("sm_conn_mode") || "";
   let relayCred = null; // { nick, pin, upTopic, downTopic, masterKey }
-  let relayEs = null;
-  let relayLastMsgId = "";
   const pendingReqs = new Map();
   let lastChatSeq = -1;
   let lastPaused = false;
@@ -1211,13 +1530,24 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     return true;
   }
 
-  async function mApi(path, method = "GET", body = null) {
+  async function mApi(path, method = "GET", body = null, customBase = null, timeoutMs = 6000) {
     const headers = { "Content-Type": "application/json" };
-    if (mobileToken) headers["X-Mobile-Token"] = mobileToken;
+    if (mobileToken && customBase === null) headers["X-Mobile-Token"] = mobileToken;
     const opt = { method, headers };
     if (body !== null) opt.body = JSON.stringify(body);
-    const resp = await fetch(baseUrl() + path, opt);
-    return await resp.json();
+    let tm = null;
+    if (typeof AbortController !== "undefined" && timeoutMs > 0) {
+      const ac = new AbortController();
+      opt.signal = ac.signal;
+      tm = setTimeout(() => ac.abort(), timeoutMs);
+    }
+    try {
+      const root = customBase !== null ? customBase : baseUrl();
+      const resp = await fetch(root + path, opt);
+      return await resp.json();
+    } finally {
+      if (tm) clearTimeout(tm);
+    }
   }
 
   function formatMsgText(raw) {
@@ -1291,17 +1621,15 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     $("mLoginGate").style.display = "none";
     $("mMainApp").style.display = "flex";
     $("mSwitchUserBtn").style.display = "inline-flex";
-    const modeTag = connMode === "cloud" ? "跨网加密直连" : "内网直连";
+    const modeTag = connMode === "cloud" ? "跨网加密直连" : "本机/内网直连";
     $("mHeaderSub").textContent = `${modeTag} · 用户：${myNick || "已连接"}`;
   }
 
   function closeRelayStream() {
-    if (relayEs) {
-      try { relayEs.close(); } catch (_e) {}
-      relayEs = null;
-    }
+    SMRelay.closeAll();
     for (const [_k, p] of pendingReqs.entries()) {
       clearTimeout(p.tm);
+      clearTimeout(p.retryTm);
       p.reject(new Error("closed"));
     }
     pendingReqs.clear();
@@ -1311,7 +1639,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     $("mLoginGate").style.display = "flex";
     $("mMainApp").style.display = "none";
     $("mSwitchUserBtn").style.display = "none";
-    $("mHeaderSub").textContent = "输入唯一名字与访问密码，随时随地安全同步电脑小猫";
+    $("mHeaderSub").textContent = "无论身在何处，云端连上电脑就能查数据、聊工作、遥控跑表";
     if (errText) {
       $("mLoginErr").textContent = errText;
       $("mLoginErr").style.display = "block";
@@ -1328,6 +1656,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       const p = pendingReqs.get(obj.req_id);
       pendingReqs.delete(obj.req_id);
       clearTimeout(p.tm);
+      clearTimeout(p.retryTm);
       p.resolve(obj);
     }
     if (obj.state) applyPcState(obj.state);
@@ -1337,72 +1666,44 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
   }
 
-  function startRelaySubscribe() {
-    if (!relayCred) return;
-    closeRelayStream();
-    if (typeof EventSource !== "undefined") {
-      try {
-        const es = new EventSource(`${NTFY_BASE}/${relayCred.downTopic}/sse?since=10s`);
-        es.onmessage = (ev) => {
-          try {
-            const parsed = JSON.parse(ev.data);
-            if (parsed && parsed.id) relayLastMsgId = parsed.id;
-            if (parsed && parsed.message) handleRelayIncomingText(parsed.message);
-          } catch (_e) {}
-        };
-        relayEs = es;
-      } catch (_e) {}
-    }
+  async function startRelaySubscribe() {
+    if (!relayCred) return false;
+    return await SMRelay.connectAndSub(relayCred.downTopic, handleRelayIncomingText, 5500);
   }
 
-  async function pollRelayOnce() {
-    if (!relayCred) return;
-    try {
-      const sinceP = relayLastMsgId ? encodeURIComponent(relayLastMsgId) : "15s";
-      const resp = await fetch(`${NTFY_BASE}/${relayCred.downTopic}/json?poll=1&since=${sinceP}`);
-      const txt = await resp.text();
-      for (const ln of txt.split(/\r?\n/)) {
-        const s = ln.trim();
-        if (!s) continue;
-        try {
-          const ev = JSON.parse(s);
-          if (ev && ev.id) relayLastMsgId = ev.id;
-          if (ev && ev.event === "message" && ev.message) handleRelayIncomingText(ev.message);
-        } catch (_e) {}
-      }
-    } catch (_e) {}
-  }
-
-  async function sendRelayCommand(cmd, params = {}, timeoutMs = 15000) {
+  async function sendRelayCommand(cmd, params = {}, timeoutMs = 12000) {
     if (!relayCred) throw new Error("未配置云桥连接");
+    const okSub = await startRelaySubscribe();
+    if (!okSub) throw new Error("broker_unreachable");
     const reqId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
     const pkt = SMCrypto.encryptPacket(relayCred.masterKey, { req_id: reqId, cmd, params });
-    const waitP = new Promise((resolve, reject) => {
+    return await new Promise((resolve, reject) => {
       const tm = setTimeout(() => {
         if (pendingReqs.has(reqId)) {
           pendingReqs.delete(reqId);
+          clearTimeout(retryTm);
           reject(new Error("timeout"));
         }
       }, timeoutMs);
-      pendingReqs.set(reqId, { resolve, reject, tm });
+      const retryTm = setTimeout(() => {
+        if (pendingReqs.has(reqId)) {
+          SMRelay.publish(relayCred.upTopic, pkt);
+        }
+      }, 1800);
+      pendingReqs.set(reqId, { resolve, reject, tm, retryTm });
+      const sent = SMRelay.publish(relayCred.upTopic, pkt);
+      if (!sent) {
+        pendingReqs.delete(reqId);
+        clearTimeout(tm);
+        clearTimeout(retryTm);
+        reject(new Error("send_failed"));
+      }
     });
-    const postP = fetch(`${NTFY_BASE}/${relayCred.upTopic}`, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-      body: pkt,
-    });
-    const quickPoll = setInterval(pollRelayOnce, 650);
-    try {
-      await postP;
-      return await waitP;
-    } finally {
-      clearInterval(quickPoll);
-    }
   }
 
   async function doPoll() {
     if (connMode === "cloud" && relayCred) {
-      await pollRelayOnce();
+      if (!SMRelay.hasReady()) await startRelaySubscribe();
       return;
     }
     if (!mobileToken) return;
@@ -1412,7 +1713,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         mobileToken = "";
         localStorage.removeItem("sm_mobile_token");
         clearInterval(pollTimer);
-        showLoginView("登录已失效，请重新输入唯一名字和访问密码");
+        showLoginView("登录已失效，请重新输入唯一名字和远程密码");
         return;
       }
       if (st && st.ok) applyPcState(st);
@@ -1464,16 +1765,16 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       localStorage.setItem("sm_mobile_base", b);
     }
     if (!nick) {
-      showLoginView("请输入目标电脑设置好的唯一名字");
+      showLoginView("请输入目标电脑设置好的名字");
       return;
     }
     if (!pin) {
-      showLoginView("请输入远程访问密码");
+      showLoginView("请输入远程密码");
       return;
     }
     const btn = $("mLoginSubmitBtn");
     btn.disabled = true;
-    btn.textContent = "正在加密校验连接…";
+    btn.textContent = "正在加密连接电脑…";
     try {
       let localWorked = false;
       if (isLocalServed()) {
@@ -1496,12 +1797,31 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
             return;
           }
         } catch (_localErr) {}
+      } else if (!b) {
+        // 若恰好在运行电脑本机浏览器打开官网，优先尝试 850ms 回环秒连；不通则无缝走云端加密直连
+        try {
+          const localHostBase = "http://127.0.0.1:18792";
+          const r = await mApi("/api/mobile/auth", "POST", { nickname: nick, pin }, localHostBase, 850);
+          if (r && r.ok && r.mobile_token) {
+            serverBase = localHostBase;
+            connMode = "local";
+            mobileToken = r.mobile_token;
+            myNick = (r.profile && (r.profile.nickname || r.profile.display_name)) || nick;
+            localStorage.setItem("sm_mobile_base", localHostBase);
+            localStorage.setItem("sm_conn_mode", "local");
+            localStorage.setItem("sm_mobile_token", mobileToken);
+            localStorage.setItem("sm_mobile_nick", myNick);
+            showMainView();
+            await doPoll();
+            clearInterval(pollTimer);
+            pollTimer = setInterval(doPoll, 1200);
+            localWorked = true;
+          }
+        } catch (_loopErr) {}
       }
       if (!localWorked) {
         const derived = SMCrypto.deriveRoomAndKey(nick, pin);
         relayCred = Object.assign({ nick, pin }, derived);
-        startRelaySubscribe();
-        await new Promise((r) => setTimeout(r, 250));
         try {
           const ack = await sendRelayCommand("auth_state", {}, 9000);
           if (ack && ack.ok) {
@@ -1513,13 +1833,18 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
             showMainView();
             if (ack.state) applyPcState(ack.state);
             clearInterval(pollTimer);
-            pollTimer = setInterval(doPoll, 2200);
+            pollTimer = setInterval(doPoll, 5000);
             return;
           }
         } catch (_relayErr) {
           closeRelayStream();
           relayCred = null;
-          showLoginView("没连上电脑：请核对【名字】和【远程密码】是否和电脑端一样，并确认电脑软件正开着并连着网。");
+          const isNetErr = _relayErr && _relayErr.message === "broker_unreachable";
+          showLoginView(
+            isNetErr
+              ? "云端通道暂未连通：请检查当前网络是否可上网后再试。"
+              : "没连上电脑：请核对【名字】和【远程密码】是否和电脑端完全一样（可在电脑【云端远程】里查看），并确认电脑软件正开着并连着网。"
+          );
         }
       }
     } finally {
@@ -1581,14 +1906,13 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       $("mLoginPinInput").value = savedPin;
       const derived = SMCrypto.deriveRoomAndKey(myNick, savedPin);
       relayCred = Object.assign({ nick: myNick, pin: savedPin }, derived);
-      startRelaySubscribe();
       try {
         const ack = await sendRelayCommand("auth_state", {}, 6500);
         if (ack && ack.ok) {
           showMainView();
           if (ack.state) applyPcState(ack.state);
           clearInterval(pollTimer);
-          pollTimer = setInterval(doPoll, 2200);
+          pollTimer = setInterval(doPoll, 5000);
           return;
         }
       } catch (_e) {
@@ -1639,10 +1963,12 @@ class MobileBridgeManager:
         self.cloud_relay_enabled = True
         self._load_remote_cfg()
 
-        # 云桥加密实时双向状态
+        # 云桥加密实时双向状态（双节点 MQTT over TLS）
         self._relay_stop = threading.Event()
-        self._relay_thread = None
+        self._relay_threads = []
         self._relay_push_thread = None
+        self._mqtt_conns = {}
+        self._mqtt_send_lock = threading.Lock()
         self._nonce_lock = threading.Lock()
         self._relay_seen_nonces = deque(maxlen=250)
         self._relay_last_active_ts = 0.0
@@ -1770,6 +2096,7 @@ class MobileBridgeManager:
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Mobile-Token")
                     self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                    self.send_header("Access-Control-Allow-Private-Network", "true")
 
                 def _send_security_headers(self):
                     self.send_header("X-Content-Type-Options", "nosniff")
@@ -1929,7 +2256,7 @@ class MobileBridgeManager:
             "next_run_str": st.get("next_run_str"),
             "data_brief": st.get("data_brief"),
             "chat_seq": st.get("chat_seq", 0),
-            "ai_history": st.get("ai_history", []),
+            "ai_history": (st.get("ai_history") or [])[-40:],
             "logs": (st.get("logs") or [])[-15:],
         }
 
@@ -1947,32 +2274,71 @@ class MobileBridgeManager:
             return self.ctrl.stop_current_task()
         return {"ok": False, "message": f"未知动作：{act}"}
 
+    def notify_credentials_changed(self):
+        """改名或改远程密码后，立刻断开旧云中继订阅并瞬时切换至新房间。"""
+        with self._lock:
+            self._relay_last_pushed_seq = -1
+            conns = list(self._mqtt_conns.values())
+            self._mqtt_conns.clear()
+            self._relay_connected = False
+        for item in conns:
+            try:
+                item["sock"].close()
+            except Exception:
+                pass
+
     def start_cloud_relay(self):
-        if self._relay_thread is not None and self._relay_thread.is_alive():
-            return
         self._relay_stop.clear()
-        self._relay_thread = threading.Thread(target=self._cloud_relay_loop, daemon=True, name="SheetMateCloudRelay")
-        self._relay_thread.start()
+        alive = [th for th in self._relay_threads if th.is_alive()]
+        if not alive:
+            self._relay_threads = []
+            for host, port in MQTT_TLS_BROKERS:
+                th = threading.Thread(
+                    target=self._mqtt_broker_loop,
+                    args=(host, port),
+                    daemon=True,
+                    name=f"SheetMateMqttRelay-{host}",
+                )
+                th.start()
+                self._relay_threads.append(th)
         if self._relay_push_thread is None or not self._relay_push_thread.is_alive():
-            self._relay_push_thread = threading.Thread(target=self._cloud_state_push_loop, daemon=True, name="SheetMateCloudPush")
+            self._relay_push_thread = threading.Thread(
+                target=self._cloud_state_push_loop,
+                daemon=True,
+                name="SheetMateCloudPush",
+            )
             self._relay_push_thread.start()
 
     def _send_relay_down_packet(self, down_topic, master_key, payload):
-        try:
-            pkt = CloudRelayCrypto.encrypt_packet(master_key, payload)
-            req = urllib.request.Request(
-                f"{NTFY_BASE_URL}/{down_topic}",
-                data=pkt.encode("utf-8"),
-                headers={"Content-Type": "text/plain; charset=utf-8", "User-Agent": "SheetMateRelay/2.8"},
-                method="POST",
-            )
-            ctx = ssl.create_default_context()
-            with urllib.request.urlopen(req, timeout=8.0, context=ctx):
+        pkt = CloudRelayCrypto.encrypt_packet(master_key, payload)
+        frame = _mqtt_build_publish(down_topic, pkt.encode("utf-8"), retain=False)
+        with self._lock:
+            conns = list(self._mqtt_conns.items())
+        sent_any = False
+        dead_hosts = []
+        for host, item in conns:
+            try:
+                with item["lock"]:
+                    item["sock"].sendall(frame)
+                sent_any = True
+            except Exception as exc:
+                self._relay_error = str(exc)[:100]
+                dead_hosts.append((host, item["sock"]))
+        for host, sock in dead_hosts:
+            with self._lock:
+                if self._mqtt_conns.get(host, {}).get("sock") is sock:
+                    self._mqtt_conns.pop(host, None)
+                    self._relay_connected = bool(self._mqtt_conns)
+            try:
+                sock.close()
+            except Exception:
                 pass
+        if sent_any:
             return True
-        except Exception as exc:
-            self._relay_error = str(exc)[:100]
-            return False
+        ok_tmp, err_tmp = _mqtt_publish_once(down_topic, pkt.encode("utf-8"), timeout=3.5)
+        if not ok_tmp and err_tmp:
+            self._relay_error = err_tmp
+        return ok_tmp
 
     def _handle_relay_command(self, obj, nick, down_topic, master_key):
         self._relay_last_active_ts = time.time()
@@ -2033,41 +2399,70 @@ class MobileBridgeManager:
                 pass
             time.sleep(1.1)
 
-    def _cloud_relay_loop(self):
-        backoff = 1.5
+    def _mqtt_broker_loop(self, host, port):
+        backoff = 1.2
+        ctx = ssl.create_default_context()
         while not self._relay_stop.is_set():
             nick = self._get_local_nick()
             if not self.cloud_relay_enabled or not nick:
-                self._relay_connected = False
-                time.sleep(2.0)
+                with self._lock:
+                    self._mqtt_conns.pop(host, None)
+                    self._relay_connected = bool(self._mqtt_conns)
+                time.sleep(1.5)
                 continue
             pin_snap = self.mobile_pin
             cred = CloudRelayCrypto.derive_room_and_key(nick, pin_snap)
             up_topic = cred["up_topic"]
             down_topic = cred["down_topic"]
             master_key = cred["master_key"]
-            stream_url = f"{NTFY_BASE_URL}/{up_topic}/json?since=10s"
+            ssock = None
             try:
-                req = urllib.request.Request(stream_url, headers={"User-Agent": "SheetMateRelay/2.8"})
-                ctx = ssl.create_default_context()
-                with urllib.request.urlopen(req, timeout=75.0, context=ctx) as resp:
+                raw_sock = socket.create_connection((host, port), timeout=8.0)
+                ssock = ctx.wrap_socket(raw_sock, server_hostname=host)
+                ssock.settimeout(8.0)
+                send_lock = threading.Lock()
+                cid = f"smpc_{os.getpid()}_{secrets.token_hex(4)}"
+                with send_lock:
+                    ssock.sendall(_mqtt_build_connect(cid, keepalive=45))
+                hdr0, body0 = _mqtt_read_packet(ssock)
+                if (hdr0 & 0xF0) != 0x20 or len(body0) < 2 or body0[1] != 0:
+                    raise ConnectionError("MQTT CONNACK rejected")
+                with send_lock:
+                    ssock.sendall(_mqtt_build_subscribe(1, up_topic))
+                hdr1, _ = _mqtt_read_packet(ssock)
+                if (hdr1 & 0xF0) != 0x90:
+                    raise ConnectionError("MQTT SUBACK missing")
+
+                with self._lock:
+                    self._mqtt_conns[host] = {"sock": ssock, "lock": send_lock}
                     self._relay_connected = True
                     self._relay_error = ""
-                    backoff = 1.5
-                    for raw_ln in resp:
-                        if self._relay_stop.is_set() or self._get_local_nick() != nick or self.mobile_pin != pin_snap or not self.cloud_relay_enabled:
-                            break
-                        s = raw_ln.decode("utf-8", errors="ignore").strip()
-                        if not s:
-                            continue
-                        try:
-                            ev = json.loads(s)
-                        except Exception:
-                            continue
-                        if ev.get("event") != "message":
-                            continue
+                backoff = 1.2
+
+                ssock.settimeout(22.0)
+                while not self._relay_stop.is_set():
+                    if (
+                        not self.cloud_relay_enabled
+                        or self._get_local_nick() != nick
+                        or self.mobile_pin != pin_snap
+                    ):
+                        break
+                    try:
+                        hdr, body = _mqtt_read_packet(ssock)
+                    except (socket.timeout, TimeoutError):
+                        with send_lock:
+                            ssock.sendall(b"\xc0\x00")
+                        continue
+                    ptype = hdr & 0xF0
+                    if ptype == 0x30:
+                        _tp, payload_b = _mqtt_parse_publish(hdr, body)
+                        raw_txt = payload_b.decode("utf-8", errors="ignore")
                         with self._nonce_lock:
-                            obj = CloudRelayCrypto.decrypt_packet(master_key, ev.get("message", ""), seen_nonces=self._relay_seen_nonces)
+                            obj = CloudRelayCrypto.decrypt_packet(
+                                master_key,
+                                raw_txt,
+                                seen_nonces=self._relay_seen_nonces,
+                            )
                         if obj is not None:
                             threading.Thread(
                                 target=self._handle_relay_command,
@@ -2075,13 +2470,29 @@ class MobileBridgeManager:
                                 daemon=True,
                             ).start()
             except Exception as exc:
-                self._relay_connected = False
-                self._relay_error = str(exc)[:100]
-                time.sleep(backoff)
-                backoff = min(15.0, backoff * 1.5)
+                if not self._relay_stop.is_set():
+                    self._relay_error = f"{host}: {str(exc)[:80]}"
+            finally:
+                with self._lock:
+                    if self._mqtt_conns.get(host, {}).get("sock") is ssock:
+                        self._mqtt_conns.pop(host, None)
+                    self._relay_connected = bool(self._mqtt_conns)
+                if ssock is not None:
+                    try:
+                        ssock.close()
+                    except Exception:
+                        pass
+            if not self._relay_stop.is_set():
+                if self._get_local_nick() == nick and self.mobile_pin == pin_snap:
+                    time.sleep(backoff)
+                    backoff = min(12.0, backoff * 1.5)
+                else:
+                    backoff = 0.5
+                    time.sleep(0.15)
 
     def stop(self):
         self._relay_stop.set()
+        self.notify_credentials_changed()
         self.stop_tunnel()
         with self._lock:
             srv = self._server
@@ -2200,9 +2611,9 @@ class MobileBridgeManager:
             return {"ok": False, "message": "为了远程安全，访问密码不能为空！"}
         with self._lock:
             self.mobile_pin = val
-            self._relay_last_pushed_seq = -1
             self._save_remote_cfg()
-        return {"ok": True, "need_pin": True, "remote_password": val, "message": f"访问密码已更新（已同步刷新加密通道）"}
+        self.notify_credentials_changed()
+        return {"ok": True, "need_pin": True, "remote_password": val, "message": "访问密码已更新（已同步刷新加密通道）"}
 
     def get_brief_info(self):
         with self._lock:

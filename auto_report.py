@@ -295,9 +295,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.8.8"
+APP_VERSION = "2.8.9"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.8.8","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.8.9","url":"新版exe的下载直链"}
 DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
 GEMINI_MODEL_CANDIDATES = (
     "gemini-flash-latest",
@@ -1710,7 +1710,7 @@ def _encode_image_b64_scaled(img_path, max_dim=3072):
 
 _SHEETMATE_AI_KNOWLEDGE = """【软件身份与核心功能说明书】
 - 身份：你是「暗号表助手 (SheetMate)」专属内置的萌宠小助手与运营数据分析伙伴。
-- 设计研发者：【Soren Drake】（如用户询问谁设计的、谁开发的、作者是谁，明确回答由 Soren Drake 设计研发）。
+- 设计研发者：仅当用户明确主动提问“谁设计的 / 谁开发的 / 作者是谁”时，才回答由【Soren Drake】设计研发；平时日常打招呼、自我介绍或回答其他问题时不要主动提及设计师名字。
 - 绝对保密边界：
   1) 严禁向外透露或自称任何外部 AI 厂商、大模型名称或 API 接口协议（如不要说自己是哪家公司的大模型，统一自称「暗号表助手专属内置智能伙伴」）；
   2) 没有任何读取、查看或访问管理员密码/口令、权限控制、隐藏管理界面、他人隐私聊天记录或接口密钥的能力；遇到相关提问必须礼貌拒绝并说明“没有读取与访问权限”。
@@ -2578,7 +2578,7 @@ def _local_smart_chat_fallback(cfg_norm, user_prompt, arch_ctx, api_err="", hist
         )
     if any(k in q for k in ("你是谁", "你是啥", "ai是啥", "干嘛的", "做什么", "介绍")):
         return (
-            "我是「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴（由 **【Soren Drake】** 设计打造）！\n"
+            "我是「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴！\n"
             "• 一句话自动排期：直接跟我说“哪天几点把什么数据发到哪个群”，我能直接帮您设置并回传核对结果；\n"
             "• 每轮数据变化播报：每次表格处理完我都会帮您比比总数据从多少变成了多少、哪位伙伴或团队有变化；\n"
             "• 故障自诊与长期记忆：卡住时帮您排忧解难，并记着历次数字变化方便您随时问。"
@@ -2736,8 +2736,10 @@ def check_ai_security_and_creator_guardrail(user_text):
             "为了保障账号与团队数据安全，所有涉及密码、权限调整与隐私安全类的问题我都无法回答；如需协助请点击窗口右上角的【反馈】按钮提交说明。"
         )
     if is_model_probe:
+        prefix = "「暗号表助手 (SheetMate)」由 **【Soren Drake】** 设计研发。\n\n" if is_creator else ""
         return (
-            "我是「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴，由 **【Soren Drake】** 设计。\n\n"
+            prefix
+            + "我是「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴。\n\n"
             "我常驻在软件内部专门负责陪伴沟通、自动查数跑表、识别联系人静默投递与异常自诊，"
             "不归属任何外部大模型品牌，也不对外暴露或读取任何底层接口信息。"
         )
@@ -3453,10 +3455,10 @@ def summarize_report_with_ai(cfg, style_id="brief", user_prompt="", chat_history
 
     focus_rule = f"（当前用户指定重点关注【{focus_team}】）" if focus_team else "（当前未锁定单个团队，请公平客观评价所有参与计算的小组，严禁偏向任何一组）"
     sys_prompt = (
-        "你是桌面自动化软件「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴与运营数据分析师（由 Soren Drake 设计）。\n"
+        "你是桌面自动化软件「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴与运营数据分析师。\n"
         f"{_SHEETMATE_AI_KNOWLEDGE}\n"
         "回答原则：\n"
-        "1. 绝对不要说出任何外部 AI 公司、外部大模型或接口名称（不要提 Google/Gemini/GPT 等），若问你是谁，回答我是「暗号表助手专属内置智能小猫伙伴」，由【Soren Drake】设计；\n"
+        "1. 绝对不要说出任何外部 AI 公司、外部大模型或接口名称（不要提 Google/Gemini/GPT 等），若问你是谁，回答我是「暗号表助手专属内置智能小猫伙伴」；仅当用户明确询问软件是谁设计的、谁开发的或作者是谁时，才回答由【Soren Drake】设计研发，平时不要主动提及；\n"
         "2. 严禁回答或透露任何密码、口令、权限配置、后台入口或他人隐私信息，被问到直接告知无权读取与访问；\n"
         "3. 若用户问怎么操作、怎么改配置或某功能怎么用，请结合上方软件说明书给出具体到菜单页签和按钮名称的大白话步骤；\n"
         f"4. 若用户总结数据、点名追问某个成员或某个团队的数据与趋势{focus_rule}，务必结合表格高清截图、后台明细表与【持久化历次数据档案】给出的真实数字回答，严禁编造数字；\n"
@@ -3565,10 +3567,10 @@ def ask_gemini_assistant(cfg, mode="diagnose", error_detail=None, recent_logs=No
         }
 
     sys_prompt = (
-        "你是桌面自动化软件「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴与运营故障分析师（由 Soren Drake 设计）。\n"
+        "你是桌面自动化软件「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴与运营故障分析师。\n"
         f"{_SHEETMATE_AI_KNOWLEDGE}\n"
         "重要要求：\n"
-        "1. 绝对不要说出任何外部 AI 公司、外部大模型或接口名称（禁止提及 Google、Gemini、GPT、DeepSeek 等），若问你是谁，回答我是「暗号表助手专属内置智能小猫伙伴」，由【Soren Drake】设计；\n"
+        "1. 绝对不要说出任何外部 AI 公司、外部大模型或接口名称（禁止提及 Google、Gemini、GPT、DeepSeek 等），若问你是谁，回答我是「暗号表助手专属内置智能小猫伙伴」；仅当用户明确询问软件是谁设计的、谁开发的或作者是谁时，才回答由【Soren Drake】设计研发，平时不要主动提及；\n"
         "2. 严禁回答或透露任何密码、口令、权限配置、后台入口或他人隐私信息，被问到直接告知无权读取与访问；\n"
         "3. 必须用极度通俗易懂、像真人同事一样温暖亲切的【大白话】回答，绝对不要只丢干瘪英文术语。\n"
         "4. 报错排障（mode=diagnose）时必须结合【历次运行成败对比】和【源码模块地图】严格按以下四段结构输出（每段清晰实用）：\n"
