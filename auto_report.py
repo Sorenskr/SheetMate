@@ -35,7 +35,20 @@ from PIL import Image
 # 优先使用程序同级或上级目录中的 ms-playwright（随项目放在 E 盘不占 C 盘），其次才回退环境变量或系统目录
 def _early_app_dir():
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+        exe_dir = Path(sys.executable).resolve().parent
+        if (exe_dir / "_internal").is_dir():
+            return exe_dir
+        # 单文件纯净模式：数据隔离到 %LOCALAPPDATA%\SheetMate，EXE 所在文件夹不产生任何杂乱文件或子目录
+        d = Path(os.environ.get("LOCALAPPDATA") or str(Path.home())) / "SheetMate"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            legacy_cfg = exe_dir / "config.json"
+            new_cfg = d / "config.json"
+            if legacy_cfg.is_file() and not new_cfg.exists():
+                new_cfg.write_bytes(legacy_cfg.read_bytes())
+        except Exception:
+            pass
+        return d
     return Path(__file__).resolve().parent
 
 
@@ -97,35 +110,30 @@ MAX_KEEP_WPS_TABS = 2
 
 
 def app_dir():
-    """兼容 exe 打包：返回程序所在目录（而非临时解压目录）"""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).parent
+    """兼容源码、目录版与单文件纯净版（单文件自动隔离数据目录，不在 exe 旁生成杂乱文件夹）。"""
+    return _early_app_dir()
 
 
 def get_local_runtime_dir():
-    """将 UI 壳体等本地运行缓存固定保存在程序所在目录内（E 盘），避免持续占用 C 盘空间。"""
+    """将 UI 壳体等本地运行缓存固定保存在数据目录内（单文件版落在 LocalAppData，不污染桌面）。"""
     base = app_dir()
     try:
         rt = base / "runtime_data"
         rt.mkdir(parents=True, exist_ok=True)
         return rt
     except Exception:
-        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SheetMate"
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SheetMate" / "runtime_data"
 
 
 def get_browser_user_data_dir():
-    """优先沿用程序同目录或上级已有的 browser_data（无缝保留 WPS 登录态），新建时也留在程序目录内不占 C 盘。"""
+    """返回浏览器登录态目录（按需创建，不在程序启动瞬间提前在 exe 旁新建文件夹）。"""
     base = app_dir()
+    if getattr(sys, "frozen", False) and not (Path(sys.executable).resolve().parent / "_internal").is_dir():
+        return base / "browser_data"
     for cand in (base / "browser_data", base.parent / "browser_data"):
         if cand.exists():
             return cand
-    try:
-        target = base / "browser_data"
-        target.mkdir(parents=True, exist_ok=True)
-        return target
-    except Exception:
-        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SheetMate" / "browser_data"
+    return base / "browser_data"
 
 
 BROWSER_USER_DATA = get_browser_user_data_dir()
@@ -222,7 +230,8 @@ def _chromium_installed():
 
 
 def _run_driver_install():
-    """调用打包进程序的 playwright driver 下载 chromium 内核。"""
+    """调用打包进程序的 playwright driver 静默下载 chromium 内核。"""
+    creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW") else 0
     try:
         from playwright._impl._driver import compute_driver_executable
         drv = compute_driver_executable()
@@ -230,11 +239,11 @@ def _run_driver_install():
             cmd = [str(drv[0]), *[str(x) for x in drv[1:]], "install", "chromium"]
         else:
             cmd = [str(drv), "install", "chromium"]
-        subprocess.run(cmd, check=False, timeout=300)
+        subprocess.run(cmd, check=False, timeout=300, creationflags=creation)
     except Exception:
         try:
             subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
-                           check=False, timeout=300)
+                           check=False, timeout=300, creationflags=creation)
         except Exception:
             pass
 
@@ -295,9 +304,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.8.9"
+APP_VERSION = "2.9.0"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.8.9","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.9.0","url":"新版exe的下载直链"}
 DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
 GEMINI_MODEL_CANDIDATES = (
     "gemini-flash-latest",

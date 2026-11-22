@@ -1,6 +1,6 @@
-# 暗号表助手（SheetMate）v2.8.9
+# 暗号表助手（SheetMate）v2.9.0
 
-[![最新版本](https://img.shields.io/badge/Release-v2.8.9-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
+[![最新版本](https://img.shields.io/badge/Release-v2.9.0-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![运行平台](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-34C759?style=flat-square&logo=windows)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![云端远程入口](https://img.shields.io/badge/Cloud%20Web-点击打开远程控制台-5856D6?style=flat-square&logo=googlechrome)](https://sorenskr.github.io/SheetMate/)
 
@@ -12,16 +12,15 @@
 
 不管您是第一次拿到这个工具的新同事，还是需要在外出差用手机查看电脑跑表进度，都可以直接通过下方入口下载或打开：
 
-| 用途 / 版本 | 直达链接 | 适用场景说明 |
+| 用途 | 直达链接 | 特点说明 |
 | :--- | :--- | :--- |
-| **Windows 单文件免安装版**（推荐新手） | [**下载 SheetMate.exe**](https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe) | 只有单独一个 `.exe` 文件，不用解压，下载后双击即可运行，支持软件内一键检查更新 |
-| **Windows 极速便携压缩包**（推荐日常高频用） | [**下载 SheetMate-Windows-x64-Portable.zip**](https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate-Windows-x64-Portable.zip) | 解压到任意文件夹后双击里面的 `SheetMate.exe`，无需每次等待解压，秒开最顺滑 |
-| **云端异地远程控制台**（手机 / 外地网页） | [**打开 https://sorenskr.github.io/SheetMate/**](https://sorenskr.github.io/SheetMate/) | 手机浏览器或外地电脑打开，填好电脑上的**唯一名字**和**远程密码**即可端到端加密聊天、查数据、遥控跑表（网页内也提供客户端下载） |
-| **全部历史版本与发行说明** | [**查看 GitHub Releases**](https://github.com/Sorenskr/SheetMate/releases) | 查看完整迭代记录、各版本说明与文件 SHA-256 校验信息 |
+| **Windows 纯净单文件客户端**（推荐直接下载） | [**下载 SheetMate.exe**](https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe) | **就单个 EXE 程序**，下载后放在任意位置双击直接运行，不在软件旁生成杂乱文件夹，关闭窗口直接退出结束，支持一键检查更新 |
+| **云端异地远程控制台**（手机 / 外地网页） | [**打开 https://sorenskr.github.io/SheetMate/**](https://sorenskr.github.io/SheetMate/) | 手机浏览器或外地电脑打开，填好电脑上的**唯一名字**和**远程密码**即可通过双节点加密实时通道秒连电脑聊天、查数据、遥控跑表（网页内也提供客户端下载） |
+| **全部历史版本与发行说明** | [**查看 GitHub Releases**](https://github.com/Sorenskr/SheetMate/releases) | 查看完整迭代记录、版本更新详情与文件 SHA-256 校验信息 |
 
 ---
 
-## ✨ v2.8.9 核心功能一览
+## ✨ v2.9.0 核心功能一览
 
 - **全自动抓数写表 & 自定义格位**
   - 自动登录后台拉取三份源数据，自动规范格式并精准写入 WPS 金山在线汇总表，同步自动清理多余旧标签页。
@@ -44,7 +43,7 @@
 
 ## 🚀 三步快速上手
 
-1. **下载运行**：点击上方下载 [**SheetMate.exe**](https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe)（或下载解压便携压缩包），在 Windows 电脑上双击打开。首次使用如尚未安装浏览器内核，程序会引导或自动完成 Chromium 初始化。
+1. **下载运行**：点击上方下载 [**SheetMate.exe**](https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe)，在 Windows 电脑上双击直接运行（同目录不生成杂乱文件夹，关窗直接退出）。首次运行若未安装浏览器组件会自动静默补齐。
 2. **填好配置与起名字**：在右上角设置一个**全队不重名的专属名字**并挑选萌宠头像；填好 WPS 汇总表链接、数据账号与目标钉钉群名称（若需手机或外地电脑遥控，在【远程网站】中设置好您自己的远程密码即可）。
 3. **一键启动或定时值守**：点击控制中心底部的 **「立即全流程」** 即可自动完成抓数、写表、截图并投递钉钉；首次使用如 WPS 需要登录，手机扫码确认一次后后续即可全自动定时执行。
 

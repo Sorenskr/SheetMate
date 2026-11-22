@@ -269,8 +269,8 @@ DEFAULT_PERMISSIONS = {k: True for k, _t, _d in PERMISSION_META}
 MAX_HUB_BODY_BYTES = 2 * 1024 * 1024
 ADMIN_MAX_FAILS = 5
 ADMIN_LOCKOUT_SEC = 60.0
-SYNC_PULL_COOLDOWN_SEC = 1.5
-AUTO_CLOUD_PULL_COOLDOWN_SEC = 4.0
+SYNC_PULL_COOLDOWN_SEC = 2.0
+AUTO_CLOUD_PULL_COOLDOWN_SEC = 18.0
 _AUTO_CLOUD_TOPIC = "sm28_th_" + hmac.new(
     b"SheetMate-HubRoom",
     b"SheetMate-AutoHub-v281::DefaultTeamWorkspace",
@@ -333,7 +333,7 @@ def _th_mqtt_read_packet(sock):
     return hdr, body
 
 
-def _th_mqtt_retained_pull(topic, timeout=2.8):
+def _th_mqtt_retained_pull(topic, timeout=2.2):
     ctx = ssl.create_default_context()
     for host, port in _AUTO_CLOUD_BROKERS:
         try:
@@ -350,8 +350,8 @@ def _th_mqtt_retained_pull(topic, timeout=2.8):
                     s_vh = struct.pack("!H", 1)
                     s_pl = _th_mqtt_str(topic) + b"\x00"
                     ss.sendall(b"\x82" + _th_mqtt_enc_varlen(len(s_vh) + len(s_pl)) + s_vh + s_pl)
-                    ss.settimeout(1.2)
-                    deadline = time.monotonic() + 1.5
+                    ss.settimeout(0.55)
+                    deadline = time.monotonic() + 0.65
                     while time.monotonic() < deadline:
                         try:
                             hdr, body = _th_mqtt_read_packet(ss)
@@ -366,6 +366,12 @@ def _th_mqtt_retained_pull(topic, timeout=2.8):
                                 except Exception:
                                     pass
                                 return body[pos:].decode("utf-8", errors="ignore")
+                    # 首个健康节点已顺利连上但云端尚无保留消息，直接结束以免串行空等第二个节点
+                    try:
+                        ss.sendall(b"\xe0\x00")
+                    except Exception:
+                        pass
+                    return None
         except Exception:
             continue
     return None
@@ -717,11 +723,15 @@ class TeamHubManager:
         self._push_lock = threading.Lock()
         self._push_thread = None
         self._push_dirty = False
+        self._pull_lock = threading.Lock()
+        self._pull_thread = None
         self._profile = self._load_or_init_profile()
         self._state = self._load_state_raw()
         self._ensure_state_schema()
         self._backfill_local_runs_once()
         self._maybe_start_center_server()
+        if self._auto_cloud_enabled:
+            self._schedule_async_remote_pull(force=True)
 
     def _load_or_init_profile(self):
         if self._profile_path.exists():
@@ -875,41 +885,50 @@ class TeamHubManager:
         with self._lock:
             cur_prof = self.get_profile()
             my_uid = cur_prof.get("user_id")
-            if skip_name or (nickname is not None and not str(nickname).strip()):
-                self._sync_pull_if_needed(force=True)
-                taken = self._collect_taken_nickname_keys(exclude_uid=my_uid)
-                base_nm = f"未命名·{self._profile['member_code']}"
-                cand = base_nm
-                suffix_i = 2
-                while normalize_nickname_key(cand) in taken:
-                    cand = f"{base_nm}-{suffix_i}"
-                    suffix_i += 1
-                self._profile["nickname"] = cand
-                self._profile["initialized"] = True
-            elif nickname is not None:
-                nm = str(nickname).strip()[:24]
-                ok_av, msg_av = self.check_nickname_available(nm, exclude_uid=my_uid)
-                if not ok_av:
-                    return {
-                        "ok": False,
-                        "duplicate": True,
-                        "message": msg_av,
-                        "profile": cur_prof,
-                        **cur_prof,
-                    }
-                self._profile["nickname"] = nm
-                self._profile["initialized"] = True
-            if avatar is not None and str(avatar).strip():
-                self._profile["avatar"] = sanitize_avatar_url(avatar)
+            if nickname is None and not skip_name:
+                if avatar is not None and str(avatar).strip():
+                    self._profile["avatar"] = sanitize_avatar_url(avatar)
+                else:
+                    self._profile["avatar"] = sanitize_avatar_url(self._profile.get("avatar"))
+                self._save_profile()
+                prof = self.get_profile()
             else:
-                self._profile["avatar"] = sanitize_avatar_url(self._profile.get("avatar"))
-            self._save_profile()
-            prof = self.get_profile()
+                if skip_name or (nickname is not None and not str(nickname).strip()):
+                    self._sync_pull_if_needed(force=True)
+                    taken = self._collect_taken_nickname_keys(exclude_uid=my_uid)
+                    base_nm = f"未命名·{self._profile['member_code']}"
+                    cand = base_nm
+                    suffix_i = 2
+                    while normalize_nickname_key(cand) in taken:
+                        cand = f"{base_nm}-{suffix_i}"
+                        suffix_i += 1
+                    self._profile["nickname"] = cand
+                    self._profile["initialized"] = True
+                elif nickname is not None:
+                    nm = str(nickname).strip()[:24]
+                    ok_av, msg_av = self.check_nickname_available(nm, exclude_uid=my_uid)
+                    if not ok_av:
+                        return {
+                            "ok": False,
+                            "duplicate": True,
+                            "message": msg_av,
+                            "profile": cur_prof,
+                            **cur_prof,
+                        }
+                    self._profile["nickname"] = nm
+                    self._profile["initialized"] = True
+                if avatar is not None and str(avatar).strip():
+                    self._profile["avatar"] = sanitize_avatar_url(avatar)
+                else:
+                    self._profile["avatar"] = sanitize_avatar_url(self._profile.get("avatar"))
+                self._save_profile()
+                prof = self.get_profile()
         self.sync_member_snapshot(status_level="idle", step_text="更新了个人名片")
+        ok_msg = "已更换头像" if (nickname is None and not skip_name) else f"已保存您的专属名字：{prof.get('display_name', '')}"
         return {
             "ok": True,
             "duplicate": False,
-            "message": f"已保存您的专属名字：{prof.get('display_name', '')}",
+            "message": ok_msg,
             "profile": prof,
             **prof,
         }
@@ -1010,14 +1029,8 @@ class TeamHubManager:
                 return p / "team_hub_state.json"
         return None
 
-    def _sync_pull_if_needed(self, force=False):
-        sync = self._state.get("sync_settings") or {}
+    def _fetch_remote_state_unlocked(self, sync):
         mode = sync.get("mode", "local_or_shared")
-        if mode in ("http_hub", "gist_cloud"):
-            now_m = time.monotonic()
-            if not force and (now_m - self._last_pull_ts) < SYNC_PULL_COOLDOWN_SEC:
-                return False
-            self._last_pull_ts = now_m
         if mode == "http_hub":
             url = str(sync.get("hub_url") or "").strip().rstrip("/")
             if url:
@@ -1026,13 +1039,12 @@ class TeamHubManager:
                         f"{url}/hub/state",
                         headers={"X-Hub-Secret": str(sync.get("hub_secret") or "sheetmate-hub")},
                     )
-                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    with urllib.request.urlopen(req, timeout=3.5) as resp:
                         remote = json.loads(resp.read().decode("utf-8"))
                     if isinstance(remote, dict) and "lock" in remote:
-                        self._merge_remote_state(remote)
-                        return True
+                        return remote
                 except Exception:
-                    return False
+                    return None
         elif mode == "gist_cloud":
             tok = str(sync.get("gist_token") or "").strip()
             gid = str(sync.get("gist_id") or "").strip()
@@ -1046,41 +1058,87 @@ class TeamHubManager:
                             "User-Agent": "SheetMateHub",
                         },
                     )
-                    with urllib.request.urlopen(req, timeout=6.0) as resp:
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
                         gd = json.loads(resp.read().decode("utf-8"))
                     raw_c = (((gd.get("files") or {}).get("sheetmate_hub.json") or {}).get("content")) or ""
                     if raw_c:
                         remote = json.loads(raw_c)
                         if isinstance(remote, dict):
+                            return remote
+                except Exception:
+                    return None
+        elif self._auto_cloud_enabled:
+            try:
+                raw_msg = _th_mqtt_retained_pull(_AUTO_CLOUD_TOPIC, timeout=2.2)
+                if raw_msg:
+                    latest_obj = _auto_cloud_unpack(raw_msg)
+                    if isinstance(latest_obj, dict) and "members" in latest_obj:
+                        return latest_obj
+            except Exception:
+                return None
+        return None
+
+    def _schedule_async_remote_pull(self, force=False):
+        with self._lock:
+            sync_snap = dict(self._state.get("sync_settings") or {})
+        mode = sync_snap.get("mode", "local_or_shared")
+        if mode == "local_or_shared" and not self._auto_cloud_enabled:
+            return
+        if mode == "http_hub" and not str(sync_snap.get("hub_url") or "").strip():
+            return
+        if mode == "gist_cloud" and (
+            not str(sync_snap.get("gist_token") or "").strip()
+            or not str(sync_snap.get("gist_id") or "").strip()
+        ):
+            return
+        now_m = time.monotonic()
+        with self._pull_lock:
+            if self._pull_thread is not None and self._pull_thread.is_alive():
+                return
+            if mode in ("http_hub", "gist_cloud"):
+                cooldown = 1.0 if force else SYNC_PULL_COOLDOWN_SEC
+                if (now_m - self._last_pull_ts) < cooldown:
+                    return
+                self._last_pull_ts = now_m
+            else:
+                cooldown = 2.5 if force else AUTO_CLOUD_PULL_COOLDOWN_SEC
+                if (now_m - self._last_auto_pull_ts) < cooldown:
+                    return
+                self._last_auto_pull_ts = now_m
+
+            def _pull_worker():
+                try:
+                    remote = self._fetch_remote_state_unlocked(sync_snap)
+                    if isinstance(remote, dict):
+                        with self._lock:
+                            self._merge_remote_state(remote)
+                except Exception:
+                    pass
+                finally:
+                    with self._pull_lock:
+                        self._pull_thread = None
+
+            th = threading.Thread(target=_pull_worker, daemon=True, name="TeamHubAsyncPull")
+            self._pull_thread = th
+            th.start()
+
+    def _sync_pull_if_needed(self, force=False):
+        sync = self._state.get("sync_settings") or {}
+        mode = sync.get("mode", "local_or_shared")
+        if mode == "local_or_shared":
+            sf = self._shared_state_file()
+            if sf is not None:
+                if sf.exists():
+                    try:
+                        remote = json.loads(sf.read_text(encoding="utf-8"))
+                        if isinstance(remote, dict) and "lock" in remote:
                             self._merge_remote_state(remote)
                             return True
-                except Exception:
-                    return False
-        else:
-            sf = self._shared_state_file()
-            if sf is not None and sf.exists():
-                try:
-                    remote = json.loads(sf.read_text(encoding="utf-8"))
-                    if isinstance(remote, dict) and "lock" in remote:
-                        self._merge_remote_state(remote)
-                        return True
-                except Exception:
-                    return False
-            elif sf is None and self._auto_cloud_enabled:
-                now_m = time.monotonic()
-                cooldown = 0.8 if force else AUTO_CLOUD_PULL_COOLDOWN_SEC
-                if (now_m - self._last_auto_pull_ts) < cooldown:
-                    return False
-                self._last_auto_pull_ts = now_m
-                try:
-                    raw_msg = _th_mqtt_retained_pull(_AUTO_CLOUD_TOPIC, timeout=2.5)
-                    if raw_msg:
-                        latest_obj = _auto_cloud_unpack(raw_msg)
-                        if isinstance(latest_obj, dict) and "members" in latest_obj:
-                            self._merge_remote_state(latest_obj)
-                            return True
-                except Exception:
-                    return False
+                    except Exception:
+                        return False
+                return False
+        # 所有网络拉取全部走后台异步线程，绝不在持锁状态阻塞前端接口与按钮点击
+        self._schedule_async_remote_pull(force=force)
         return False
 
     def _merge_remote_state(self, remote):

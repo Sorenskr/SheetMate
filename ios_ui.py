@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.8.9 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.9.0 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -90,8 +90,8 @@ def _find_app_shell_browser():
     return None, None
 
 
-def _apply_square_rounded_win32(wx, wy, win_w, win_h=None):
-    """为桌面 --app 窗口应用 Windows 11 原生四角大圆角，若旧记忆尺寸过小则扩至宽屏尺寸。"""
+def _apply_square_rounded_win32(wx, wy, win_w, win_h=None, win_state=None):
+    """为桌面 --app 窗口应用 Windows 11 原生四角大圆角，并记录主窗口句柄用于关窗即退监测。"""
     if win_h is None:
         win_h = win_w
     if os.name != "nt":
@@ -132,12 +132,21 @@ def _apply_square_rounded_win32(wx, wy, win_w, win_h=None):
                     title = tbuf.value or ""
                     cls = cbuf.value or ""
                     if "暗号表助手" in title and cls.startswith("Chrome_WidgetWin"):
-                        found_hwnd = int(hwnd)
-                        return False
+                        rc_chk = wintypes.RECT()
+                        if user32.GetWindowRect(hwnd, ctypes.byref(rc_chk)):
+                            if (rc_chk.right - rc_chk.left) >= 240 and (rc_chk.bottom - rc_chk.top) >= 200:
+                                found_hwnd = int(hwnd)
+                                return False
+                        else:
+                            found_hwnd = int(hwnd)
+                            return False
                     return True
 
                 user32.EnumWindows(WNDENUMPROC(_cb), 0)
                 if found_hwnd:
+                    if isinstance(win_state, dict):
+                        win_state["hwnd"] = int(found_hwnd)
+                        win_state["seen"] = True
                     if not styled:
                         try:
                             # DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2
@@ -227,12 +236,12 @@ class _SheetMateController:
                 self.mobile_bridge.start()
             except Exception:
                 pass
-            try:
-                mobile_bridge.export_static_mobile_web(Path(base_dir) / "mobile_web.html")
-                if (Path(base_dir) / ".git").exists():
+            if (Path(base_dir) / ".git").exists():
+                try:
+                    mobile_bridge.export_static_mobile_web(Path(base_dir) / "mobile_web.html")
                     mobile_bridge.export_github_pages_site(Path(base_dir) / "docs")
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
         app.set_gui_logger(self._on_log)
         app.set_step_callback(self._on_step)
@@ -2023,8 +2032,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/png" href="/icon.png?v=2.8.9" />
-<link rel="shortcut icon" href="/favicon.ico?v=2.8.9" />
+<link rel="icon" type="image/png" href="/icon.png?v=2.9.0" />
+<link rel="shortcut icon" href="/favicon.ico?v=2.9.0" />
 <style>
   :root {
     --bg: #EAF0F8;
@@ -4400,9 +4409,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.8.9" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.9.0" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.8.9</span>
+          <span class="ver-pill" id="verBadge">v2.9.0</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -6729,15 +6738,25 @@ function showToast(msg) {
   el._t = setTimeout(() => el.classList.remove("show"), 1900);
 }
 
-async function api(path, method = "GET", body = null, extraHeaders = null) {
+async function api(path, method = "GET", body = null, extraHeaders = null, timeoutMs = 15000) {
   const headers = { "X-Token": TOKEN, "Content-Type": "application/json" };
   if (extraHeaders && typeof extraHeaders === "object") {
     Object.assign(headers, extraHeaders);
   }
   const opts = { method, headers };
   if (body !== null) opts.body = JSON.stringify(body);
-  const res = await fetch(path, opts);
-  return await res.json();
+  let tm = null;
+  if (typeof AbortController !== "undefined" && timeoutMs > 0) {
+    const ac = new AbortController();
+    opts.signal = ac.signal;
+    tm = setTimeout(() => ac.abort(), timeoutMs);
+  }
+  try {
+    const res = await fetch(path, opts);
+    return await res.json();
+  } finally {
+    if (tm) clearTimeout(tm);
+  }
 }
 
 function scrollToLogBottom(smooth = false) {
@@ -7881,9 +7900,12 @@ async function sendAiSummary(styleId, rawPrompt) {
   }
 }
 
+let pollInFlight = false;
 async function pollState() {
+  if (pollInFlight) return;
+  pollInFlight = true;
   try {
-    const st = await api(`/api/state?since=${lastLogSeq}`);
+    const st = await api(`/api/state?since=${lastLogSeq}`, "GET", null, null, 4500);
     $("verBadge").textContent = `v${st.version}`;
     if (previewMemberUid) {
       updateTeamLockBanner(st.lock_status, st.queue_status, st.member_profile);
@@ -8052,6 +8074,8 @@ async function pollState() {
     }
   } catch (_err) {
     // 忽略瞬时刷新抖动
+  } finally {
+    pollInFlight = false;
   }
 }
 
@@ -8686,9 +8710,14 @@ function bindEvents() {
     if (ok) window.open(safeU, "_blank", "noopener,noreferrer");
   };
 
-  window.addEventListener("pagehide", () => {
+  let closeBeaconSent = false;
+  const sendCloseBeacon = () => {
+    if (closeBeaconSent) return;
+    closeBeaconSent = true;
     try { navigator.sendBeacon(`/api/close?token=${encodeURIComponent(TOKEN)}`, "{}"); } catch (_e) {}
-  });
+  };
+  window.addEventListener("beforeunload", sendCloseBeacon);
+  window.addEventListener("pagehide", sendCloseBeacon);
 
   bindTeamCollabAndAdminEvents();
 }
@@ -8758,34 +8787,64 @@ async function applyFocusTeamUpdate(rawTeam, toastMsg = "") {
   if (toastMsg) showToast(toastMsg);
 }
 
-async function openProfileModal() {
-  const data = await api("/api/profile");
-  if (data && data.profile) memberProfile = data.profile;
-  if (Array.isArray(data.presets)) avatarPresets = data.presets;
-  if (data && data.sync_settings) syncSettingsState = data.sync_settings;
-  const prof = memberProfile || {};
-  selectedAvatarUrl = safeAvatarUrl(prof.avatar) || safeAvatarUrl(avatarPresets[0] && avatarPresets[0].url);
-  $("profileNicknameInput").value = prof.nickname || "";
-  $("profileAvatarPreview").src = selectedAvatarUrl;
-
+function renderAvatarPresetsGrid() {
   const grid = $("avatarPresetsGrid");
+  if (!grid) return;
   grid.innerHTML = "";
+  if (!Array.isArray(avatarPresets) || !avatarPresets.length) {
+    const tip = document.createElement("div");
+    tip.style.cssText = "grid-column:1 / -1;font-size:12px;color:var(--sub);text-align:center;padding:10px 0;";
+    tip.textContent = "正在加载萌宠头像…";
+    grid.appendChild(tip);
+    return;
+  }
   for (const av of avatarPresets) {
     const safeUrl = safeAvatarUrl(av.url);
     const item = document.createElement("button");
     item.type = "button";
     item.className = "avatar-preset-opt" + (selectedAvatarUrl === safeUrl ? " active" : "");
     item.innerHTML = `<img src="${safeUrl}" alt="" /><span>${escapeHtmlStr(av.name)}</span>`;
-    item.onclick = () => {
+    item.onclick = async () => {
       selectedAvatarUrl = safeUrl;
       $("profileAvatarPreview").src = safeUrl;
+      if ($("memberMiniAvatar")) $("memberMiniAvatar").src = safeUrl;
       for (const ch of grid.querySelectorAll(".avatar-preset-opt")) ch.classList.remove("active");
       item.classList.add("active");
+      try {
+        const r = await api("/api/profile", "POST", { avatar: safeUrl }, null, 5000);
+        if (r && r.ok && r.profile) {
+          memberProfile = r.profile;
+          updateMemberTopChip(r.profile);
+          showToast("已更换头像：" + (av.name || ""));
+        }
+      } catch (_e) {}
     };
     grid.appendChild(item);
   }
+}
 
+async function openProfileModal() {
+  const prof0 = memberProfile || {};
+  if (!selectedAvatarUrl) {
+    selectedAvatarUrl = safeAvatarUrl(prof0.avatar) || safeAvatarUrl(avatarPresets[0] && avatarPresets[0].url);
+  }
+  if ($("profileNicknameInput")) $("profileNicknameInput").value = prof0.nickname || "";
+  if ($("profileAvatarPreview") && selectedAvatarUrl) $("profileAvatarPreview").src = selectedAvatarUrl;
+  renderAvatarPresetsGrid();
   $("profileModalMask").classList.add("show");
+  try {
+    const data = await api("/api/profile", "GET", null, null, 4500);
+    if (data && data.profile) memberProfile = data.profile;
+    if (Array.isArray(data && data.presets) && data.presets.length) avatarPresets = data.presets;
+    if (data && data.sync_settings) syncSettingsState = data.sync_settings;
+    const prof = memberProfile || {};
+    selectedAvatarUrl = safeAvatarUrl(prof.avatar) || safeAvatarUrl(avatarPresets[0] && avatarPresets[0].url);
+    if ($("profileNicknameInput") && document.activeElement !== $("profileNicknameInput")) {
+      $("profileNicknameInput").value = prof.nickname || "";
+    }
+    if ($("profileAvatarPreview")) $("profileAvatarPreview").src = selectedAvatarUrl;
+    renderAvatarPresetsGrid();
+  } catch (_e) {}
 }
 
 function resizeUploadedAvatar(file) {
@@ -9229,8 +9288,8 @@ function bindTeamCollabAndAdminEvents() {
     $("aiClearTeamBtn").onclick = () => applyFocusTeamUpdate("", "已清空组名筛选，恢复全部团队公平分析");
   }
 
-  // 成员身份头像与编号（支持随机自动落盘与关窗前自动保存未存修改）
-  const saveProfileSelection = async ({ closeOnSuccess = true, silentIfUnchanged = false } = {}) => {
+  // 成员身份头像与编号（支持秒保存头像/随机名、回车保存及关窗防遗漏）
+  const saveProfileSelection = async ({ closeOnSuccess = true, silentIfUnchanged = false, allowEmpty = false } = {}) => {
     const nick = $("profileNicknameInput").value.trim();
     const curProf = memberProfile || {};
     const curNick = (curProf.nickname || "").trim();
@@ -9239,11 +9298,15 @@ function bindTeamCollabAndAdminEvents() {
       if (closeOnSuccess) $("profileModalMask").classList.remove("show");
       return true;
     }
-    const r = await api("/api/profile", "POST", {
-      nickname: nick,
-      skip_name: !nick,
-      avatar: selectedAvatarUrl,
-    });
+    if (!nick && !allowEmpty) {
+      showToast("请先输入好记的名字，或点右边【随机名字】");
+      $("profileNicknameInput").focus();
+      return false;
+    }
+    const payload = nick
+      ? { nickname: nick, skip_name: false, avatar: selectedAvatarUrl }
+      : { avatar: selectedAvatarUrl };
+    const r = await api("/api/profile", "POST", payload, null, 6000);
     if (r && r.ok) {
       memberProfile = r.profile;
       updateMemberTopChip(r.profile);
@@ -9260,8 +9323,12 @@ function bindTeamCollabAndAdminEvents() {
     const inp = $("profileNicknameInput").value.trim();
     const curNick = ((memberProfile && memberProfile.nickname) || "").trim();
     const curAv = safeAvatarUrl(memberProfile && memberProfile.avatar);
-    if ((inp && inp !== curNick) || selectedAvatarUrl !== curAv) {
+    if (inp && inp !== curNick) {
       await saveProfileSelection({ closeOnSuccess: true, silentIfUnchanged: true });
+      return;
+    }
+    if (selectedAvatarUrl && selectedAvatarUrl !== curAv) {
+      await saveProfileSelection({ closeOnSuccess: true, silentIfUnchanged: true, allowEmpty: true });
       return;
     }
     $("profileModalMask").classList.remove("show");
@@ -9271,15 +9338,21 @@ function bindTeamCollabAndAdminEvents() {
   $("profileModalMask").addEventListener("click", (ev) => {
     if (ev.target === $("profileModalMask")) closeProfileModalSmart();
   });
+  $("profileNicknameInput").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      saveProfileSelection({ closeOnSuccess: true, silentIfUnchanged: false });
+    }
+  });
   $("profileDiceBtn").onclick = async () => {
-    const r = await api(`/api/profile/random-name?exclude=${encodeURIComponent($("profileNicknameInput").value.trim())}`);
+    const r = await api(`/api/profile/random-name?exclude=${encodeURIComponent($("profileNicknameInput").value.trim())}`, "GET", null, null, 4500);
     if (r && r.nickname) {
       $("profileNicknameInput").value = r.nickname;
       await saveProfileSelection({ closeOnSuccess: false, silentIfUnchanged: false });
     }
   };
   $("profileSkipNameBtn").onclick = async () => {
-    const r = await api("/api/profile", "POST", { skip_name: true, avatar: selectedAvatarUrl });
+    const r = await api("/api/profile", "POST", { skip_name: true, avatar: selectedAvatarUrl }, null, 5000);
     if (r && r.ok) {
       memberProfile = r.profile;
       updateMemberTopChip(r.profile);
@@ -9292,8 +9365,16 @@ function bindTeamCollabAndAdminEvents() {
     if (!f) return;
     selectedAvatarUrl = await resizeUploadedAvatar(f);
     $("profileAvatarPreview").src = selectedAvatarUrl;
+    if ($("memberMiniAvatar")) $("memberMiniAvatar").src = selectedAvatarUrl;
     for (const ch of $("avatarPresetsGrid").querySelectorAll(".avatar-preset-opt")) ch.classList.remove("active");
-    showToast("已导入自定义头像");
+    try {
+      const r = await api("/api/profile", "POST", { avatar: selectedAvatarUrl }, null, 5000);
+      if (r && r.ok && r.profile) {
+        memberProfile = r.profile;
+        updateMemberTopChip(r.profile);
+      }
+    } catch (_e) {}
+    showToast("已导入并保存自定义头像");
   };
   $("profileSaveBtn").onclick = () => saveProfileSelection({ closeOnSuccess: true, silentIfUnchanged: false });
 
@@ -9962,6 +10043,8 @@ def _make_handler(ctrl, token):
                 return
 
             if parsed.path == "/":
+                ctrl.close_requested_at = 0.0
+                ctrl.last_heartbeat = time.time()
                 body = HTML_TEMPLATE.replace("__TOKEN_JSON__", json.dumps(token)).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self._send_security_headers()
@@ -10255,6 +10338,7 @@ def show_settings_window(app):
     shell_exe, _kind = _find_app_shell_browser()
     proc = None
     launched_at = time.time()
+    win_state = {"hwnd": 0, "seen": False}
 
     if shell_exe:
         rt_base = app.get_local_runtime_dir() if hasattr(app, "get_local_runtime_dir") else (app.app_dir() / "runtime_data")
@@ -10278,7 +10362,7 @@ def show_settings_window(app):
         ]
         try:
             proc = subprocess.Popen(cmd)
-            _apply_square_rounded_win32(wx, wy, win_w, win_h)
+            _apply_square_rounded_win32(wx, wy, win_w, win_h, win_state=win_state)
         except Exception:
             proc = None
 
@@ -10299,9 +10383,15 @@ def show_settings_window(app):
     glass = neu.GlassProgress(tk_root, title="暗号表助手")
     ctrl.attach_glass(glass, tk_root)
 
+    _exiting = False
+
     def _shutdown():
+        nonlocal _exiting
+        if _exiting:
+            return
+        _exiting = True
         try:
-            ctrl.save_config(ctrl.get_config())
+            app.save_config(app.normalize_config(ctrl.get_config()))
         except Exception:
             pass
         try:
@@ -10309,7 +10399,13 @@ def show_settings_window(app):
         except Exception:
             pass
         try:
-            server.shutdown()
+            if getattr(ctrl, "mobile_bridge", None) is not None:
+                ctrl.mobile_bridge.stop()
+        except Exception:
+            pass
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
         except Exception:
             pass
         try:
@@ -10320,13 +10416,20 @@ def show_settings_window(app):
 
     def _watch_lifecycle():
         now = time.time()
-        if ctrl.close_requested_at > 0 and (now - ctrl.close_requested_at) > 1.6 and (now - ctrl.last_heartbeat) > 1.4:
+        if win_state["seen"] and (now - launched_at) > 2.2 and os.name == "nt":
+            try:
+                if not ctypes.windll.user32.IsWindow(wintypes.HWND(win_state["hwnd"])):
+                    _shutdown()
+                    return
+            except Exception:
+                pass
+        if ctrl.close_requested_at > 0 and (now - ctrl.close_requested_at) > 0.45:
             _shutdown()
             return
-        if proc is not None and (now - launched_at) > 3.0 and proc.poll() is not None and (now - ctrl.last_heartbeat) > 2.5:
+        if proc is not None and not win_state["seen"] and (now - launched_at) > 4.0 and proc.poll() is not None and (now - ctrl.last_heartbeat) > 2.5:
             _shutdown()
             return
-        tk_root.after(450, _watch_lifecycle)
+        tk_root.after(220, _watch_lifecycle)
 
-    tk_root.after(1000, _watch_lifecycle)
+    tk_root.after(600, _watch_lifecycle)
     tk_root.mainloop()
