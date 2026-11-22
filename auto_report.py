@@ -304,9 +304,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.9.1"
+APP_VERSION = "2.9.2"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.9.1","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.9.2","url":"新版exe的下载直链"}
 DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
 GEMINI_MODEL_CANDIDATES = (
     "gemini-flash-latest",
@@ -931,8 +931,16 @@ def classify_error_detail(exc=None, stage="", extra=None):
             "优化钉钉托盘唤起与登录主窗口的识别类名",
         )
 
-    if st == "dingtalk_search" or "未能自动搜到" in err_s or "没能定位到钉钉会话" in err_s:
-        tgt = extra.get("search_name") or "目标群聊"
+    if st == "dingtalk_search" or "未能自动搜到" in err_s or "没能定位到钉钉会话" in err_s or "一对一匹配" in err_s:
+        tgt = extra.get("search_name") or "目标联系人"
+        if "一对一匹配" in err_s or "文件传输助手" in err_s:
+            return _pack(
+                "ERR-DT-303",
+                f"未找到与「{tgt}」一对一匹配的钉钉对象",
+                err_s,
+                "1. 请核对人名或群名是否有误；\n2. 确认数据文件与钉钉通讯录中有此人后再发（已安全拦截，不会误发给文件传输助手）。",
+                f"核对联系人「{tgt}」姓名拼写与花名册匹配逻辑",
+            )
         return _pack(
             "ERR-DT-303",
             f"钉钉里没搜到「{tgt}」",
@@ -2853,13 +2861,67 @@ def _save_verified_dingtalk_target(alias_name, confirmed_dt_name):
         pass
 
 
+_DAILY_TSV_NAMES_CACHE = {"sig": "", "people": [], "groups": []}
+
+
+def _load_names_from_daily_tsv(report_dir=None):
+    """读取桌面数据日报 TSV 全员真实姓名与组别，并按文件 mtime 缓存避免反复读盘。"""
+    base = Path(report_dir) if report_dir else (Path.home() / "Desktop" / "数据日报")
+    if not base.exists():
+        return [], []
+    sig_parts, files = [], []
+    for nm in ("暗号数据.tsv", "注册数据.tsv", "短链数据.tsv"):
+        p = base / nm
+        if p.exists() and p.is_file():
+            try:
+                st = p.stat()
+                sig_parts.append(f"{nm}:{int(st.st_mtime)}:{st.st_size}")
+                files.append(p)
+            except Exception:
+                pass
+    sig = "|".join(sig_parts)
+    if sig and sig == _DAILY_TSV_NAMES_CACHE.get("sig"):
+        return list(_DAILY_TSV_NAMES_CACHE["people"]), list(_DAILY_TSV_NAMES_CACHE["groups"])
+
+    people, groups = [], []
+    seen_p, seen_g = set(), set()
+    skip_vals = {"合计", "总计", "汇总", "小计", "全员", "未知", "-", "—", "无", "空", "null", "none", "nan"}
+    for p in files:
+        try:
+            lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+            if len(lines) < 2:
+                continue
+            hdr = [h.strip() for h in lines[0].split("\t")]
+            p_cols = [i for i, h in enumerate(hdr) if any(k in h for k in ("姓名", "员工", "归属", "负责", "人员", "成员", "用户名", "推广员"))]
+            g_cols = [i for i, h in enumerate(hdr) if any(k in h for k in ("团队", "小组", "组别", "部门", "战队"))]
+            for ln in lines[1:800]:
+                cols = ln.split("\t")
+                for ci in p_cols:
+                    if ci < len(cols):
+                        val = cols[ci].strip()
+                        if val and val.lower() not in skip_vals and 2 <= len(val) <= 12 and not val.isdigit() and val not in seen_p:
+                            seen_p.add(val)
+                            people.append(val)
+                for ci in g_cols:
+                    if ci < len(cols):
+                        val = cols[ci].strip()
+                        if val and val.lower() not in skip_vals and 2 <= len(val) <= 20 and not val.isdigit() and val not in seen_g:
+                            seen_g.add(val)
+                            groups.append(val)
+        except Exception:
+            pass
+    if sig:
+        _DAILY_TSV_NAMES_CACHE["sig"] = sig
+        _DAILY_TSV_NAMES_CACHE["people"] = people
+        _DAILY_TSV_NAMES_CACHE["groups"] = groups
+    return people, groups
+
+
 def collect_known_people_and_groups(cfg=None, extra_roster=None):
-    """汇总花名册：配置群聊、协同成员唯一昵称/备注、历史档案真实员工及各组名称。"""
+    """汇总花名册：配置群聊、协同成员唯一昵称/备注、数据档案及桌面数据日报全部真实员工与组别。"""
     norm = normalize_config(cfg if isinstance(cfg, dict) else {})
-    people = []
-    groups = []
-    seen_p = set()
-    seen_g = set()
+    people, groups = [], []
+    seen_p, seen_g = set(), set()
 
     def _add_p(val):
         s = str(val or "").strip()
@@ -2889,12 +2951,21 @@ def collect_known_people_and_groups(cfg=None, extra_roster=None):
             _add_p(mem)
 
     try:
-        arch = load_report_archive(limit=5)
-        for rec in (arch or [])[-3:]:
+        arch = load_report_archive(limit=8)
+        for rec in (arch or [])[-6:]:
             for p_it in (rec.get("personal") or []):
                 _add_p(p_it.get("name"))
             for t_it in (rec.get("teams") or []):
                 _add_g(t_it.get("team"))
+    except Exception:
+        pass
+
+    try:
+        tsv_p, tsv_g = _load_names_from_daily_tsv()
+        for val in tsv_p:
+            _add_p(val)
+        for val in tsv_g:
+            _add_g(val)
     except Exception:
         pass
 
@@ -3006,16 +3077,99 @@ def detect_dingtalk_logged_in_user_name(use_cache=True):
     return detected
 
 
+def _gb2312_initial(ch):
+    """零依赖获取常用汉字拼音首字母（基于 GBK/GB2312 一级字拼音区间）。"""
+    if "a" <= ch <= "z" or "A" <= ch <= "Z":
+        return ch.lower()
+    if "0" <= ch <= "9":
+        return ch
+    try:
+        b = ch.encode("gbk")
+    except Exception:
+        return ch
+    if len(b) < 2:
+        return ch
+    code = (b[0] << 8) + b[1]
+    bounds = (
+        (0xB0A1, 0xB0C4, "a"), (0xB0C5, 0xB2C0, "b"), (0xB2C1, 0xB4ED, "c"),
+        (0xB4EE, 0xB6E9, "d"), (0xB6EA, 0xB7A1, "e"), (0xB7A2, 0xB8C0, "f"),
+        (0xB8C1, 0xB9FD, "g"), (0xB9FE, 0xBBF6, "h"), (0xBBF7, 0xBFA5, "j"),
+        (0xBFA6, 0xC0AB, "k"), (0xC0AC, 0xC2E7, "l"), (0xC2E8, 0xC4C2, "m"),
+        (0xC4C3, 0xC5B5, "n"), (0xC5B6, 0xC5BD, "o"), (0xC5BE, 0xC6D9, "p"),
+        (0xC6DA, 0xC8BA, "q"), (0xC8BB, 0xC8F5, "r"), (0xC8F6, 0xCBF9, "s"),
+        (0xCBFA, 0xCDD9, "t"), (0xCDDA, 0xCEF3, "w"), (0xCEF4, 0xD1B8, "x"),
+        (0xD1B9, 0xD4D0, "y"), (0xD4D1, 0xD7F9, "z"),
+    )
+    for lo, hi, ini in bounds:
+        if lo <= code <= hi:
+            return ini
+    return ch
+
+
+_HOMOPHONE_GROUPS = (
+    "娄楼卢芦鲁陆", "慧会惠卉辉汇晖", "珍真贞臻振震甄", "刘留柳流六",
+    "奕亦毅艺意怡依伊逸易益义宜", "慕木穆沐牧", "杰洁捷婕哲喆", "小晓筱肖萧笑",
+    "聪匆琮从", "俊军君钧骏", "鑫欣馨新心辛", "磊雷蕾", "泉全权铨", "马码玛",
+    "豫玉宇雨羽予御", "鄂俄额", "罗落洛骆", "东冬栋董", "张章彰", "王汪",
+    "李理里礼黎丽利立莉力", "陈晨辰沉橙", "杨洋阳扬", "黄皇", "赵兆",
+    "周洲舟", "吴武伍无", "徐许旭绪", "朱祝竹", "胡湖虎", "高糕", "林琳霖",
+    "何和河贺赫", "郭国", "梁良凉亮", "郑正政", "宋松颂", "潘盼攀", "江姜蒋将",
+    "峰锋丰风枫凤", "涛滔韬", "浩豪昊皓", "伟玮炜威巍", "敏民鸣明铭名",
+    "静晶景靖净", "婷亭廷庭", "雯文闻纹", "佳嘉家加", "思斯丝", "涵寒韩汉",
+)
+_HOMOPHONE_CHAR_MAP = {}
+for _gi, _grp in enumerate(_HOMOPHONE_GROUPS):
+    for _ch in _grp:
+        _HOMOPHONE_CHAR_MAP.setdefault(_ch, f"H{_gi}")
+
+
+def _char_phonetic_token(ch):
+    return _HOMOPHONE_CHAR_MAP[ch] if ch in _HOMOPHONE_CHAR_MAP else ("I_" + _gb2312_initial(ch))
+
+
+def _phonetic_name_similarity(q_name, cand_name):
+    """计算中文姓名同音/拼音首字母/字形综合相似度（0.0~1.0），用于错别字与同音字智能找人。"""
+    import difflib
+    q = str(q_name or "").strip()
+    c = str(cand_name or "").strip()
+    if not q or not c:
+        return 0.0
+    if q == c:
+        return 1.0
+    if abs(len(q) - len(c)) > 1:
+        return 0.0
+    if len(q) == len(c):
+        pos_scores, exact_cnt, homo_cnt = [], 0, 0
+        for qc, cc in zip(q, c):
+            if qc == cc:
+                pos_scores.append(1.0)
+                exact_cnt += 1
+            elif qc in _HOMOPHONE_CHAR_MAP and _HOMOPHONE_CHAR_MAP.get(qc) == _HOMOPHONE_CHAR_MAP.get(cc):
+                pos_scores.append(0.88)
+                homo_cnt += 1
+            elif _gb2312_initial(qc) == _gb2312_initial(cc) and _gb2312_initial(qc).isalpha():
+                pos_scores.append(0.62)
+            else:
+                pos_scores.append(0.0)
+        avg = sum(pos_scores) / max(1, len(pos_scores))
+        if (exact_cnt + homo_cnt) >= max(2, len(q)) and exact_cnt >= 1:
+            return max(avg, 0.88)
+        if exact_cnt >= 1 and sum(1 for x in pos_scores if x >= 0.62) == len(pos_scores):
+            return max(avg, 0.82)
+        return avg
+    return difflib.SequenceMatcher(None, [_char_phonetic_token(x) for x in q], [_char_phonetic_token(x) for x in c]).ratio() * 0.78
+
+
 def _clean_spoken_target_phrase(raw_t):
     s = str(raw_t or "").strip()
     s = re.sub(r"^[「\"'『\s]+|[」\"'』\s]+$", "", s)
-    s = re.sub(r"^(?:钉钉上的?|钉钉里的?|钉钉|给|同事|好友|那位)\s*", "", s)
+    s = re.sub(r"^(?:钉钉上的?|钉钉里的?|钉钉|给|发给|发送到|发到|投递给|私发给?|找|联系|同事|好友|那位|换成)\s*", "", s)
     s = re.sub(r"(?:的钉钉|那边|那里|这里|一下|看看|吧|啊|呀|哦|就行|就好|哈|呢)$", "", s).strip()
     return s
 
 
 def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_roster=None, use_ai=True, is_local_speaker=True):
-    """模糊理解口语/简称/“我”等称呼，结合花名册、本机钉钉登录身份与内置 AI 生成高命中率搜索候选链。"""
+    """模糊与同音纠错找人：严格一对一匹配，绝不把查无此人错投给文件小助手，找不到直接报错。"""
     import difflib
 
     cleaned = _clean_spoken_target_phrase(raw_target)
@@ -3023,18 +3177,37 @@ def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_r
     roster = collect_known_people_and_groups(cfg=norm_cfg, extra_roster=extra_roster)
     verified = _load_verified_dingtalk_targets()
 
+    if cleaned in ("文件小助手", "文件传输助手", "小助手", "传输助手"):
+        return {
+            "ok": True,
+            "raw": str(raw_target or ""),
+            "resolved_name": "文件小助手",
+            "candidates": ["文件小助手"],
+            "matched_from_roster": True,
+            "is_self": True,
+            "explicit_assistant": True,
+            "note": "已明确指定发往「文件小助手」",
+        }
+
     if cleaned in ("发群", "发群里", "发到群", "发到群里", "群", "群里", "大群", "默认群"):
         fallback_tgts = get_enabled_dt_targets(norm_cfg)
-        fb_name = fallback_tgts[0] if fallback_tgts else "文件小助手"
+        if not fallback_tgts:
+            return {
+                "ok": False,
+                "not_found": True,
+                "raw": str(raw_target or ""),
+                "error": "您还没有在【钉钉投递】里配置任何目标群聊，请先填写群名称或直接说「发给某某某」。",
+            }
+        fb_name = fallback_tgts[0]
         return {
             "ok": True,
             "raw": str(raw_target or ""),
             "resolved_name": fb_name,
-            "candidates": list(dict.fromkeys(fallback_tgts or ["文件小助手"])),
+            "candidates": list(dict.fromkeys(fallback_tgts)),
             "matched_from_roster": True,
             "is_self": False,
             "is_group_default": True,
-            "note": f"已将「{cleaned}」对应为您配置好的发送目标「{'、'.join(fallback_tgts) if fallback_tgts else fb_name}」",
+            "note": f"已将「{cleaned}」对应为您配置好的发送目标「{'、'.join(fallback_tgts)}」",
         }
 
     if cleaned in ("我", "我自己", "本人", "我本人", "我的", "我的钉钉", "自己"):
@@ -3051,46 +3224,46 @@ def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_r
                         remark_real = rmk
                     break
 
+        dt_self = detect_dingtalk_logged_in_user_name() if is_local_speaker else ""
+        real_cands = [x for x in dict.fromkeys([sp_real, remark_real, dt_self]) if x]
+        if not real_cands:
+            sp_desc = f"当前登录名为「{sp}」，" if sp else ""
+            return {
+                "ok": False,
+                "not_found": True,
+                "raw": str(raw_target or ""),
+                "error": (
+                    f"未能确定「我」对应的真实联系人姓名（{sp_desc}数据文件与钉钉中均无跟您一对一匹配的实名，程序与文件传输助手无关，不会错发给文件小助手）。"
+                    f"请在软件右上角把昵称设为您的钉钉真实姓名，或直接告诉我「发给 某某某」！"
+                ),
+            }
+
+        best_self = real_cands[0]
         if is_local_speaker:
-            dt_self = detect_dingtalk_logged_in_user_name()
-            cands = [x for x in dict.fromkeys([sp_real, remark_real, dt_self, "文件小助手"]) if x]
-            best_self = cands[0]
-            if sp_real or remark_real or dt_self:
-                note_txt = f"已识别「我」为当前用户「{best_self}」（搜不到本人会话将自动发至「文件小助手」）"
-            else:
-                note_txt = "已识别「我」为当前本机操作人，已自动定位您的钉钉「文件小助手」私聊"
             return {
                 "ok": True,
                 "raw": str(raw_target or ""),
                 "resolved_name": best_self,
-                "candidates": cands,
-                "matched_from_roster": bool(sp_real or remark_real or dt_self),
+                "candidates": real_cands,
+                "matched_from_roster": True,
                 "is_self": True,
-                "note": note_txt,
+                "note": f"已一对一识别「我」为「{best_self}」",
             }
-
-        remote_real = sp_real or remark_real
-        if remote_real:
-            cleaned = remote_real
-            is_self = True
-        else:
-            fallback_tgts = get_enabled_dt_targets(norm_cfg)
-            fb_name = fallback_tgts[0] if fallback_tgts else "文件小助手"
-            return {
-                "ok": True,
-                "raw": str(raw_target or ""),
-                "resolved_name": fb_name,
-                "candidates": [fb_name],
-                "matched_from_roster": False,
-                "is_self": True,
-                "note": f"远程发话人「{sp or '未命名'}」暂未设置真实姓名，暂已为您发往默认会话「{fb_name}」",
-            }
+        cleaned = best_self
+        is_self = True
     else:
         is_self = False
 
     if not cleaned:
         fallback_tgts = get_enabled_dt_targets(norm_cfg)
-        fb_name = fallback_tgts[0] if fallback_tgts else "文件小助手"
+        if not fallback_tgts:
+            return {
+                "ok": False,
+                "not_found": True,
+                "raw": str(raw_target or ""),
+                "error": "未指定要发给哪位同事或哪个群，且当前未配置默认目标会话，请直接说出收信人姓名。",
+            }
+        fb_name = fallback_tgts[0]
         return {
             "ok": True,
             "raw": str(raw_target or ""),
@@ -3138,12 +3311,12 @@ def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_r
             elif not want_group and not cand_is_grp:
                 score += 0.04
             elif not want_group and cand_is_grp:
-                # 个人姓名（如“娄慧珍”）不得因子串包含被误改写成小组大群（如“娄慧珍组”）
                 score = min(score, 0.58)
         else:
             seq_r = difflib.SequenceMatcher(None, q_low, c_low).ratio()
             overlap = sum(1 for ch in set(q_low) if ch in c_low)
-            score = max(seq_r, overlap / max(1, len(set(q_low))) * 0.72)
+            p_sim = _phonetic_name_similarity(cleaned, cand) if (not want_group and not cand_is_grp) else 0.0
+            score = max(seq_r, overlap / max(1, len(set(q_low))) * 0.72, p_sim)
             if not want_group and cand_is_grp:
                 score = min(score, 0.58)
         if score >= 0.52:
@@ -3161,50 +3334,51 @@ def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_r
         ai_cfg = norm_c.get("ai_assistant") or {}
         if ai_cfg.get("enabled", True) and str(ai_cfg.get("provider") or "gemini") != "local_only":
             try:
-                sample_pool = pool_order[:40]
+                sample_pool = pool_order[:60]
                 g_res = _call_gemini_generate(
                     norm_c,
-                    "你是钉钉联系人与群名消歧助手。只输出一段JSON，不要解释：{\"best\":\"最匹配名字或原词\",\"alts\":[\"备选1\",\"备选2\"]}",
+                    "你是钉钉联系人与群名同音纠错助手。只输出一段JSON，不要解释：如果花名册中存在明确对应的同音字、错别字或简称（如卢慧珍->娄慧珍、刘亦->刘奕），返回{\"best\":\"花名册原名\",\"alts\":[]}；如果完全没有对应人选，必须返回{\"best\":\"\",\"not_found\":true}，严禁编造或凑数。",
                     [{"role": "user", "parts": [{"text": f"用户提到：{cleaned}\n已知花名册：{json.dumps(sample_pool, ensure_ascii=False)}"}]}],
-                    temperature=0.1,
-                    max_tokens=120,
-                    timeout_sec=6,
+                    temperature=0.05,
+                    max_tokens=100,
+                    timeout_sec=3.5,
                 )
                 if g_res.get("ok"):
                     m_j = re.search(r"\{[\s\S]*?\}", str(g_res.get("reply") or ""))
                     if m_j:
                         obj = json.loads(m_j.group(0))
                         b_ai = str(obj.get("best") or "").strip()
-                        if b_ai and len(b_ai) <= 30:
+                        if b_ai and len(b_ai) <= 30 and not obj.get("not_found") and b_ai in pool_order:
                             best_name = b_ai
-                            matched_roster = b_ai in pool_order
+                            matched_roster = True
                         for a in (obj.get("alts") or []):
                             a_s = str(a or "").strip()
                             if a_s and a_s not in alts:
                                 alts.append(a_s)
             except Exception:
                 pass
-        if not matched_roster and scored and scored[0][0] >= 0.62:
+        if not matched_roster and scored and scored[0][0] >= 0.72:
             best_name = scored[0][1]
             matched_roster = True
 
-    cands = [best_name, cleaned]
+    cands = [best_name] if best_name == cleaned else [best_name, cleaned]
     for a in alts:
         if a not in cands:
             cands.append(a)
     stripped_core = re.sub(r"(?:组|群|部门)$", "", best_name).strip()
     if stripped_core and len(stripped_core) >= 2 and stripped_core not in cands:
         cands.append(stripped_core)
-    if len(cleaned) >= 3:
+    if not matched_roster and len(cleaned) >= 3:
         cands.append(cleaned[-2:])
         cands.append(cleaned[:2])
     cands = [x for x in dict.fromkeys(cands) if str(x).strip()]
 
-    note = (
-        f"已将「{raw_target}」智能理解为「{best_name}」"
-        if best_name != cleaned
-        else f"已确认目标对象「{best_name}」"
-    )
+    if best_name != cleaned:
+        note = f"已将「{cleaned}」智能纠错匹配为「{best_name}」"
+    elif matched_roster:
+        note = f"已一对一锁定「{best_name}」"
+    else:
+        note = f"将在钉钉通讯录按「{best_name}」一对一精确查找（查不到将直接报错）"
     return {
         "ok": True,
         "raw": str(raw_target or ""),
@@ -3262,8 +3436,43 @@ def parse_natural_date_spec(raw):
     return {"explicit": False, "mode": "offset", "day_offset": 0, "label": "当前默认日期"}
 
 
-def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=None, is_local_speaker=True):
-    """识别即时单次执行指令（例如“要看昨天的数据发给我，跑一下发给钉钉小王”），返回不污染默认配置的临时运行方案。"""
+def _extract_last_on_demand_context(chat_history):
+    """从最近对话历史提取上一次明确的发送目标与动作，避免续跑时反复确认发哪个人。"""
+    last_targets = []
+    last_action = "run_full"
+    last_was_not_found = False
+    for idx, it in enumerate(reversed(list(chat_history or [])[-10:])):
+        if not isinstance(it, dict):
+            continue
+        meta = it.get("on_demand_meta")
+        if isinstance(meta, dict):
+            tgts = [str(x).strip() for x in (meta.get("targets") or []) if str(x).strip()]
+            if tgts and not last_targets:
+                last_targets = tgts
+                last_action = str(meta.get("action") or "run_full")
+                break
+        txt = str(it.get("text") or "")
+        if idx <= 1 and it.get("role") == "model" and ("一对一匹配" in txt or "未找到" in txt or "未能确定" in txt):
+            last_was_not_found = True
+        if it.get("role") == "model" and not last_targets:
+            m_t = re.search(r"(?:已确定发送给\s*\*?\*?|钉钉发送目标[：:]\s*\*?\*?|发送到钉钉「|已发送[^「]*「)([^」*\n（(]{1,24})", txt)
+            if m_t:
+                cand_line = m_t.group(1).strip()
+                cands = [p.strip() for p in cand_line.split("、") if p.strip()]
+                if cands:
+                    last_targets = cands
+                    if "文字" in txt:
+                        last_action = "text_send"
+                    elif "截图" in txt and "跑表" not in txt and "全流程" not in txt:
+                        last_action = "capture_send"
+                    else:
+                        last_action = "run_full"
+                    break
+    return {"targets": last_targets, "action": last_action, "last_was_not_found": last_was_not_found}
+
+
+def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=None, is_local_speaker=True, chat_history=None):
+    """识别即时单次执行指令（支持同音纠错找人、续跑上下文与严格查无此人直接报错），绝不污染默认配置。"""
     raw = str(user_text or "").strip()
     if not raw or check_ai_security_and_creator_guardrail(raw):
         return {"handled": False}
@@ -3272,11 +3481,11 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
     if any(k in raw for k in ("每天", "每日", "每周", "工作日", "周末", "每隔", "定时计划", "帮我设置", "帮我改设置", "设置为")):
         return {"handled": False}
     if any(k in raw for k in ("怎么", "如何", "哪里设置", "为什么", "能不能自己")) and not any(
-        k in raw for k in ("发给我", "发我", "给我发", "发给", "发到", "跑一下", "跑程序", "自动运行", "立即运行", "马上跑")
+        k in raw for k in ("发给我", "发我", "给我发", "发给", "发到", "跑一下", "跑程序", "自动运行", "立即运行", "马上跑", "续跑", "再跑")
     ):
         return {"handled": False}
 
-    # 先剔除否定意图（如“发给我不要发群”），避免将“发群”误提取成目标
+    hist_ctx = _extract_last_on_demand_context(chat_history)
     scan_text = re.sub(
         r"(?:不要|不用|别|不是|勿|切勿)\s*(?:发给|发送到|发到|投递给|私发给?|传给|推给|发)\s*[^，。,.;；!\n？?\s]{1,16}",
         " ",
@@ -3288,7 +3497,7 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
         scan_text,
     ):
         raw_targets.append("我")
-    for m in re.finditer(r"(?:发给|发送到|发到|投递给|私发给?|传给|推给)\s*([^，。,.;；!\n？?]{1,24})", scan_text):
+    for m in re.finditer(r"(?:发给|发送到|发到|投递给|私发给?|传给|推给|换成|改成)\s*([^，。,.;；!\n？?]{1,24})", scan_text):
         seg = m.group(1).strip()
         seg = re.split(r"(?:\s+|并|然后|同时|再把|也发|并且|不要|不用|别|不是|就行|就好|看看|一下)", seg)[0].strip()
         for part in re.split(r"[、,，和与及]+", seg):
@@ -3300,13 +3509,27 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
     if not raw_targets and re.search(r"(?:发到?群里?|发大群|投递到群)", scan_text):
         raw_targets.append("发群")
 
-    has_run_verb = any(k in raw for k in ("跑一下", "跑个", "跑程序", "自动运行", "立即运行", "马上运行", "马上跑", "抓最新", "抓取数据", "更新表格", "重新跑", "重跑"))
+    # 若上一轮刚刚提醒“未找到一对一联系人”，本轮用户只简短回复了一个人名（如“娄慧珍”），直接接管执行
+    if not raw_targets and hist_ctx.get("last_was_not_found") and re.fullmatch(r"[\u4e00-\u9fff]{2,5}", raw):
+        raw_targets.append(raw)
+
+    has_run_verb = any(k in raw for k in (
+        "跑一下", "跑个", "跑一次", "跑程序", "自动运行", "立即运行", "马上运行", "马上跑",
+        "抓最新", "抓取数据", "更新表格", "重新跑", "重跑", "续跑", "再跑", "再来一次", "再来一遍",
+        "重发一下", "再发一次", "刷新一下", "截个图", "截图发", "直接发", "现在发",
+    ))
     if not raw_targets and not has_run_verb:
         return {"handled": False}
 
     import copy
     run_cfg = normalize_config(copy.deepcopy(cfg if isinstance(cfg, dict) else {}))
     date_spec = parse_natural_date_spec(raw)
+
+    # 续跑/再跑时未点名发谁：自动继承上一轮对话已锁定的目标，不再反复追问确认
+    if not raw_targets and hist_ctx.get("targets") and any(
+        k in raw for k in ("续跑", "再跑", "再来一次", "再来一遍", "重跑", "重发", "再发")
+    ):
+        raw_targets = list(hist_ctx["targets"])
 
     resolved_list = []
     res_notes = []
@@ -3315,6 +3538,14 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
         r_obj = resolve_smart_dingtalk_target(
             rt, cfg=run_cfg, speaker_name=speaker_name, extra_roster=extra_roster, use_ai=True, is_local_speaker=is_local_speaker
         )
+        if not r_obj.get("ok"):
+            return {
+                "handled": True,
+                "action": "error_only",
+                "targets": [],
+                "date_spec": date_spec,
+                "reply": f"❌ {r_obj.get('error') or '未找到一对一匹配的发送对象，已安全拦截，不会误发给文件传输助手。'}",
+            }
         if r_obj.get("is_group_default"):
             grp_list = [x for x in (r_obj.get("candidates") or []) if x] or [r_obj["resolved_name"]]
             for g_nm in grp_list:
@@ -3330,12 +3561,22 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
             res_notes.append(r_obj["note"])
 
     if not resolved_list:
-        resolved_list = get_enabled_dt_targets(run_cfg) or ["文件小助手"]
+        resolved_list = get_enabled_dt_targets(run_cfg)
+        if not resolved_list:
+            return {
+                "handled": True,
+                "action": "error_only",
+                "targets": [],
+                "date_spec": date_spec,
+                "reply": "❌ 还没有指明要发给哪位同事（也没有默认群聊配置），请直接告诉我「发给 某某某」。",
+            }
 
     if any(k in raw for k in ("只发文字", "纯文字", "文字总结发", "文字发")):
         action = "text_send"
     elif has_run_verb:
         action = "run_full"
+    elif hist_ctx.get("last_was_not_found") and hist_ctx.get("action") in ("run_full", "capture_send", "text_send"):
+        action = hist_ctx["action"]
     else:
         action = "capture_send"
 
@@ -3373,20 +3614,14 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
             run_cfg["dt_day_offset"] = int(date_spec.get("day_offset", 0))
 
     act_label = {
-        "run_full": "后台全流程跑表 + 截图发钉钉",
-        "capture_send": "按指定日期刷新汇总表并截图发钉钉",
-        "text_send": "整理实时数据文字战报并直发钉钉",
+        "run_full": "全流程跑表 + 发钉钉",
+        "capture_send": "刷新汇总表 + 截图发钉钉",
+        "text_send": "整理数据文字战报 + 直发钉钉",
     }[action]
 
     tgt_str = "、".join(resolved_list)
     note_line = f"（{'；'.join(res_notes)}）" if res_notes else ""
-    reply = (
-        f"收到！我已经完全理解您的意思，正在为您启动单次临时任务（不会改动您的日常默认定时配置）：\n"
-        f"• **执行动作**：{act_label}\n"
-        f"• **数据日期**：{date_spec['label']}\n"
-        f"• **钉钉发送目标**：**{tgt_str}** {note_line}\n\n"
-        f"搜索钉钉对象时如果直接搜全称没命中，我会自动尝试简称/关联名字并对照结果列表自己确认后再发送，完成后会第一时间通知您！"
-    )
+    reply = f"⚡ 已确定发送给 **{tgt_str}**{note_line}，正在为您直接执行：{act_label}（{date_spec['label']}），请稍候~"
     return {
         "handled": True,
         "action": action,
@@ -4445,12 +4680,12 @@ def wait_for_recovery(title, detail, hint="", actions=None, timeout_sec=900, err
         auto_ok = True
     if auto_ok and not need_human_login and act_list and title_str not in _auto_confirmed_recovery_titles:
         auto_act = next(
-            (a for a in act_list if str(a.get("id") or "") in ("retry", "continue", "skip_search", "retry_paste")),
-            act_list[0],
+            (a for a in act_list if str(a.get("id") or "") in ("retry", "continue", "retry_paste")),
+            None,
         )
-        auto_id = str(auto_act.get("id") or "retry")
-        auto_lbl = str(auto_act.get("label") or auto_id)
-        if auto_id != "cancel":
+        if auto_act is not None:
+            auto_id = str(auto_act.get("id") or "retry")
+            auto_lbl = str(auto_act.get("label") or auto_id)
             _auto_confirmed_recovery_titles.add(title_str)
             log(f"▶ 已按默认自动确定规则选择「{auto_lbl}」继续执行（无需手动点确认）")
             sleep_check(0.35)
@@ -5057,7 +5292,7 @@ DEFAULT_CONFIG = {
     "dt_auto_send": True,        # 默认确认直接按 Enter 发送；关闭则只贴入待发
     "auto_confirm_choices": True, # 默认对非登录类确认选择自动点击确定继续
     "dt_clear_before_send": True,  # 粘贴前先清空聊天输入框原有残留内容
-    "dt_paste_delay_sec": 3,     # 打开/切入会话后等待几秒再粘贴图片，防止加载期漏贴
+    "dt_paste_delay_sec": 1,     # 打开/切入会话后等待几秒再粘贴图片（1秒极速就绪）
     "dt_silent_send": True,      # 发送前自动勾选「设为静音」（静音发送）
     "dt_minimize_after_send": True,  # 自动发送完成后最小化钉钉窗口
     "dt_search": "文件小助手",    # 钉钉搜索的主会话名（兼容单目标及回退）
@@ -8830,7 +9065,9 @@ def _ai_pick_best_search_row(target_name, candidates, rows, cfg=None):
         elif sec in ("文档", "云文档", "钉钉文档", "聊天记录", "待办", "邮件", "网络查找", "搜索网络"):
             sc -= 60.0
         elif sec == "功能" and "助手" not in str(target_name or ""):
-            sc -= 28.0
+            sc -= 40.0
+        if "助手" not in str(target_name or "") and any(k in r_title for k in ("文件小助手", "文件传输助手")):
+            sc -= 120.0
         if _is_chat_sentence_noise(r_title):
             sc -= 85.0
         if re.search(r"\.(?:xlsx?|docx?|pptx?|pdf|csv|txt|png|jpe?g|zip)$", r_title.strip(), re.I):
@@ -8853,7 +9090,7 @@ def _ai_pick_best_search_row(target_name, candidates, rows, cfg=None):
                 opts = [{"idx": i, "title": r["title"], "section": r["section"]} for i, r in enumerate(rows[:6])]
                 g_res = _call_gemini_generate(
                     norm_c,
-                    "你在帮用户在钉钉全局搜索结果中选择最正确的收信人或群聊。只返回JSON：{\"pick\": 序号整数或-1}",
+                    "你在帮用户在钉钉全局搜索结果中选择唯一一对一匹配的收信人或群聊。严禁把文件小助手/文件传输助手匹配给普通人名。只返回JSON：{\"pick\": 序号整数或-1}",
                     [{"role": "user", "parts": [{"text": f"用户想找：{target_name}（候选词：{candidates[:4]}）\n搜索到的结果：{json.dumps(opts, ensure_ascii=False)}"}]}],
                     temperature=0.05,
                     max_tokens=60,
@@ -8864,10 +9101,13 @@ def _ai_pick_best_search_row(target_name, candidates, rows, cfg=None):
                     if m_j:
                         pk = int(m_j.group(1))
                         if 0 <= pk < len(rows):
-                            return rows[pk]
+                            picked_r = rows[pk]
+                            if "助手" not in str(target_name or "") and any(k in str(picked_r.get("title") or "") for k in ("文件小助手", "文件传输助手")):
+                                return None
+                            return picked_r
             except Exception:
                 pass
-    return top_row if top_sc >= 54.0 else None
+    return top_row if top_sc >= 72.0 else None
 
 
 def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interactive=True, text_only_message=""):
@@ -9769,6 +10009,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
 
                 if not skip_search:
                     chat_ready = False
+                    confirmed_no_match = False
                     interrupted_act = None
                     try:
                         with hands_off_guard(f"钉钉搜索并打开会话「{search_name}」，随后粘贴数据"):
@@ -9776,16 +10017,13 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                                 check_stop()
                                 _force_front()
                                 awakened_once = True
-                                _, ding_pid, _ = _sleep_watch_ding(0.42, expected_pid=ding_pid, fg_locked=False)
+                                _, ding_pid, _ = _sleep_watch_ding(0.32, expected_pid=ding_pid, fg_locked=False)
+                                set_cands = list(direct_candidates)
                                 if cfg.get("_resolve_self_for_search") == search_name and not auto_heal_used.get("_self_probed"):
                                     auto_heal_used["_self_probed"] = True
                                     dt_live_self = detect_dingtalk_logged_in_user_name(use_cache=False)
                                     if dt_live_self and dt_live_self not in set_cands:
-                                        if search_name == "文件小助手":
-                                            set_cands = [dt_live_self] + list(set_cands)
-                                            log(f"  💡 已自动识别当前登录钉钉为「{dt_live_self}」，优先搜索本人会话（搜不到自动回退文件小助手）")
-                                        else:
-                                            set_cands = list(set_cands) + [dt_live_self]
+                                        set_cands = list(set_cands) + [dt_live_self]
                                 if _link_box() is not None:
                                     _close_link_box()
                                 _open_global_search()
@@ -9796,16 +10034,16 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                                     if _is_search_popup_open():
                                         opened = True
                                         break
-                                    sleep_check(0.22)
+                                    sleep_check(0.18)
                                 popup_ctl, doc = (None, None) if opened else _search_doc()
                                 if not opened and doc is None:
                                     log("  搜索窗口没打开，正在重试…")
                                     continue
-                                _sleep_watch_ding(0.28, expected_pid=ding_pid, fg_locked=True)
+                                _sleep_watch_ding(0.22, expected_pid=ding_pid, fg_locked=True)
 
-                                set_cands = list(direct_candidates)
-                                settle_wait = float((pc_plan or {}).get("search_settle_sec") or 0.9)
+                                settle_wait = float((pc_plan or {}).get("search_settle_sec") or 0.7)
                                 kw_idx = 0
+                                all_cands_seen_no_match = True
                                 while kw_idx < len(set_cands):
                                     kw = set_cands[kw_idx]
                                     _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
@@ -9816,31 +10054,27 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                                                 _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
                                                 if _is_search_popup_open():
                                                     break
-                                                sleep_check(0.22)
-                                            _sleep_watch_ding(0.25, expected_pid=ding_pid, fg_locked=True)
+                                                sleep_check(0.18)
+                                            _sleep_watch_ding(0.2, expected_pid=ding_pid, fg_locked=True)
                                         popup_ctl, doc = _search_doc()
                                         if doc is not None:
                                             _focus_search_input(popup_ctl, doc)
-                                            sleep_check(0.15)
+                                            sleep_check(0.12)
 
-                                    ua.SendKeys("{Ctrl}a", waitTime=0.08)
-                                    ua.SendKeys("{Back}", waitTime=0.08)
+                                    ua.SendKeys("{Ctrl}a", waitTime=0.06)
+                                    ua.SendKeys("{Back}", waitTime=0.06)
                                     if not _paste_text(kw, verify=True):
+                                        all_cands_seen_no_match = False
                                         log(f"  关键词「{kw}」写入剪贴板未就绪，跳过重试…")
                                         kw_idx += 1
                                         continue
                                     _sleep_watch_ding(settle_wait, expected_pid=ding_pid, fg_locked=True)
 
-                                    # 智能候选确认：先检测列表是否“无结果”或存在多条匹配并由 AI 确认点击最准确那条
                                     _popup_now, doc_now = _search_doc()
                                     if doc_now is not None:
                                         scan_res = _collect_dingtalk_search_rows(_iter_search_docs(doc_now), check_stop)
                                         if scan_res.get("empty_result"):
-                                            log(f"  搜索「{kw}」无结果，AI 自动切换简称/关联名字继续检索…")
-                                            if len(kw) >= 3:
-                                                for sub_kw in (kw[-2:], kw[:2]):
-                                                    if sub_kw not in set_cands:
-                                                        set_cands.append(sub_kw)
+                                            log(f"  钉钉中无「{kw}」搜索结果，禁止盲选误发")
                                             kw_idx += 1
                                             continue
                                         best_row = _ai_pick_best_search_row(search_name, set_cands, scan_res.get("rows") or [], cfg=cfg)
@@ -9848,62 +10082,66 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                                             br = best_row["rect"]
                                             cx = int((br.left + br.right) / 2)
                                             cy = int((br.top + br.bottom) / 2)
-                                            ua.Click(cx, cy, waitTime=0.28)
-                                            if _wait_search_closed(loops=8, step=0.2):
+                                            ua.Click(cx, cy, waitTime=0.25)
+                                            if _wait_search_closed(loops=8, step=0.18):
                                                 if str(best_row.get("section") or "") in ("联系人", "群组", "常用"):
                                                     _save_verified_dingtalk_target(search_name, best_row.get("title", ""))
-                                                log(f"  ✅ AI 已识别并确认钉钉目标：「{search_name}」→「{best_row.get('title', search_name)}」")
+                                                log(f"  ✅ 已一对一确认钉钉目标：「{search_name}」→「{best_row.get('title', search_name)}」")
                                                 chat_ready = True
                                                 break
+                                        if _has_search_history(doc_now):
+                                            all_cands_seen_no_match = False
+                                            _focus_search_input(_popup_now, doc_now)
+                                            sleep_check(0.12)
+                                            ua.SendKeys("{Ctrl}a", waitTime=0.06)
+                                            ua.SendKeys("{Back}", waitTime=0.06)
+                                            if _paste_text(kw, verify=True):
+                                                _sleep_watch_ding(settle_wait, expected_pid=ding_pid, fg_locked=True)
+                                                _popup2, doc2 = _search_doc()
+                                                if doc2 is not None:
+                                                    scan2 = _collect_dingtalk_search_rows(_iter_search_docs(doc2), check_stop)
+                                                    best2 = _ai_pick_best_search_row(search_name, set_cands, scan2.get("rows") or [], cfg=cfg)
+                                                    if best2 is not None and best2.get("rect") is not None:
+                                                        br2 = best2["rect"]
+                                                        ua.Click(int((br2.left + br2.right) / 2), int((br2.top + br2.bottom) / 2), waitTime=0.25)
+                                                        if _wait_search_closed(loops=8, step=0.18):
+                                                            chat_ready = True
+                                                            break
+                                        matched_strict = _feature_item(doc_now, search_name, search_tokens)
+                                        if matched_strict is not None and "助手" not in str(matched_strict[0].Name or ""):
+                                            ir = matched_strict[1]
+                                            ua.Click(int((ir.left + ir.right) / 2), int((ir.top + ir.bottom) / 2), waitTime=0.25)
+                                            if _wait_search_closed(loops=6, step=0.18):
+                                                chat_ready = True
+                                                break
+                                        log(f"  未在钉钉结果中找到与「{kw}」一对一匹配的会话，严禁按 Enter 乱发")
+                                        kw_idx += 1
+                                        continue
 
-                                    # 零阻塞直通：输入搜索词后直接按 Enter，不先递归遍历整个搜索结果树防卡死！
+                                    all_cands_seen_no_match = False
+                                    # 仅当无法读取搜索树弹窗时才使用键盘 Enter 兜底
                                     _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
-                                    ua.SendKeys("{Enter}", waitTime=0.25)
-                                    if _wait_search_closed(loops=8, step=0.2):
+                                    ua.SendKeys("{Enter}", waitTime=0.22)
+                                    if _wait_search_closed(loops=8, step=0.18):
                                         chat_ready = True
                                         break
 
-                                    # 兜底1：部分钉钉版本需要先按一次 ↓ 高亮第一项再按 Enter
                                     _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
-                                    ua.SendKeys("{Down}", waitTime=0.12)
-                                    ua.SendKeys("{Enter}", waitTime=0.25)
-                                    if _wait_search_closed(loops=6, step=0.2):
+                                    ua.SendKeys("{Down}", waitTime=0.10)
+                                    ua.SendKeys("{Enter}", waitTime=0.22)
+                                    if _wait_search_closed(loops=6, step=0.18):
                                         chat_ready = True
                                         break
-
-                                    # 兜底2：仅在前两招未进群时才做带超时的搜索框焦点检测与列表匹配点击
-                                    popup_ctl, doc = _search_doc()
-                                    if doc is not None and _has_search_history(doc):
-                                        log(f"  检测到搜索框尚未接收内容，重新聚焦并粘贴「{kw}」…")
-                                        _focus_search_input(popup_ctl, doc)
-                                        sleep_check(0.15)
-                                        ua.SendKeys("{Ctrl}a", waitTime=0.08)
-                                        ua.SendKeys("{Back}", waitTime=0.08)
-                                        if _paste_text(kw, verify=True):
-                                            _sleep_watch_ding(settle_wait, expected_pid=ding_pid, fg_locked=True)
-                                            ua.SendKeys("{Enter}", waitTime=0.25)
-                                            if _wait_search_closed(loops=6, step=0.2):
-                                                chat_ready = True
-                                                break
-
-                                    if doc is not None:
-                                        matched = _feature_item(doc, search_name, search_tokens)
-                                        if matched is not None:
-                                            _item_ctl, item_rect = matched
-                                            cx = int((item_rect.left + item_rect.right) / 2)
-                                            cy = int((item_rect.top + item_rect.bottom) / 2)
-                                            ua.Click(cx, cy, waitTime=0.28)
-                                            if _wait_search_closed(loops=6, step=0.2):
-                                                chat_ready = True
-                                                break
-                                    log(f"  关键词「{kw}」未直接进入会话，尝试下一候选词…")
                                     kw_idx += 1
 
                                 if chat_ready:
                                     break
+                                ua.SendKeys("{Esc}", waitTime=0.18)
+                                if all_cands_seen_no_match and set_cands:
+                                    confirmed_no_match = True
+                                    break
                                 log("  本轮未进入目标会话，关闭搜索框后重试…")
-                                ua.SendKeys("{Esc}", waitTime=0.22)
-                                _sleep_watch_ding(0.45, expected_pid=ding_pid, fg_locked=True)
+                                _sleep_watch_ding(0.35, expected_pid=ding_pid, fg_locked=True)
                     except DingTalkInterrupted as e_intr:
                         interrupted_act = _pause_for_dingtalk_interruption(str(e_intr))
                         if interrupted_act == "skipped":
@@ -9911,6 +10149,10 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                         continue
 
                     if not chat_ready:
+                        if confirmed_no_match:
+                            raise RuntimeError(
+                                f"在数据文件与钉钉通讯录中均未找到与「{search_name}」一对一匹配的联系人或群聊（已安全拦截，与文件传输助手无关，不会误发给文件小助手）"
+                            )
                         if not auto_heal_used["search"]:
                             auto_heal_used["search"] = True
                             heal_s = ai_auto_debug_and_heal(
@@ -9971,12 +10213,15 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             except Exception:
                                 pass
 
-                        # 按用户设定等待 N 秒让钉钉聊天框加载完成再粘贴（防加载未就绪漏贴）
+                        # 按用户设定等待 N 秒让钉钉聊天框加载完成再粘贴（纯文字直发极速免等）
                         try:
-                            paste_delay = max(0, min(20, int(round(float(cfg.get("dt_paste_delay_sec", 3))))))
+                            paste_delay = max(0, min(20, int(round(float(cfg.get("dt_paste_delay_sec", 1))))))
                         except Exception:
-                            paste_delay = 3
-                        if paste_delay > 0:
+                            paste_delay = 1
+                        if str(text_only_message or "").strip():
+                            if paste_delay > 0:
+                                _sleep_watch_ding(min(0.25, float(paste_delay)), expected_pid=ding_pid, fg_locked=False)
+                        elif paste_delay > 0:
                             log(f"  ⏳ 等待 {paste_delay} 秒让钉钉聊天框加载就绪后再粘贴（可在「钉钉投递」调整秒数）…")
                             _sleep_watch_ding(paste_delay, expected_pid=ding_pid, fg_locked=False)
 
@@ -10092,7 +10337,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             if not _paste_text(text_msg, verify=True):
                                 raise RuntimeError("钉钉文字未就绪，已停止自动发送，请检查后手动按 Enter")
                             text_pasted_ok = True
-                            _sleep_watch_ding(0.6, expected_pid=ding_pid, fg_locked=True)
+                            _sleep_watch_ding(0.25, expected_pid=ding_pid, fg_locked=True)
 
                         def _do_toggle_silent_step():
                             if do_silent:
@@ -10114,8 +10359,8 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             _do_paste_text_step()
                             _do_toggle_silent_step()
 
-                        # 点完设为静音/取消静音与贴图后等待 1 秒，确保不误落入搜索栏后直接发送
-                        _sleep_watch_ding(1.0, expected_pid=ding_pid, fg_locked=False)
+                        # 点完设为静音/取消静音后极速核验焦点并直接发送
+                        _sleep_watch_ding(0.35, expected_pid=ding_pid, fg_locked=False)
                         if _is_search_popup_open():
                             _ensure_not_in_search_box(r)
                         ding_commit, ding_pid, _ = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)

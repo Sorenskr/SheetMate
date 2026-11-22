@@ -1,6 +1,6 @@
-# 暗号表助手（SheetMate）v2.9.1
+# 暗号表助手（SheetMate）v2.9.2
 
-[![最新版本](https://img.shields.io/badge/Release-v2.9.1-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
+[![最新版本](https://img.shields.io/badge/Release-v2.9.2-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![运行平台](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-34C759?style=flat-square&logo=windows)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![云端远程入口](https://img.shields.io/badge/Cloud%20Web-点击打开远程控制台-5856D6?style=flat-square&logo=googlechrome)](https://sorenskr.github.io/SheetMate/)
 
@@ -20,7 +20,13 @@
 
 ---
 
-## ✨ v2.9.1 核心功能一览
+## ✨ v2.9.2 核心功能一览
+
+- **气泡秒发零卡顿 + AI 同音找人 & 查无此人直报错**
+  - 手机/网页端与电脑端同步采用 0ms 乐观上屏渲染并移除头部分栏重负载高斯模糊，点击发送瞬间气泡秒现、电脑实时共振直发，无阻塞连击不卡顿。
+  - 新增桌面数据日报全员名录扫描与中文拼音/同音字簇纠错（如把 `卢慧珍`、`刘亦` 自动匹配至真实员工 `娄慧珍`、`刘奕`）；找不到一对一联系人时**立即明确报错，绝不盲按回车或误发给文件传输助手**；支持上下文记忆“续跑一次”直接沿用目标。
+- **手机/网页端记住账号密码自动登录 & 退出/切换账号**
+  - 默认持久化记住已登录的账号、密码与专属连接链接，下次打开网址直接免重输秒登；顶部常驻 **「切换账号」** 与 **「退出」** 按钮，支持多账号一键快切。
 
 - **智能语音指令精准识人与默认自动确认**
   - 在钉钉发消息指令中准确理解 **「我 / 发给我」**（自动匹配本机钉钉实名会话或文件小助手，绝不把系统随机趣味昵称拿去钉钉乱搜），识别 **「发群 / 发群里」** 自动对应已启用的默认群聊，自动剔除聊天记录文本干扰并清洗错误记忆。

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.9.1 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.9.2 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -698,12 +698,12 @@ class _SheetMateController:
             "message": f"已自调模块顺序并立即重试（{resume_msg}）" if resumed else "已自调内部模块顺序与等待秒数，下次运行立即生效",
         }
 
-    def _append_chat_notice(self, text, source="task_done", shot_info="远程指令回执"):
+    def _append_chat_notice(self, text, source="task_done", shot_info="远程指令回执", meta=None):
         txt = str(text or "").strip()
         if not txt:
             return
         with self._lock:
-            self.ai_chat_history.append({
+            item = {
                 "role": "model",
                 "text": txt,
                 "time": time.strftime("%H:%M:%S"),
@@ -711,10 +711,15 @@ class _SheetMateController:
                 "source": source,
                 "shot_info": shot_info,
                 "via": "pc",
-            })
+            }
+            if isinstance(meta, dict):
+                item["on_demand_meta"] = meta
+            self.ai_chat_history.append(item)
             if len(self.ai_chat_history) > 25:
                 self.ai_chat_history = self.ai_chat_history[-25:]
             self._chat_seq += 1
+        if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+            self.mobile_bridge.notify_state_changed()
 
     def verify_mobile_member_login(self, nickname):
         q = str(nickname or "").strip()
@@ -796,25 +801,19 @@ class _SheetMateController:
             tgt_txt = "、".join(targets) if targets else "指定会话"
             if ok_flag:
                 self._append_chat_notice(
-                    f"✅ 您的即时指令已完成！已按【{date_lbl}】处理好内容并发送到钉钉「{tgt_txt}」。",
+                    f"✅ 已发送到钉钉「{tgt_txt}」（{date_lbl}）。",
                     source="task_done",
-                    shot_info=f"已完成 -> {tgt_txt}",
+                    shot_info=f"已发送 -> {tgt_txt}",
+                    meta={"targets": targets, "action": action},
                 )
             else:
                 self._append_chat_notice(
-                    f"⚠️ 您的即时指令（目标：{tgt_txt}）未能全部完成：{err_tip or '遇到执行中断，请查看运行日志'}",
+                    f"❌ 发送钉钉「{tgt_txt}」失败：{err_tip or '未找到匹配联系人或执行中断'}",
                     source="task_done",
-                    shot_info="指令未完成",
+                    shot_info="发送失败",
                 )
 
         if action == "text_send":
-            rt_ai = self._build_runtime_ai_cfg(run_cfg)
-            sum_res = self.app.summarize_report_with_ai(
-                rt_ai,
-                style_id="brief",
-                user_prompt=f"请帮我提取与{date_lbl}最相关的关键表格与团队/个人数据简报，准备直接作为钉钉文字发送",
-            )
-            msg_txt = str((sum_res or {}).get("reply") or "").strip() or f"{date_lbl} 数据已为您整理完毕。"
             with self._lock:
                 self._run_epoch += 1
                 ep = self._run_epoch
@@ -824,11 +823,11 @@ class _SheetMateController:
                 self._run_mode = "text_send"
                 self._run_trigger_type = "manual"
                 self.status_level = "running"
-                self.progress = 0.35
-                self.step_text = f"正在将整理结果发给钉钉 {'、'.join(targets)}…"
+                self.progress = 0.25
+                self.step_text = f"正在准备文字结果发给钉钉 {'、'.join(targets)}…"
             threading.Thread(
                 target=self._text_send_worker,
-                args=(ep, run_cfg, targets, msg_txt, _done_cb),
+                args=(ep, run_cfg, targets, "", _done_cb, date_lbl),
                 daemon=True,
             ).start()
             return {"ok": True}
@@ -905,6 +904,19 @@ class _SheetMateController:
 
         with self._lock:
             hist_snap = list(self.ai_chat_history[-10:])
+            if action == "send":
+                self.ai_chat_history.append({
+                    "role": "user",
+                    "text": display_user,
+                    "time": time.strftime("%H:%M:%S"),
+                    "via": source_device or "pc",
+                    "sender": eff_speaker,
+                })
+                if len(self.ai_chat_history) > 25:
+                    self.ai_chat_history = self.ai_chat_history[-25:]
+                self._chat_seq += 1
+        if action == "send" and self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+            self.mobile_bridge.notify_state_changed()
 
         on_demand_res = (
             self.app.try_handle_ai_on_demand_task(
@@ -913,28 +925,42 @@ class _SheetMateController:
                 speaker_name=eff_speaker,
                 extra_roster=roster,
                 is_local_speaker=is_local_speaker,
+                chat_history=hist_snap,
             )
             if (clean_prompt and hasattr(self.app, "try_handle_ai_on_demand_task"))
             else {"handled": False}
         )
         if on_demand_res.get("handled"):
-            exec_r = self.execute_ai_on_demand_task(on_demand_res, speaker_name=eff_speaker)
-            if exec_r.get("ok"):
+            if on_demand_res.get("action") == "error_only":
                 res = {
                     "ok": True,
-                    "source": "on_demand_task",
+                    "source": "on_demand_not_found",
                     "model": "",
-                    "shot_info": f"已派发任务 · {'、'.join(on_demand_res.get('targets') or [])}",
+                    "shot_info": "未找到一对一联系人",
                     "reply": on_demand_res["reply"],
                 }
             else:
-                res = {
-                    "ok": True,
-                    "source": "on_demand_blocked",
-                    "model": "",
-                    "shot_info": "任务暂缓",
-                    "reply": f"我已理解您想做的事，但暂时未能启动：{exec_r.get('message', '当前有任务运行中')}",
-                }
+                exec_r = self.execute_ai_on_demand_task(on_demand_res, speaker_name=eff_speaker)
+                if exec_r.get("ok"):
+                    res = {
+                        "ok": True,
+                        "source": "on_demand_task",
+                        "model": "",
+                        "shot_info": f"已锁定 -> {'、'.join(on_demand_res.get('targets') or [])}",
+                        "reply": on_demand_res["reply"],
+                        "on_demand_meta": {
+                            "targets": list(on_demand_res.get("targets") or []),
+                            "action": on_demand_res.get("action") or "capture_send",
+                        },
+                    }
+                else:
+                    res = {
+                        "ok": True,
+                        "source": "on_demand_blocked",
+                        "model": "",
+                        "shot_info": "任务暂缓",
+                        "reply": f"暂时未能启动：{exec_r.get('message', '当前有任务运行中')}",
+                    }
         else:
             cmd_res = (
                 self.app.try_handle_ai_config_command(clean_prompt, cfg_snap)
@@ -979,14 +1005,7 @@ class _SheetMateController:
                 pass
         if reply_txt:
             with self._lock:
-                self.ai_chat_history.append({
-                    "role": "user",
-                    "text": display_user,
-                    "time": time.strftime("%H:%M:%S"),
-                    "via": source_device or "pc",
-                    "sender": eff_speaker,
-                })
-                self.ai_chat_history.append({
+                model_msg = {
                     "role": "model",
                     "text": reply_txt,
                     "time": time.strftime("%H:%M:%S"),
@@ -994,12 +1013,17 @@ class _SheetMateController:
                     "source": res.get("source", ""),
                     "shot_info": res.get("shot_info", ""),
                     "via": "pc",
-                })
+                }
+                if isinstance(res.get("on_demand_meta"), dict):
+                    model_msg["on_demand_meta"] = res["on_demand_meta"]
+                self.ai_chat_history.append(model_msg)
                 if len(self.ai_chat_history) > 25:
                     self.ai_chat_history = self.ai_chat_history[-25:]
                 self._chat_seq += 1
                 res["history"] = list(self.ai_chat_history)
                 res["chat_seq"] = self._chat_seq
+            if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+                self.mobile_bridge.notify_state_changed()
         return res
 
     def get_config(self):
@@ -1738,14 +1762,33 @@ class _SheetMateController:
                 except Exception:
                     pass
 
-    def _text_send_worker(self, run_epoch, run_cfg, targets, message_text, on_done=None):
+    def _text_send_worker(self, run_epoch, run_cfg, targets, message_text, on_done=None, date_lbl=""):
         ok_cb = False
         err_cb = ""
         try:
+            msg_use = str(message_text or "").strip()
+            if not msg_use:
+                rt_ai = self._build_runtime_ai_cfg(run_cfg)
+                lbl = str(date_lbl or "当前日期")
+                try:
+                    sum_res = self.app.summarize_report_with_ai(
+                        rt_ai,
+                        style_id="brief",
+                        user_prompt=f"请帮我提取与{lbl}最相关的关键表格与团队/个人数据简报，准备直接作为钉钉文字发送",
+                    )
+                    msg_use = str((sum_res or {}).get("reply") or "").strip()
+                except Exception:
+                    msg_use = ""
+                if not msg_use:
+                    msg_use = f"{lbl} 数据已为您整理完毕。"
+            with self._lock:
+                if self._run_epoch == run_epoch:
+                    self.progress = 0.55
+                    self.step_text = f"正在将整理结果直发钉钉 {'、'.join(targets)}…"
             self.app.send_dingtalk_text_message(
                 run_cfg,
                 targets,
-                message_text,
+                msg_use,
                 silent=bool((run_cfg or {}).get("dt_silent_send", True)),
                 recover_interactive=False,
             )
@@ -2041,8 +2084,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/png" href="/icon.png?v=2.9.1" />
-<link rel="shortcut icon" href="/favicon.ico?v=2.9.1" />
+<link rel="icon" type="image/png" href="/icon.png?v=2.9.2" />
+<link rel="shortcut icon" href="/favicon.ico?v=2.9.2" />
 <style>
   :root {
     --bg: #EAF0F8;
@@ -4418,9 +4461,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.9.1" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.9.2" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.9.1</span>
+          <span class="ver-pill" id="verBadge">v2.9.2</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -7879,7 +7922,11 @@ async function sendAiSummary(styleId, rawPrompt) {
   $("aiSendBtn").disabled = true;
   renderAiChatFeed(cachedChatHistory, label);
   try {
-    await api("/api/config", "POST", collectConfigFromDOM());
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+      await api("/api/config", "POST", collectConfigFromDOM());
+    }
     const res = await api("/api/ai-summary", "POST", { style_id: styleId, prompt: promptText, action: "send" });
     if (res && res.updated_config) {
       cfg = res.updated_config;

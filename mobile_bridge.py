@@ -657,7 +657,6 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     padding: 12px 14px 10px;
     padding-top: max(12px, env(safe-area-inset-top));
     background: var(--card);
-    backdrop-filter: blur(20px);
     border-bottom: 0.5px solid var(--sep);
     display: flex;
     align-items: center;
@@ -675,11 +674,6 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
-    animation: m-cat-bob 3.6s ease-in-out infinite;
-  }
-  @keyframes m-cat-bob {
-    0%, 100% { transform: translateY(0) rotate(-2deg); }
-    50% { transform: translateY(-2.5px) rotate(2.5deg); }
   }
   .m-title { font-size: 15px; font-weight: 800; line-height: 1.2; }
   .m-sub { font-size: 11px; color: var(--sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -903,6 +897,8 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   .m-feed {
     flex: 1;
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
     padding: 8px 12px;
     display: flex;
     flex-direction: column;
@@ -933,6 +929,42 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   .m-bubble.is-spot {
     border-color: rgba(52, 199, 89, 0.45);
     background: linear-gradient(135deg, rgba(52, 199, 89, 0.14), rgba(10, 132, 255, 0.1));
+  }
+  .m-bubble.is-err {
+    border-color: rgba(255, 59, 48, 0.45);
+    background: rgba(255, 59, 48, 0.08);
+  }
+  .m-typing-dots { display: inline-flex; gap: 4px; align-items: center; padding: 3px 2px; }
+  .m-typing-dots span {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--sub);
+    animation: m-dot-bounce 1s infinite ease-in-out;
+  }
+  .m-typing-dots span:nth-child(2) { animation-delay: 0.16s; }
+  .m-typing-dots span:nth-child(3) { animation-delay: 0.32s; }
+  @keyframes m-dot-bounce { 0%, 80%, 100% { opacity: 0.35; transform: scale(0.8); } 40% { opacity: 1; transform: scale(1.1); } }
+  .m-remember-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--sub);
+  }
+  .m-remember-row label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-weight: 600; color: var(--text); }
+  .m-saved-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .m-saved-chip {
+    display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px;
+    border: 1px solid rgba(10, 132, 255, 0.3); background: rgba(10, 132, 255, 0.08); color: var(--blue);
+    font-size: 12px; font-weight: 700; cursor: pointer;
+  }
+  .m-modal-mask {
+    position: fixed; inset: 0; background: rgba(15, 23, 42, 0.46); z-index: 950;
+    display: none; align-items: center; justify-content: center; padding: 16px;
+  }
+  .m-modal-mask.show { display: flex; }
+  .m-modal-card {
+    width: 100%; max-width: 390px; background: var(--card); border: 0.5px solid var(--sep);
+    border-radius: 20px; padding: 16px; display: flex; flex-direction: column; gap: 10px;
+    box-shadow: 0 20px 48px rgba(15, 23, 42, 0.24);
+  }
+  .m-acct-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 9px 11px; border-radius: 12px; border: 0.5px solid var(--sep); background: rgba(120, 120, 128, 0.07);
   }
   .m-b-meta { font-size: 10.5px; opacity: 0.72; margin-top: 5px; }
   .m-composer {
@@ -1011,7 +1043,8 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div class="m-hdr-actions">
       <a class="m-pill" href="https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe" target="_blank" rel="noopener noreferrer" title="下载 Windows 电脑端客户端">下载电脑版</a>
-      <button type="button" class="m-pill" id="mSwitchUserBtn" style="display:none;">切换电脑</button>
+      <button type="button" class="m-pill" id="mSwitchUserBtn" style="display:none;">切换账号</button>
+      <button type="button" class="m-pill" id="mLogoutBtn" style="display:none;background:rgba(255,59,48,0.12);color:var(--red);">退出</button>
     </div>
   </header>
 
@@ -1024,11 +1057,24 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
 
+      <div id="mSavedAccountsWrap" style="display:none;flex-direction:column;gap:6px;">
+        <div class="m-label" style="margin-bottom:0;">已记住账号（点击一键直连）</div>
+        <div class="m-saved-pills" id="mSavedAccountsBar"></div>
+      </div>
+
       <div class="m-label">1. 电脑上起好的名字</div>
       <input type="text" class="m-input" id="mLoginNameInput" placeholder="填电脑右上角设置的名字" autocomplete="username" />
 
       <div class="m-label">2. 远程密码</div>
       <input type="password" class="m-input" id="mLoginPinInput" placeholder="填电脑【远程网站】里设置的密码" autocomplete="current-password" />
+
+      <div class="m-label">3. 专属连接链接（选填，留空默认云端直连）</div>
+      <input type="url" class="m-input" id="mServerBaseInput" placeholder="一般留空即可；局域网/临时链接可贴这里" autocomplete="url" />
+
+      <div class="m-remember-row">
+        <label><input type="checkbox" id="mRememberCheck" checked /> 记住账号密码，下次打开自动登录</label>
+        <button type="button" id="mClearSavedBtn" style="border:none;background:none;color:var(--sub);font-size:11.5px;cursor:pointer;display:none;">清除已存</button>
+      </div>
 
       <div id="mLoginErr" style="font-size:12.5px;color:var(--red);display:none;line-height:1.45;"></div>
       <button type="button" class="m-btn-primary" id="mLoginSubmitBtn">云端连接我的电脑</button>
@@ -1037,7 +1083,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="m-dl-card" id="mDownloadCard">
       <div class="m-dl-head">
         <div class="m-dl-title">电脑还没装软件？免费下载客户端</div>
-        <span class="m-dl-badge">v2.9.1 纯净单文件版</span>
+        <span class="m-dl-badge">v2.9.2 纯净单文件版</span>
       </div>
       <div class="m-dl-desc">
         下载这单个 SheetMate.exe 双击直接运行（绝不生成杂乱文件夹、无需安装环境、关闭窗口直接结束退出），支持自动抓数写 WPS 表、钉钉静音发群与云端异地遥控。
@@ -1094,6 +1140,17 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       <input type="text" id="mChatInput" placeholder="跟电脑小猫说：看昨天数据发给我 / 跑一下发给小王…" />
       <button type="button" class="m-send-btn" id="mSendBtn">发送</button>
     </div>
+  </div>
+</div>
+<div class="m-modal-mask" id="mSwitchModalMask">
+  <div class="m-modal-card">
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <div style="font-size:15px;font-weight:800;">切换账号 / 切换用户</div>
+      <button type="button" class="m-pill" id="mSwitchCloseBtn">关闭</button>
+    </div>
+    <div style="font-size:12px;color:var(--sub);">选择已记住的电脑账号一键秒切，或新登录其他成员：</div>
+    <div id="mSwitchAcctList" style="display:flex;flex-direction:column;gap:7px;max-height:240px;overflow-y:auto;"></div>
+    <button type="button" class="m-btn-primary" id="mSwitchAddNewBtn" style="padding:10px;font-size:13.5px;">＋ 登录其他账号 / 换一台电脑</button>
   </div>
 </div>
 <div class="m-toast" id="mToast"></div>
@@ -1474,9 +1531,6 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         waitResolvers.push(onReady);
       });
-      if (firstReady && !conns.every((e) => e.ready)) {
-        await new Promise((r) => setTimeout(r, 320));
-      }
       return hasReady();
     }
     function publish(upTopic, packetStr) {
@@ -1496,17 +1550,60 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   const qs = new URLSearchParams(window.location.search);
   const $ = (id) => document.getElementById(id);
+  const LS_CREDS_KEY = "sm_saved_cred_v2";
+  const LS_ACCTS_KEY = "sm_saved_accounts_v2";
+  const LS_AUTO_KEY = "sm_auto_login";
+  const LS_CACHE_STATE_KEY = "sm_cached_state_v2";
+
+  function safeJsonParse(raw, fallback) {
+    try { return raw ? JSON.parse(raw) : fallback; } catch (_e) { return fallback; }
+  }
+  function loadSavedAccounts() {
+    const arr = safeJsonParse(localStorage.getItem(LS_ACCTS_KEY), []);
+    return Array.isArray(arr) ? arr.filter((x) => x && x.nick && x.pin) : [];
+  }
+  function saveAccountRecord(rec) {
+    if (!rec || !rec.nick || !rec.pin) return;
+    const key = SMCrypto.normalizeNickKey(rec.nick);
+    const list = loadSavedAccounts().filter((x) => SMCrypto.normalizeNickKey(x.nick) !== key);
+    list.unshift({
+      nick: String(rec.nick).trim(),
+      pin: String(rec.pin).trim(),
+      serverBase: String(rec.serverBase || "").trim(),
+      connMode: String(rec.connMode || "cloud"),
+      updatedAt: Date.now(),
+    });
+    if (list.length > 8) list.length = 8;
+    localStorage.setItem(LS_ACCTS_KEY, JSON.stringify(list));
+    localStorage.setItem(LS_CREDS_KEY, JSON.stringify(list[0]));
+  }
+  function removeAccountRecord(nick) {
+    const key = SMCrypto.normalizeNickKey(nick);
+    const list = loadSavedAccounts().filter((x) => SMCrypto.normalizeNickKey(x.nick) !== key);
+    localStorage.setItem(LS_ACCTS_KEY, JSON.stringify(list));
+    const cur = safeJsonParse(localStorage.getItem(LS_CREDS_KEY), null);
+    if (cur && SMCrypto.normalizeNickKey(cur.nick) === key) {
+      if (list.length) localStorage.setItem(LS_CREDS_KEY, JSON.stringify(list[0]));
+      else localStorage.removeItem(LS_CREDS_KEY);
+    }
+  }
+
+  let savedCred = safeJsonParse(localStorage.getItem(LS_CREDS_KEY), null);
   let mobileToken = localStorage.getItem("sm_mobile_token") || "";
-  let myNick = localStorage.getItem("sm_mobile_nick") || qs.get("name") || "";
-  let serverBase = localStorage.getItem("sm_mobile_base") || qs.get("hub") || "";
-  let connMode = localStorage.getItem("sm_conn_mode") || "";
+  let myNick = (savedCred && savedCred.nick) || localStorage.getItem("sm_mobile_nick") || qs.get("name") || "";
+  let myPin = (savedCred && savedCred.pin) || "";
+  let serverBase = (savedCred && savedCred.serverBase) || localStorage.getItem("sm_mobile_base") || qs.get("hub") || "";
+  let connMode = (savedCred && savedCred.connMode) || localStorage.getItem("sm_conn_mode") || "";
   let relayCred = null; // { nick, pin, upTopic, downTopic, masterKey }
   const pendingReqs = new Map();
   let lastChatSeq = -1;
   let lastPaused = false;
   let pollTimer = null;
+  let cachedChatHistory = [];
+  let pendingUserMsgs = [];
 
   if ($("mLoginNameInput") && myNick) $("mLoginNameInput").value = myNick;
+  if ($("mLoginPinInput") && myPin) $("mLoginPinInput").value = myPin;
   if ($("mServerBaseInput") && serverBase) $("mServerBaseInput").value = serverBase;
 
   function showToast(msg) {
@@ -1514,7 +1611,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     t.textContent = msg;
     t.style.display = "block";
     clearTimeout(t._tm);
-    t._tm = setTimeout(() => { t.style.display = "none"; }, 2800);
+    t._tm = setTimeout(() => { t.style.display = "none"; }, 2600);
   }
 
   function baseUrl() {
@@ -1554,40 +1651,63 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     return String(raw || "").replace(/\*\*([^*]+)\*\*/g, "$1");
   }
 
+  function buildBubbleNode(it) {
+    const div = document.createElement("div");
+    const isUser = it.role === "user";
+    const isSpot = it.source === "data_spotlight";
+    const txt = formatMsgText(it.text || "");
+    const isErr = !isUser && (txt.startsWith("❌") || it.source === "on_demand_not_found" || txt.includes("发送失败") || txt.includes("未找到"));
+    div.className = `m-bubble ${isUser ? "user" : "model"}${isSpot ? " is-spot" : ""}${isErr ? " is-err" : ""}`;
+    const body = document.createElement("div");
+    body.textContent = txt;
+    div.appendChild(body);
+    const meta = document.createElement("div");
+    meta.className = "m-b-meta";
+    const viaTag = isUser ? (it.via === "mobile" ? "远程发出" : "电脑发出") : "智能管家";
+    meta.textContent = [it.time, viaTag, it.shot_info].filter(Boolean).join(" · ");
+    div.appendChild(meta);
+    return div;
+  }
+
+  let _chatRenderRaf = 0;
   function renderChats(list) {
-    const feed = $("mChatFeed");
-    const items = Array.isArray(list) ? list : [];
-    if (!items.length) {
+    cachedChatHistory = Array.isArray(list) ? list : [];
+    if (_chatRenderRaf) cancelAnimationFrame(_chatRenderRaf);
+    const draw = () => {
+      _chatRenderRaf = 0;
+      const feed = $("mChatFeed");
+      const items = cachedChatHistory;
+      const frag = document.createDocumentFragment();
+      if (!items.length && !pendingUserMsgs.length) {
+        const welcome = document.createElement("div");
+        welcome.className = "m-bubble model";
+        const d = document.createElement("div");
+        d.textContent = "你好！在这里直接打字就能指挥电脑跑表、找人发钉钉，消息点击即出、零延迟同步~";
+        welcome.appendChild(d);
+        frag.appendChild(welcome);
+      } else {
+        for (const it of items) frag.appendChild(buildBubbleNode(it));
+        for (const pMsg of pendingUserMsgs) {
+          frag.appendChild(buildBubbleNode({ role: "user", text: pMsg, time: "刚刚", via: "mobile", shot_info: "已发出" }));
+        }
+        if (pendingUserMsgs.length) {
+          const waitDiv = document.createElement("div");
+          waitDiv.className = "m-bubble model";
+          waitDiv.innerHTML = `<div class="m-typing-dots"><span></span><span></span><span></span></div>`;
+          frag.appendChild(waitDiv);
+        }
+      }
       feed.innerHTML = "";
-      const welcome = document.createElement("div");
-      welcome.className = "m-bubble model";
-      const d = document.createElement("div");
-      d.textContent = "你好！我是你的云端智能助手，在这里发送的指令和聊天都会实时同步到电脑屏幕~";
-      welcome.appendChild(d);
-      feed.appendChild(welcome);
-      return;
-    }
-    feed.innerHTML = "";
-    for (const it of items) {
-      const div = document.createElement("div");
-      const isUser = it.role === "user";
-      const isSpot = it.source === "data_spotlight";
-      div.className = `m-bubble ${isUser ? "user" : "model"}${isSpot ? " is-spot" : ""}`;
-      const body = document.createElement("div");
-      body.textContent = formatMsgText(it.text || "");
-      div.appendChild(body);
-      const meta = document.createElement("div");
-      meta.className = "m-b-meta";
-      const viaTag = isUser ? (it.via === "mobile" ? "远程发出" : "电脑发出") : "智能管家";
-      meta.textContent = [it.time, viaTag, it.shot_info].filter(Boolean).join(" · ");
-      div.appendChild(meta);
-      feed.appendChild(div);
-    }
-    feed.scrollTop = feed.scrollHeight;
+      feed.appendChild(frag);
+      feed.scrollTop = feed.scrollHeight;
+    };
+    if (typeof requestAnimationFrame === "function") _chatRenderRaf = requestAnimationFrame(draw);
+    else draw();
   }
 
   function applyPcState(st) {
     if (!st || typeof st !== "object") return;
+    try { localStorage.setItem(LS_CACHE_STATE_KEY, JSON.stringify({ st, ts: Date.now() })); } catch (_e) {}
     const dot = $("mStatusDot");
     dot.className = "m-st-dot" + (st.busy ? " busy" : (st.status_level === "err" ? " err" : ""));
     $("mStepText").textContent = st.step_text || "空闲中";
@@ -1613,7 +1733,34 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
     if (typeof st.chat_seq === "number" && st.chat_seq !== lastChatSeq) {
       lastChatSeq = st.chat_seq;
-      renderChats(st.ai_history || []);
+      const incoming = Array.isArray(st.ai_history) ? st.ai_history : [];
+      if (pendingUserMsgs.length && incoming.some((m) => m.role === "user" && m.text === pendingUserMsgs[0])) {
+        pendingUserMsgs.shift();
+      }
+      renderChats(incoming);
+    }
+  }
+
+  function renderSavedAccountUI() {
+    const list = loadSavedAccounts();
+    const wrap = $("mSavedAccountsWrap");
+    const bar = $("mSavedAccountsBar");
+    const clearBtn = $("mClearSavedBtn");
+    if (clearBtn) clearBtn.style.display = list.length ? "inline" : "none";
+    if (!wrap || !bar) return;
+    bar.innerHTML = "";
+    if (!list.length) {
+      wrap.style.display = "none";
+      return;
+    }
+    wrap.style.display = "flex";
+    for (const acc of list) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "m-saved-chip";
+      chip.textContent = `${acc.nick}`;
+      chip.onclick = () => quickSwitchToAccount(acc);
+      bar.appendChild(chip);
     }
   }
 
@@ -1621,8 +1768,9 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     $("mLoginGate").style.display = "none";
     $("mMainApp").style.display = "flex";
     $("mSwitchUserBtn").style.display = "inline-flex";
+    if ($("mLogoutBtn")) $("mLogoutBtn").style.display = "inline-flex";
     const modeTag = connMode === "cloud" ? "跨网加密直连" : "本机/内网直连";
-    $("mHeaderSub").textContent = `${modeTag} · 用户：${myNick || "已连接"}`;
+    $("mHeaderSub").textContent = `${modeTag} · 当前用户：${myNick || "已连接"}`;
   }
 
   function closeRelayStream() {
@@ -1639,7 +1787,10 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     $("mLoginGate").style.display = "flex";
     $("mMainApp").style.display = "none";
     $("mSwitchUserBtn").style.display = "none";
+    if ($("mLogoutBtn")) $("mLogoutBtn").style.display = "none";
+    if ($("mSwitchModalMask")) $("mSwitchModalMask").classList.remove("show");
     $("mHeaderSub").textContent = "无论身在何处，云端连上电脑就能查数据、聊工作、遥控跑表";
+    renderSavedAccountUI();
     if (errText) {
       $("mLoginErr").textContent = errText;
       $("mLoginErr").style.display = "block";
@@ -1721,38 +1872,233 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   async function sendChat(text) {
-    const msg = String(text !== undefined ? text : $("mChatInput").value).trim();
+    const inp = $("mChatInput");
+    const msg = String(text !== undefined ? text : inp.value).trim();
     if (!msg) return;
-    $("mChatInput").value = "";
-    $("mSendBtn").disabled = true;
+    if (text === undefined || inp.value.trim() === msg) inp.value = "";
+    pendingUserMsgs.push(msg);
+    renderChats(cachedChatHistory);
     try {
       if (connMode === "cloud" && relayCred) {
         const res = await sendRelayCommand("chat", { prompt: msg, style_id: "custom" }, 32000);
+        const idx = pendingUserMsgs.indexOf(msg);
+        if (idx >= 0) pendingUserMsgs.splice(idx, 1);
         if (res && res.result) {
           const r = res.result;
           if (Array.isArray(r.history)) {
             lastChatSeq = typeof r.chat_seq === "number" ? r.chat_seq : lastChatSeq + 1;
             renderChats(r.history);
-          } else if (r.reply) {
-            showToast("电脑已回复");
+          } else {
+            renderChats(cachedChatHistory);
           }
+        } else {
+          renderChats(cachedChatHistory);
         }
       } else {
         const res = await mApi("/api/mobile/chat", "POST", { prompt: msg });
+        const idx = pendingUserMsgs.indexOf(msg);
+        if (idx >= 0) pendingUserMsgs.splice(idx, 1);
         if (res && Array.isArray(res.history)) {
           lastChatSeq = typeof res.chat_seq === "number" ? res.chat_seq : lastChatSeq + 1;
           renderChats(res.history);
         } else if (res && res.reply) {
-          showToast("已发送给电脑处理");
+          renderChats(cachedChatHistory);
           doPoll();
         } else {
+          renderChats(cachedChatHistory);
           showToast((res && res.message) || "发送未成功");
         }
       }
     } catch (_e) {
+      const idx = pendingUserMsgs.indexOf(msg);
+      if (idx >= 0) pendingUserMsgs.splice(idx, 1);
+      renderChats(cachedChatHistory);
       showToast("暂未收到电脑回应，请确认电脑软件处于开启状态");
-    } finally {
-      $("mSendBtn").disabled = false;
+    }
+  }
+
+  async function performLogin(nick, pin, b, { remember = true, silentBoot = false } = {}) {
+    const cleanNick = String(nick || "").trim();
+    const cleanPin = String(pin || "").trim();
+    const cleanBase = String(b || "").trim().replace(/\/+$/, "");
+    if (!cleanNick) {
+      showLoginView("请输入目标电脑设置好的名字");
+      return false;
+    }
+    if (!cleanPin) {
+      showLoginView("请输入远程密码");
+      return false;
+    }
+    if (cleanBase) {
+      serverBase = cleanBase;
+      localStorage.setItem("sm_mobile_base", cleanBase);
+    } else if (!isLocalServed()) {
+      serverBase = "";
+      localStorage.removeItem("sm_mobile_base");
+    }
+
+    const persistSuccess = (mode, tok, resolvedNick) => {
+      connMode = mode;
+      myNick = resolvedNick || cleanNick;
+      myPin = cleanPin;
+      if (tok) {
+        mobileToken = tok;
+        localStorage.setItem("sm_mobile_token", tok);
+      }
+      localStorage.setItem("sm_conn_mode", mode);
+      localStorage.setItem("sm_mobile_nick", myNick);
+      if (remember) {
+        localStorage.setItem(LS_AUTO_KEY, "1");
+        saveAccountRecord({ nick: myNick, pin: cleanPin, serverBase: serverBase, connMode: mode });
+      } else {
+        localStorage.setItem(LS_AUTO_KEY, "0");
+      }
+      if ($("mLoginNameInput")) $("mLoginNameInput").value = myNick;
+      if ($("mLoginPinInput")) $("mLoginPinInput").value = cleanPin;
+    };
+
+    let localWorked = false;
+    if (isLocalServed()) {
+      try {
+        const r = await mApi("/api/mobile/auth", "POST", { nickname: cleanNick, pin: cleanPin }, cleanBase || baseUrl());
+        if (r && r.ok && r.mobile_token) {
+          const rNick = (r.profile && (r.profile.nickname || r.profile.display_name)) || cleanNick;
+          persistSuccess("local", r.mobile_token, rNick);
+          showMainView();
+          await doPoll();
+          clearInterval(pollTimer);
+          pollTimer = setInterval(doPoll, 1200);
+          localWorked = true;
+          return true;
+        } else if (r && r.message && !cleanBase) {
+          showLoginView(r.message);
+          return false;
+        }
+      } catch (_localErr) {}
+    } else if (!cleanBase) {
+      try {
+        const localHostBase = "http://127.0.0.1:18792";
+        const r = await mApi("/api/mobile/auth", "POST", { nickname: cleanNick, pin: cleanPin }, localHostBase, 750);
+        if (r && r.ok && r.mobile_token) {
+          serverBase = localHostBase;
+          localStorage.setItem("sm_mobile_base", localHostBase);
+          const rNick = (r.profile && (r.profile.nickname || r.profile.display_name)) || cleanNick;
+          persistSuccess("local", r.mobile_token, rNick);
+          showMainView();
+          await doPoll();
+          clearInterval(pollTimer);
+          pollTimer = setInterval(doPoll, 1200);
+          localWorked = true;
+          return true;
+        }
+      } catch (_loopErr) {}
+    }
+    if (!localWorked) {
+      const derived = SMCrypto.deriveRoomAndKey(cleanNick, cleanPin);
+      relayCred = Object.assign({ nick: cleanNick, pin: cleanPin }, derived);
+      try {
+        const ack = await sendRelayCommand("auth_state", {}, silentBoot ? 7500 : 9000);
+        if (ack && ack.ok) {
+          persistSuccess("cloud", "", ack.nickname || cleanNick);
+          showMainView();
+          if (ack.state) applyPcState(ack.state);
+          clearInterval(pollTimer);
+          pollTimer = setInterval(doPoll, 5000);
+          return true;
+        }
+      } catch (_relayErr) {
+        closeRelayStream();
+        relayCred = null;
+        const isNetErr = _relayErr && _relayErr.message === "broker_unreachable";
+        showLoginView(
+          isNetErr
+            ? "云端通道暂未连通：请检查当前网络是否可上网后再试。"
+            : "没连上电脑：请核对【名字】和【远程密码】是否和电脑端完全一样，并确认电脑软件正开着并连着网。"
+        );
+        return false;
+      }
+    }
+    return false;
+  }
+
+  function logoutCurrentSession() {
+    mobileToken = "";
+    connMode = "";
+    relayCred = null;
+    pendingUserMsgs = [];
+    lastChatSeq = -1;
+    closeRelayStream();
+    localStorage.setItem(LS_AUTO_KEY, "0");
+    localStorage.removeItem("sm_mobile_token");
+    localStorage.removeItem("sm_conn_mode");
+    clearInterval(pollTimer);
+    showLoginView("");
+    showToast("已退出当前连接");
+  }
+
+  async function quickSwitchToAccount(acc) {
+    if (!acc || !acc.nick || !acc.pin) return;
+    if ($("mSwitchModalMask")) $("mSwitchModalMask").classList.remove("show");
+    if ($("mLoginNameInput")) $("mLoginNameInput").value = acc.nick;
+    if ($("mLoginPinInput")) $("mLoginPinInput").value = acc.pin;
+    if ($("mServerBaseInput")) $("mServerBaseInput").value = acc.serverBase || "";
+    serverBase = acc.serverBase || "";
+    closeRelayStream();
+    clearInterval(pollTimer);
+    showToast(`正在切换到「${acc.nick}」…`);
+    await performLogin(acc.nick, acc.pin, acc.serverBase || "", { remember: true });
+  }
+
+  function renderSwitchModalList() {
+    const box = $("mSwitchAcctList");
+    if (!box) return;
+    box.innerHTML = "";
+    const list = loadSavedAccounts();
+    if (!list.length) {
+      const tip = document.createElement("div");
+      tip.style.cssText = "font-size:12px;color:var(--sub);padding:8px 0;";
+      tip.textContent = "暂未记住其他账号，点下方按钮即可登录新账号并自动记住。";
+      box.appendChild(tip);
+      return;
+    }
+    for (const acc of list) {
+      const row = document.createElement("div");
+      row.className = "m-acct-item";
+      const left = document.createElement("div");
+      left.style.cssText = "min-width:0;cursor:pointer;flex:1;";
+      const nm = document.createElement("div");
+      nm.style.cssText = "font-size:13.5px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+      const isCur = myNick && SMCrypto.normalizeNickKey(acc.nick) === SMCrypto.normalizeNickKey(myNick);
+      nm.textContent = acc.nick + (isCur ? "（当前）" : "");
+      const sub = document.createElement("div");
+      sub.style.cssText = "font-size:11px;color:var(--sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+      sub.textContent = acc.serverBase || "云端暗号加密通道";
+      left.appendChild(nm);
+      left.appendChild(sub);
+      left.onclick = () => quickSwitchToAccount(acc);
+
+      const btns = document.createElement("div");
+      btns.style.cssText = "display:flex;gap:5px;flex-shrink:0;";
+      const swBtn = document.createElement("button");
+      swBtn.type = "button";
+      swBtn.className = "m-pill";
+      swBtn.textContent = isCur ? "重连" : "切换";
+      swBtn.onclick = () => quickSwitchToAccount(acc);
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "m-pill";
+      delBtn.style.cssText = "background:rgba(255,59,48,0.12);color:var(--red);";
+      delBtn.textContent = "删";
+      delBtn.onclick = () => {
+        removeAccountRecord(acc.nick);
+        renderSwitchModalList();
+        renderSavedAccountUI();
+      };
+      btns.appendChild(swBtn);
+      btns.appendChild(delBtn);
+      row.appendChild(left);
+      row.appendChild(btns);
+      box.appendChild(row);
     }
   }
 
@@ -1760,110 +2106,51 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     const nick = $("mLoginNameInput").value.trim();
     const pin = $("mLoginPinInput").value.trim();
     const b = $("mServerBaseInput") ? $("mServerBaseInput").value.trim() : "";
-    if (b) {
-      serverBase = b;
-      localStorage.setItem("sm_mobile_base", b);
-    }
-    if (!nick) {
-      showLoginView("请输入目标电脑设置好的名字");
-      return;
-    }
-    if (!pin) {
-      showLoginView("请输入远程密码");
-      return;
-    }
+    const remember = $("mRememberCheck") ? Boolean($("mRememberCheck").checked) : true;
     const btn = $("mLoginSubmitBtn");
     btn.disabled = true;
     btn.textContent = "正在加密连接电脑…";
     try {
-      let localWorked = false;
-      if (isLocalServed()) {
-        try {
-          const r = await mApi("/api/mobile/auth", "POST", { nickname: nick, pin });
-          if (r && r.ok && r.mobile_token) {
-            connMode = "local";
-            mobileToken = r.mobile_token;
-            myNick = (r.profile && (r.profile.nickname || r.profile.display_name)) || nick;
-            localStorage.setItem("sm_conn_mode", "local");
-            localStorage.setItem("sm_mobile_token", mobileToken);
-            localStorage.setItem("sm_mobile_nick", myNick);
-            showMainView();
-            await doPoll();
-            clearInterval(pollTimer);
-            pollTimer = setInterval(doPoll, 1200);
-            localWorked = true;
-          } else if (r && r.message && !b) {
-            showLoginView(r.message);
-            return;
-          }
-        } catch (_localErr) {}
-      } else if (!b) {
-        // 若恰好在运行电脑本机浏览器打开官网，优先尝试 850ms 回环秒连；不通则无缝走云端加密直连
-        try {
-          const localHostBase = "http://127.0.0.1:18792";
-          const r = await mApi("/api/mobile/auth", "POST", { nickname: nick, pin }, localHostBase, 850);
-          if (r && r.ok && r.mobile_token) {
-            serverBase = localHostBase;
-            connMode = "local";
-            mobileToken = r.mobile_token;
-            myNick = (r.profile && (r.profile.nickname || r.profile.display_name)) || nick;
-            localStorage.setItem("sm_mobile_base", localHostBase);
-            localStorage.setItem("sm_conn_mode", "local");
-            localStorage.setItem("sm_mobile_token", mobileToken);
-            localStorage.setItem("sm_mobile_nick", myNick);
-            showMainView();
-            await doPoll();
-            clearInterval(pollTimer);
-            pollTimer = setInterval(doPoll, 1200);
-            localWorked = true;
-          }
-        } catch (_loopErr) {}
-      }
-      if (!localWorked) {
-        const derived = SMCrypto.deriveRoomAndKey(nick, pin);
-        relayCred = Object.assign({ nick, pin }, derived);
-        try {
-          const ack = await sendRelayCommand("auth_state", {}, 9000);
-          if (ack && ack.ok) {
-            connMode = "cloud";
-            myNick = ack.nickname || nick;
-            localStorage.setItem("sm_conn_mode", "cloud");
-            localStorage.setItem("sm_mobile_nick", myNick);
-            sessionStorage.setItem("sm_relay_pin", pin);
-            showMainView();
-            if (ack.state) applyPcState(ack.state);
-            clearInterval(pollTimer);
-            pollTimer = setInterval(doPoll, 5000);
-            return;
-          }
-        } catch (_relayErr) {
-          closeRelayStream();
-          relayCred = null;
-          const isNetErr = _relayErr && _relayErr.message === "broker_unreachable";
-          showLoginView(
-            isNetErr
-              ? "云端通道暂未连通：请检查当前网络是否可上网后再试。"
-              : "没连上电脑：请核对【名字】和【远程密码】是否和电脑端完全一样（可在电脑【云端远程】里查看），并确认电脑软件正开着并连着网。"
-          );
-        }
-      }
+      await performLogin(nick, pin, b, { remember });
     } finally {
       btn.disabled = false;
       btn.textContent = "云端连接我的电脑";
     }
   };
 
+  if ($("mClearSavedBtn")) {
+    $("mClearSavedBtn").onclick = () => {
+      localStorage.removeItem(LS_ACCTS_KEY);
+      localStorage.removeItem(LS_CREDS_KEY);
+      localStorage.removeItem(LS_AUTO_KEY);
+      localStorage.removeItem("sm_mobile_nick");
+      localStorage.removeItem("sm_mobile_base");
+      if ($("mLoginNameInput")) $("mLoginNameInput").value = "";
+      if ($("mLoginPinInput")) $("mLoginPinInput").value = "";
+      if ($("mServerBaseInput")) $("mServerBaseInput").value = "";
+      renderSavedAccountUI();
+      showToast("已清除本地记住的账号与密码");
+    };
+  }
   $("mSwitchUserBtn").onclick = () => {
-    mobileToken = "";
-    connMode = "";
-    relayCred = null;
-    closeRelayStream();
-    localStorage.removeItem("sm_mobile_token");
-    localStorage.removeItem("sm_conn_mode");
-    sessionStorage.removeItem("sm_relay_pin");
-    clearInterval(pollTimer);
-    showLoginView("");
+    renderSwitchModalList();
+    if ($("mSwitchModalMask")) $("mSwitchModalMask").classList.add("show");
   };
+  if ($("mSwitchCloseBtn")) $("mSwitchCloseBtn").onclick = () => $("mSwitchModalMask").classList.remove("show");
+  if ($("mSwitchModalMask")) {
+    $("mSwitchModalMask").onclick = (ev) => {
+      if (ev.target === $("mSwitchModalMask")) $("mSwitchModalMask").classList.remove("show");
+    };
+  }
+  if ($("mSwitchAddNewBtn")) {
+    $("mSwitchAddNewBtn").onclick = () => {
+      if ($("mSwitchModalMask")) $("mSwitchModalMask").classList.remove("show");
+      logoutCurrentSession();
+      if ($("mLoginNameInput")) { $("mLoginNameInput").value = ""; $("mLoginNameInput").focus(); }
+      if ($("mLoginPinInput")) $("mLoginPinInput").value = "";
+    };
+  }
+  if ($("mLogoutBtn")) $("mLogoutBtn").onclick = logoutCurrentSession;
 
   $("mSendBtn").onclick = () => sendChat();
   $("mChatInput").addEventListener("keydown", (e) => {
@@ -1886,7 +2173,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
           const r = await mApi("/api/mobile/action", "POST", { action: act });
           showToast((r && r.message) || "指令已下发给电脑");
         }
-        setTimeout(doPoll, 350);
+        setTimeout(doPoll, 250);
       } catch (_e) {
         showToast("操作指令暂未送达，请重试");
       }
@@ -1894,31 +2181,27 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   (async function bootMobile() {
-    if (connMode === "local" && mobileToken && isLocalServed()) {
+    renderSavedAccountUI();
+    const allowAuto = localStorage.getItem(LS_AUTO_KEY) !== "0";
+    if (connMode === "local" && mobileToken && isLocalServed() && allowAuto) {
       showMainView();
+      const cached = safeJsonParse(localStorage.getItem(LS_CACHE_STATE_KEY), null);
+      if (cached && cached.st) applyPcState(cached.st);
       await doPoll();
       clearInterval(pollTimer);
       pollTimer = setInterval(doPoll, 1200);
       return;
     }
-    const savedPin = sessionStorage.getItem("sm_relay_pin") || "";
-    if (connMode === "cloud" && myNick && savedPin) {
-      $("mLoginPinInput").value = savedPin;
-      const derived = SMCrypto.deriveRoomAndKey(myNick, savedPin);
-      relayCred = Object.assign({ nick: myNick, pin: savedPin }, derived);
-      try {
-        const ack = await sendRelayCommand("auth_state", {}, 6500);
-        if (ack && ack.ok) {
-          showMainView();
-          if (ack.state) applyPcState(ack.state);
-          clearInterval(pollTimer);
-          pollTimer = setInterval(doPoll, 5000);
-          return;
-        }
-      } catch (_e) {
-        closeRelayStream();
-        relayCred = null;
-      }
+    const useCred = savedCred || (myNick && myPin ? { nick: myNick, pin: myPin, serverBase: serverBase } : null);
+    if (allowAuto && useCred && useCred.nick && useCred.pin) {
+      if ($("mLoginNameInput")) $("mLoginNameInput").value = useCred.nick;
+      if ($("mLoginPinInput")) $("mLoginPinInput").value = useCred.pin;
+      if ($("mServerBaseInput") && useCred.serverBase) $("mServerBaseInput").value = useCred.serverBase;
+      showMainView();
+      const cached = safeJsonParse(localStorage.getItem(LS_CACHE_STATE_KEY), null);
+      if (cached && cached.st) applyPcState(cached.st);
+      $("mHeaderSub").textContent = `自动登录中… · ${useCred.nick}`;
+      await performLogin(useCred.nick, useCred.pin, useCred.serverBase || "", { remember: true, silentBoot: true });
     }
   })();
 })();
@@ -1965,6 +2248,7 @@ class MobileBridgeManager:
 
         # 云桥加密实时双向状态（双节点 MQTT over TLS）
         self._relay_stop = threading.Event()
+        self._push_wakeup = threading.Event()
         self._relay_threads = []
         self._relay_push_thread = None
         self._mqtt_conns = {}
@@ -2380,6 +2664,13 @@ class MobileBridgeManager:
                 "state": self._pack_mobile_state(st),
             })
 
+    def notify_state_changed(self):
+        """电脑端聊天或运行状态变化时，立即唤醒云中继推流线程做 0 延迟推送。"""
+        try:
+            self._push_wakeup.set()
+        except Exception:
+            pass
+
     def _cloud_state_push_loop(self):
         while not self._relay_stop.is_set():
             try:
@@ -2397,7 +2688,8 @@ class MobileBridgeManager:
                             })
             except Exception:
                 pass
-            time.sleep(1.1)
+            self._push_wakeup.wait(timeout=0.7)
+            self._push_wakeup.clear()
 
     def _mqtt_broker_loop(self, host, port):
         backoff = 1.2
