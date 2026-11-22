@@ -323,7 +323,7 @@
         </svg>
       </div>
       <div style="min-width:0;">
-        <div class="m-title">暗号表助手 · 云端异地远程版</div>
+        <div class="m-title">暗号表助手 · 云端远程</div>
         <div class="m-sub" id="mHeaderSub">无论身在何处，云端连上电脑就能查数据、聊工作、遥控跑表</div>
       </div>
     </div>
@@ -333,7 +333,7 @@
   <div class="m-login-wrap" id="mLoginGate">
     <div class="m-card">
       <div class="m-intro-box">
-        <div class="m-intro-title">怎么从外地云端连上您的电脑（Soren Drake 设计）</div>
+        <div class="m-intro-title">云端连电脑（Soren Drake 设计）</div>
         <div>
           无论您在家、出差还是用手机流量，只要填上在电脑右上角起的<strong>名字</strong>和<strong>远程密码</strong>，就能直接从云端连回电脑——随时问数据、遥控自动跑表发钉钉，两边的聊天记录会实时同步。
         </div>
@@ -628,7 +628,7 @@
       const welcome = document.createElement("div");
       welcome.className = "m-bubble model";
       const d = document.createElement("div");
-      d.textContent = "你好！我是电脑上的专属智能小猫伙伴。你在网页发出的任何指令和对话都会实时同步到电脑屏幕上~";
+      d.textContent = "你好！我是你的云端智能助手，在这里发送的指令和聊天都会实时同步到电脑屏幕~";
       welcome.appendChild(d);
       feed.appendChild(welcome);
       return;
@@ -644,7 +644,7 @@
       div.appendChild(body);
       const meta = document.createElement("div");
       meta.className = "m-b-meta";
-      const viaTag = isUser ? (it.via === "mobile" ? "远程发出" : "电脑发出") : "小猫伙伴";
+      const viaTag = isUser ? (it.via === "mobile" ? "远程发出" : "电脑发出") : "智能管家";
       meta.textContent = [it.time, viaTag, it.shot_info].filter(Boolean).join(" · ");
       div.appendChild(meta);
       feed.appendChild(div);

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.8.3 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.8.4 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -4395,9 +4395,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.8.3" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.8.4" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.8.3</span>
+          <span class="ver-pill" id="verBadge">v2.8.4</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -4556,7 +4556,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="kpi-ribbon-4">
           <div class="kpi-card" id="kpiRegCard">
             <div class="mini-stat-top">
-              <span class="mini-stat-title">最新盘面注册</span>
+              <span class="mini-stat-title">数据概览</span>
               <div class="sf-badge sf-blue" style="width:22px;height:22px;border-radius:6px;">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
               </div>
@@ -4567,7 +4567,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
           <div class="kpi-card k-purple" id="kpiTopCard">
             <div class="mini-stat-top">
-              <span class="mini-stat-title">团队与个人领跑</span>
+              <span class="mini-stat-title">团队排行</span>
               <div class="sf-badge sf-purple" style="width:22px;height:22px;border-radius:6px;">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
               </div>
@@ -4578,7 +4578,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
           <div class="kpi-card k-teal" id="sumPresetsRow">
             <div class="mini-stat-top">
-              <span class="mini-stat-title">自定义单元格校准</span>
+              <span class="mini-stat-title">格位写入</span>
               <div class="sf-badge sf-teal" style="width:22px;height:22px;border-radius:6px;">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/></svg>
               </div>
@@ -4589,7 +4589,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
           <div class="kpi-card k-green" data-jump="schedule">
             <div class="mini-stat-top">
-              <span class="mini-stat-title">每日排期计划</span>
+              <span class="mini-stat-title">排期计划</span>
               <div class="sf-badge sf-green" style="width:22px;height:22px;border-radius:6px;">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><rect x="3" y="4" width="18" height="18" rx="3"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
               </div>
@@ -4634,11 +4634,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div class="section-wrap">
-              <div class="section-head"><span>钉钉投递策略速览</span><span>点击修改配置</span></div>
+              <div class="section-head"><span>投递概览</span><span>点击修改</span></div>
               <div class="stat-grid-2">
                 <div class="mini-stat-card" data-jump="dingtalk">
                   <div class="mini-stat-top">
-                    <span class="mini-stat-title">目标钉钉会话</span>
+                    <span class="mini-stat-title">目标群聊</span>
                     <div class="sf-badge sf-indigo" style="width:22px;height:22px;border-radius:6px;">
                       <svg viewBox="0 0 24 24" fill="currentColor" style="width:12px;height:12px;"><path d="M6.0 1.9Q12.5 6.8 18.2 11.1C19.3 12.0 19.1 13.8 17.6 14.7L14.9 16.2L17.4 16.2L9.3 22.1L11.9 17.6L9.9 17.6L11.5 15.1C8.4 15.0 6.2 13.5 5.9 11.3C7.7 12.4 9.7 12.9 11.7 12.9C7.5 12.0 5.0 9.8 4.8 6.8C7.0 8.5 9.6 9.9 12.4 10.6C8.0 8.8 5.5 5.6 6.0 1.9Z"/></svg>
                     </div>
@@ -4649,7 +4649,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 <div class="mini-stat-card" data-jump="dingtalk">
                   <div class="mini-stat-top">
-                    <span class="mini-stat-title">发送与文案策略</span>
+                    <span class="mini-stat-title">发送策略</span>
                     <div class="sf-badge sf-orange" style="width:22px;height:22px;border-radius:6px;">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><path d="M13.73 21a2 2 0 01-3.46 0"/><path d="M18.63 13A17.89 17.89 0 0118 8"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
                     </div>
@@ -4662,8 +4662,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             <div class="section-wrap">
               <div class="section-head">
-                <span>表格自定义单元格写入规则</span>
-                <button class="head-action-btn" id="homeAddCellBtn" type="button">+ 去自定义 / 新增格位</button>
+                <span>格位规则</span>
+                <button class="head-action-btn" id="homeAddCellBtn" type="button">+ 新增格位</button>
               </div>
               <div class="ios-group">
                 <div class="home-cell-grid" id="homeCellChips"></div>
@@ -4672,7 +4672,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             <div class="section-wrap">
               <div class="section-head">
-                <span>实时运行动态（上次：<span id="lastRun">—</span>）</span>
+                <span>运行动态（上次：<span id="lastRun">—</span>）</span>
                 <button class="head-action-btn" data-jump="more" type="button">全部日志</button>
               </div>
               <div class="ios-group">
@@ -4740,16 +4740,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                       </svg>
                     </button>
                     <div class="row-main">
-                      <div class="row-title">内置智能小猫伙伴与数据管家</div>
+                      <div class="row-title">数据管家</div>
                       <div class="row-sub">Soren Drake 设计 · 会自动播报变动、查档案也能陪你聊天解闷</div>
                     </div>
                   </div>
                   <div style="display:flex;align-items:center;gap:5px;flex-shrink:0;">
-                    <button class="mini-pill" id="aiSuggestBtn" type="button" style="white-space:nowrap;">体检建议</button>
+                    <button class="mini-pill" id="aiSuggestBtn" type="button" style="white-space:nowrap;">数据自检</button>
                     <button class="mini-pill" id="aiClearChatBtn" type="button" style="color:var(--sub);white-space:nowrap;">清空</button>
                   </div>
                 </div>
-                <span class="ai-src-pill" id="aiShotStatusPill">智能小猫伙伴就绪</span>
+                <span class="ai-src-pill" id="aiShotStatusPill">数据就绪</span>
               </div>
 
               <div class="ai-greeting-banner" id="aiMascotGreetingBar">
@@ -4798,7 +4798,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
               <div class="ai-chat-feed" id="aiChatFeed">
                 <div class="ai-empty-guide" id="aiEmptyGuide">
-                  我是「暗号表助手」专属内置的智能小猫伙伴（由 Soren Drake 设计）。您可以：<br/>
+                  我是「暗号表助手」内置智能助手（由 Soren Drake 设计）。您可以：<br/>
                   1. 点上方任意总结模板或快捷提问胶囊，也可点击左上角小猫头像让我陪你聊句元气工作鼓励；<br/>
                   2. 直接提问软件用法（如“怎么在 I4 格自动填入内容”）、当前状态或排障问题，每次跑完表我也会第一时间告诉你关键数据涨跌变化；<br/>
                   3. 点名追问任意团队或成员数据（或在上方输入/掷骰子选组名），我会自动结合历次归档档案公平分析。
@@ -4820,7 +4820,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="bento-col">
             <div class="section-wrap">
               <div class="section-head">
-                <span>目标群聊 / 联系人（支持多个）</span>
+                <span>目标会话</span>
                 <button class="head-action-btn" id="addTargetBtn" type="button">+ 添加会话</button>
               </div>
               <div class="ios-group">
@@ -4830,7 +4830,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
                   </div>
                   <div class="row-main">
-                    <div class="row-title">检测钉钉环境与同权限状态</div>
+                    <div class="row-title">软件自检</div>
                     <div class="row-sub">排查权限不一致、登录主窗与兜底模板</div>
                   </div>
                   <div class="row-right">
@@ -4844,7 +4844,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             <div class="section-wrap">
               <div class="section-head">
-                <span>钉钉发送文案时间格式与 AI 简报</span>
+                <span>消息格式</span>
               </div>
               <div class="ios-group">
                 <div class="slot-block" style="padding:10px 13px;">
@@ -4918,7 +4918,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             <div class="section-wrap">
               <div class="section-head">
-                <span>分时段消息后缀</span>
+                <span>时段后缀</span>
                 <button class="head-action-btn" id="addSuffixRuleBtn" type="button">+ 添加时段</button>
               </div>
               <div class="ios-group">
@@ -4943,7 +4943,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="bento-col">
             <div class="section-wrap" id="summaryPresetsSection">
               <div class="section-head">
-                <span>汇总表筛选预设校准（名称框定位）</span>
+                <span>格位校准</span>
                 <div class="tt-head-tools">
                   <button class="head-action-btn" id="resetPresetsBtn" type="button" style="color:var(--sub);">恢复默认</button>
                   <button class="head-action-btn" id="addPresetBtn" type="button">+ 新增位置</button>
@@ -5002,7 +5002,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div class="section-wrap">
-              <div class="section-head"><span>投递行为控制（双列速调）</span></div>
+              <div class="section-head"><span>投递设置</span></div>
               <div class="ios-group">
                 <div class="slot-block" style="padding:10px 13px;border-bottom:0.5px solid var(--sep);">
                   <div class="preset-sub-row">
@@ -5111,7 +5111,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="bento-grid">
           <div class="bento-col">
             <div class="section-wrap">
-              <div class="section-head"><span>自动值守日期与时段</span><span>点击胶囊调整</span></div>
+              <div class="section-head"><span>值守时段</span><span>点击调整</span></div>
               <div class="ios-group">
                 <div class="slot-block">
                   <div class="slot-head">
@@ -5202,7 +5202,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div class="section-wrap">
-              <div class="section-head"><span>发群时段限制</span></div>
+              <div class="section-head"><span>发送时段</span></div>
               <div class="ios-group">
                 <div class="ios-row">
                   <div class="sf-badge sf-red">
@@ -5226,7 +5226,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="bento-col">
             <div class="section-wrap">
               <div class="section-head">
-                <span>每日执行排期全览</span>
+                <span>排期总览</span>
                 <div class="tt-head-tools">
                   <button class="head-action-btn" id="resetAllPointsBtn" type="button" style="display:none;color:var(--red);">重置单点</button>
                   <span id="ttSummaryText">共 0 轮</span>
@@ -5262,14 +5262,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div class="section-wrap">
-              <div class="section-head"><span>异常自诊与按键操作指南</span><span>F8 / F9</span></div>
+              <div class="section-head"><span>按键排障</span><span>F8 / F9</span></div>
               <div class="ios-group">
                 <div class="ios-row clickable" id="guideToggleRow">
                   <div class="sf-badge sf-blue">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
                   </div>
                   <div class="row-main">
-                    <div class="row-title">常见异常代码与 F8/F9 续跑说明</div>
+                    <div class="row-title">异常自检与续跑</div>
                     <div class="row-sub" id="guideSummarySub">点击展开速查指南</div>
                   </div>
                   <div class="row-right">
@@ -5297,27 +5297,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="bento-col">
             <div class="section-wrap">
               <div class="section-head">
-                <span>内置智能小猫伙伴偏好</span>
+                <span>智能设置</span>
               </div>
               <div class="ios-group">
                 <div class="switch-grid-2">
                   <div class="sg-cell">
                     <div class="sg-copy">
-                      <span class="sg-title">启用内置智能伙伴</span>
+                      <span class="sg-title">智能助手</span>
                       <span class="sg-sub">主动播报数据变化与陪伴问答</span>
                     </div>
                     <label class="ios-switch sm"><input type="checkbox" id="aiEnabled" /><span class="ios-slider"></span></label>
                   </div>
                   <div class="sg-cell">
                     <div class="sg-copy">
-                      <span class="sg-title">报错时自动 AI 诊断</span>
+                      <span class="sg-title">报错自检</span>
                       <span class="sg-sub">失败后自动生成大白话方案</span>
                     </div>
                     <label class="ios-switch sm"><input type="checkbox" id="aiAutoDiagnose" /><span class="ios-slider"></span></label>
                   </div>
                   <div class="sg-cell" style="grid-column:1 / -1;">
                     <div class="sg-copy">
-                      <span class="sg-title">遇错 AI 自动看图自愈</span>
+                      <span class="sg-title">自动修复</span>
                       <span class="sg-sub">卡住时先截屏看现场并自动调整窗口焦点/按钮续跑，自愈失败再提示人工</span>
                     </div>
                     <label class="ios-switch sm"><input type="checkbox" id="aiAutoHeal" /><span class="ios-slider"></span></label>
@@ -5325,7 +5325,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
                 <div class="ios-row compact-sep">
                   <div class="row-main">
-                    <div class="row-title" style="font-size:12.5px;">长期总结附加偏好（可选）</div>
+                    <div class="row-title" style="font-size:12.5px;">总结偏好</div>
                     <div class="rule-input-box" style="margin-top:5px;">
                       <input type="text" id="aiCustomPrompt" placeholder="例如：每次总结都重点对比各组完成率与增量榜单" />
                     </div>
@@ -5335,7 +5335,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div class="section-wrap">
-              <div class="section-head"><span>数据源与后台账号（双列）</span></div>
+              <div class="section-head"><span>数据账号</span></div>
               <div class="ios-group">
                 <div class="ios-row">
                   <div class="sf-badge sf-blue">
@@ -5365,14 +5365,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div class="section-wrap">
-              <div class="section-head"><span>历史截图归档</span><span>最多留存 20 张</span></div>
+              <div class="section-head"><span>截图归档</span><span>最多留存 20 张</span></div>
               <div class="ios-group">
                 <div class="ios-row">
                   <div class="sf-badge sf-indigo">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
                   </div>
                   <div class="row-main">
-                    <div class="row-title">自动归档汇总表截图</div>
+                    <div class="row-title">自动归档</div>
                     <div class="row-sub">供随时回看及 AI 上下轮增量对比</div>
                   </div>
                   <label class="ios-switch sm"><input type="checkbox" id="saveShotHistory" /><span class="ios-slider"></span></label>
@@ -5564,7 +5564,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="modal-mask" id="mobileBridgeModalMask">
     <div class="card-modal" style="width:min(680px,95vw);">
       <div class="modal-head">
-        <div class="modal-title">云端异地远程连这台电脑</div>
+        <div class="modal-title">云端远程</div>
         <button class="mini-pill" id="mobileModalCloseBtn" type="button">关闭</button>
       </div>
       <div class="modal-scroll">
@@ -5611,7 +5611,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="modal-mask" id="profileModalMask">
     <div class="card-modal">
       <div class="modal-head">
-        <div class="modal-title">设置我的展示名字与头像</div>
+        <div class="modal-title">昵称头像</div>
         <button class="mini-pill" id="profileCloseBtn" type="button">关闭</button>
       </div>
       <div class="modal-scroll">
@@ -5655,7 +5655,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="modal-mask" id="lockWaitModalMask">
     <div class="card-modal" style="width:min(440px,92vw);">
       <div class="modal-head">
-        <div class="modal-title">当前有同事正在操作表格</div>
+        <div class="modal-title">排队提醒</div>
         <button class="mini-pill" id="lockWaitCloseBtn" type="button">关闭</button>
       </div>
       <div class="modal-scroll">
@@ -5682,7 +5682,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="modal-mask" id="feedbackModalMask">
     <div class="card-modal">
       <div class="modal-head">
-        <div class="modal-title">问题与建议反馈</div>
+        <div class="modal-title">意见反馈</div>
         <button class="mini-pill" id="fbCloseBtn" type="button">关闭</button>
       </div>
       <div class="modal-scroll">
@@ -5706,7 +5706,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="modal-mask" id="adminAuthMask">
     <div class="card-modal" style="width:min(380px,92vw);">
       <div class="modal-head">
-        <div class="modal-title">超级管理员安全验证</div>
+        <div class="modal-title">超管验证</div>
         <button class="mini-pill" id="adminAuthCloseBtn" type="button">取消</button>
       </div>
       <div class="modal-scroll">
@@ -5725,7 +5725,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="card-modal wide">
       <div class="modal-head">
         <div style="display:flex;align-items:center;gap:10px;">
-          <div class="modal-title">超级管理员总控后台</div>
+          <div class="modal-title">总控后台</div>
           <span class="ver-pill" style="background:rgba(88,86,214,0.16);color:var(--indigo);">全员监控 · 权限调控 · 统计审计</span>
         </div>
         <div style="display:flex;gap:7px;">
@@ -5747,7 +5747,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div id="adminPane-stats" class="admin-pane" style="display:flex;flex-direction:column;gap:12px;">
           <div class="admin-box">
             <div class="admin-box-title">
-              <span>自定义时间范围运行统计</span>
+              <span>运行统计</span>
               <div class="filter-bar">
                 <button type="button" class="mini-pill active" data-qrange="today">今天</button>
                 <button type="button" class="mini-pill" data-qrange="yesterday">昨天</button>
@@ -5770,14 +5770,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
             <div class="admin-box">
               <div class="admin-box-title">
-                <span>实时防撞锁与排队状态</span>
+                <span>排队状态</span>
                 <button type="button" class="pill-action-btn danger" id="adminForceUnlockBtn">一键强制解锁并清队</button>
               </div>
               <div id="adminLockDetail" style="font-size:12.5px;color:var(--text-2);">当前空闲，无人占用表格。</div>
             </div>
             <div class="admin-box">
               <div class="admin-box-title">
-                <span>全员云端异地协同状态</span>
+                <span>云端协同</span>
                 <button type="button" class="pill-action-btn ok" id="adminCloudSyncNowBtn">立即云端同步</button>
               </div>
               <div style="font-size:12.5px;line-height:1.55;color:var(--sub);" id="adminCloudStatusTip">
@@ -5787,7 +5787,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
 
           <div class="admin-box">
-            <div class="admin-box-title"><span>成员运行榜 &amp; 最近流水记录</span></div>
+            <div class="admin-box-title"><span>运行流水</span></div>
             <div id="adminRunsList" style="display:flex;flex-direction:column;gap:7px;"></div>
           </div>
         </div>
@@ -5798,11 +5798,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <!-- Tab 3: 同步报错 + AI 聊天记录 -->
         <div id="adminPane-errors" class="admin-pane" style="display:none;flex-direction:column;gap:12px;">
           <div class="admin-box">
-            <div class="admin-box-title"><span>全员异常报错同步清单（附头像/昵称/备注）</span></div>
+            <div class="admin-box-title"><span>异常汇总</span></div>
             <div id="adminErrorsList" style="display:flex;flex-direction:column;gap:8px;"></div>
           </div>
           <div class="admin-box">
-            <div class="admin-box-title"><span>成员与内置 AI 聊天计划记录</span></div>
+            <div class="admin-box-title"><span>对话记录</span></div>
             <div id="adminAiChatsList" style="display:flex;flex-direction:column;gap:8px;"></div>
           </div>
         </div>
@@ -5813,7 +5813,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <!-- Tab 5: 全局软件设计逻辑与密码 -->
         <div id="adminPane-logic" class="admin-pane" style="display:none;flex-direction:column;gap:12px;">
           <div class="admin-box">
-            <div class="admin-box-title"><span>全员统一运行设计逻辑（实时调控并覆盖生效）</span></div>
+            <div class="admin-box-title"><span>全局逻辑</span></div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:12.5px;">
               <div>
                 <div style="color:var(--sub);margin-bottom:4px;">防撞锁最长自动释放时间（秒，30-1800）：</div>
@@ -5855,7 +5855,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
           <div class="admin-box">
             <div class="admin-box-title">
-              <span>全员默认 AI 接口配置（仅超级管理员可见与调配 · 可在成员页单人覆盖）</span>
+              <span>接口配置</span>
               <button type="button" class="pill-action-btn" id="adminTestGlobalAiBtn">测试接口连通</button>
             </div>
             <div style="display:flex;flex-direction:column;gap:8px;font-size:12.5px;">
@@ -5886,7 +5886,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
 
           <div class="admin-box">
-            <div class="admin-box-title"><span>修改超级管理员口令与密码</span></div>
+            <div class="admin-box-title"><span>密码设置</span></div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
               <input type="password" id="adminNewPasscodeInput" class="small-input" placeholder="新口令（例如 myadmin）" />
               <input type="password" id="adminNewPasswordInput" class="small-input" placeholder="新密码" />
@@ -7582,11 +7582,11 @@ function renderErrorDiagCard(det, aiRes, aiBusy) {
   if (panelSig !== lastAiPanelSig) {
     lastAiPanelSig = panelSig;
     if (aiBusy) {
-      aiPanel.textContent = "内置智能小猫伙伴正在对照历史运行记录与报错原因为您复盘分析，请稍候…";
+      aiPanel.textContent = "智能管家正在对照历史记录与报错原因复盘分析，请稍候…";
       aiPanel.classList.add("show");
     } else if (aiRes && aiRes.reply && (aiRes.mode === "diagnose" || aiRes.mode === "auto_heal")) {
       const srcTag = (aiRes.source === "gemini" || aiRes.source === "gemini_vision" || aiRes.source === "ai_cloud" || aiRes.source === "ai_vision")
-        ? (aiRes.mode === "auto_heal" ? "智能小猫视觉自动调试" : "智能小猫历史对比深度诊断")
+        ? (aiRes.mode === "auto_heal" ? "智能视觉调试" : "智能历史复盘")
         : (aiRes.mode === "auto_heal" ? "AI 自动看图调试引擎" : "本地专家历史对比复盘");
       aiPanel.innerHTML = `<div class="md-h3">${escapeHtmlStr(srcTag)}</div>${formatSafeMarkdown(aiRes.reply)}`;
       aiPanel.classList.add("show");
@@ -7654,7 +7654,7 @@ function renderAiChatFeed(history, pendingText = null) {
       const infoSpan = document.createElement("span");
       infoSpan.style.cssText = "display:inline-flex;align-items:center;";
       const srcDesc = (turn.source === "gemini" || turn.source === "ai_cloud" || turn.source === "data_spotlight" || turn.source === "greeting")
-        ? "智能小猫伙伴"
+        ? "智能管家"
         : (turn.shot_info ? "智能助手" : "贴士");
       infoSpan.innerHTML = `${buildMiniCatSvg()}<span>${escapeHtmlStr([turn.time, srcDesc, turn.shot_info].filter(Boolean).join(" · "))}</span>`;
       const cpBtn = document.createElement("button");
@@ -8045,13 +8045,13 @@ function bindEvents() {
   $("autoHealNowBtn").onclick = async () => {
     const panel = $("diagAiPanel");
     lastAiPanelSig = "";
-    panel.textContent = "内置智能小猫伙伴正在截屏观察现场并自动调试修复，请稍候…";
+    panel.textContent = "智能管家正在截屏观察现场并自动调试修复，请稍候…";
     panel.classList.add("show");
     $("autoHealNowBtn").disabled = true;
     try {
       const res = await api("/api/ai-auto-heal", "POST", {});
       const tag = (res.source === "gemini_vision" || res.source === "gemini" || res.source === "ai_vision" || res.source === "ai_cloud")
-        ? "智能小猫视觉自动调试"
+        ? "智能视觉调试"
         : "AI 自动调试引擎";
       panel.innerHTML = `<div class="md-h3">${escapeHtmlStr(tag)}</div>${formatSafeMarkdown(res.reply || "")}`;
       if (res.resumed) showToast("智能伙伴已自动调整现场并恢复运行");
@@ -8065,11 +8065,11 @@ function bindEvents() {
   $("askAiErrorBtn").onclick = async () => {
     const panel = $("diagAiPanel");
     lastAiPanelSig = "";
-    panel.textContent = "内置智能小猫伙伴正在对照历次运行成败日志并整理分析建议，请稍候…";
+    panel.textContent = "智能管家正在对照历次运行日志整理分析建议，请稍候…";
     panel.classList.add("show");
     try {
       const res = await api("/api/ai-diagnose", "POST", { mode: "diagnose" });
-      const tag = (res.source === "gemini" || res.source === "ai_cloud") ? "智能小猫历史对比深度诊断" : "本地专家历史对比复盘";
+      const tag = (res.source === "gemini" || res.source === "ai_cloud") ? "智能历史复盘" : "专家历史复盘";
       panel.innerHTML = `<div class="md-h3">${escapeHtmlStr(tag)}</div>${formatSafeMarkdown(res.reply || "")}`;
       renderErrorDiagCard(currentErrorDetail, res, false);
     } catch (_e) {
@@ -9605,7 +9605,7 @@ async function loadStartupGreeting(force = false) {
     aiStyles = Array.isArray(data.ai_meta.styles) ? data.ai_meta.styles : [];
     aiCandidateTeams = Array.isArray(data.ai_meta.candidate_teams) ? data.ai_meta.candidate_teams : [];
     cachedChatHistory = Array.isArray(data.ai_meta.history) ? data.ai_meta.history : [];
-    $("aiShotStatusPill").textContent = data.ai_meta.latest_shot_label ? ("已就绪 · " + data.ai_meta.latest_shot_label) : "智能小猫伙伴就绪";
+    $("aiShotStatusPill").textContent = data.ai_meta.latest_shot_label ? ("已就绪 · " + data.ai_meta.latest_shot_label) : "数据就绪";
     if (data.ai_meta.data_brief) applyDataBriefUI(data.ai_meta.data_brief);
     renderAiChatFeed(cachedChatHistory);
   }
