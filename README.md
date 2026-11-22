@@ -1,85 +1,87 @@
-# 📊 暗号表助手（SheetMate）
+# 暗号表助手（SheetMate）v2.8.8
 
-> 自动拉取数据日报 → 写入 WPS 金山在线表格 → 高清框选汇总表复制为图片 → 精准推送至钉钉群聊。
+[![最新版本](https://img.shields.io/badge/Release-v2.8.8-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
+[![运行平台](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-34C759?style=flat-square&logo=windows)](https://github.com/Sorenskr/SheetMate/releases/latest)
+[![云端远程入口](https://img.shields.io/badge/Cloud%20Web-点击打开远程控制台-5856D6?style=flat-square&logo=googlechrome)](https://sorenskr.github.io/SheetMate/)
 
----
-
-## 📥 下载与使用（Windows 免安装版）
-
-### 👉 **[点击直接下载最新版 SheetMate.exe (v2.0.1)](https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe)**
-
-> 也可以前往 **[Releases 发布页](https://github.com/Sorenskr/SheetMate/releases)** 查看所有历史版本。
-
-### 首次使用步骤
-1. 下载 `SheetMate.exe` 到任意文件夹（首次运行不会在桌面铺开杂乱缓存，浏览器数据自动存放在 `%LOCALAPPDATA%\SheetMate\browser_data`）。
-2. 双击 `SheetMate.exe` 打开 **Apple iOS 18 风格控制中心**（首次运行会在后台自动补齐 Chromium 组件）。
-3. 在控制中心设置好「钉钉目标群聊 / 会话」与运行计划，点击 **「立即跑一次」**。
-4. 首次运行若 WPS 弹出扫码登录页面，请使用手机扫码登录一次，后续即全程全自动执行。
+> 由 **Soren Drake** 设计研发的办公数据自动化与多端协同助手：自动登录后台抓数、一键清洗写入 WPS 在线汇总表、高清智能截图、无坐标钉钉静音发群，支持手机与异地网页端到端加密聊天遥控。
 
 ---
 
-## 🚀 v2.0.1 更新亮点
+## 📥 立即下载与在线访问
 
-- **无坐标钉钉智能「静音发送」与图像匹配双引擎兜底**
-  - 优先采用 `pywinauto (backend="uia")` 仅按进程 `DingTalk.exe` 定位发送按钮、下拉箭头与「设为静音 / 取消静音」菜单，彻底告别跨电脑分辨率/DPI 错位问题（每步 2 次 @ `1s` 重试，失败自动输出 UIA 控件树快照方便排查）。
-  - UIA 不可用时自动降级 `pyautogui.locateOnScreen` 多尺度灰度模板匹配，并在运行日志明确标注当前所用模式；同时提供独立探测脚本 `probe_dingtalk_silent.py`。
-  - 启动及发送前检测脚本与 `DingTalk.exe` **同权限运行一致性**，静音切换后强制复核键盘光标确在底部聊天输入窗口再按 `Enter`。
-- **每日执行排期每节点精细化管控**
-  - 「每日执行排期全览」每行直接展示该节点实际生效的**时间后缀具体内容**，右侧内嵌行内「静音发送」开关拨杆；点开节点弹窗还可精细配置三态静音策略（`跟随全局` / `静音发送` / `常规提醒`）与单点后缀。
-  - 若某节点关闭静音发送，会自动清理钉钉输入框残留的「静音发送」状态，杜绝误静音。
-- **多群聊 / 多联系人依次自动投递与实用增强**
-  - 「钉钉投递」支持添加多组会话并独立启停；WPS 仅截图一次即可按序自动搜群投递，单群遇阻可选择跳过继续发下一个。
-  - 新增**值守期间防电脑休眠/息屏**（Win32 `SetThreadExecutionState`）、**一键检测钉钉环境与同权限状态**、**最近 20 张汇总截图自动归档**与排期跨日 `下轮` 提示。
+不管您是第一次拿到这个工具的新同事，还是需要在外出差用手机查看电脑跑表进度，都可以直接通过下方入口下载或打开：
+
+| 用途 / 版本 | 直达链接 | 适用场景说明 |
+| :--- | :--- | :--- |
+| **Windows 单文件免安装版**（推荐新手） | [**下载 SheetMate.exe**](https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe) | 只有单独一个 `.exe` 文件，不用解压，下载后双击即可运行，支持软件内一键检查更新 |
+| **Windows 极速便携压缩包**（推荐日常高频用） | [**下载 SheetMate-Windows-x64-Portable.zip**](https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate-Windows-x64-Portable.zip) | 解压到任意文件夹后双击里面的 `SheetMate.exe`，无需每次等待解压，秒开最顺滑 |
+| **云端异地远程控制台**（手机 / 外地网页） | [**打开 https://sorenskr.github.io/SheetMate/**](https://sorenskr.github.io/SheetMate/) | 手机浏览器或外地电脑打开，填好电脑上的**唯一名字**和**远程密码**即可端到端加密聊天、查数据、遥控跑表（网页内也提供客户端下载） |
+| **全部历史版本与发行说明** | [**查看 GitHub Releases**](https://github.com/Sorenskr/SheetMate/releases) | 查看完整迭代记录、各版本说明与文件 SHA-256 校验信息 |
 
 ---
 
-## ✨ v2.0.0 核心特性与优化
+## ✨ v2.8.8 核心功能一览
 
-- **全新 Apple iOS 18 风格控制中心**
-  - 粘性毛玻璃导航栏、支持浅色 / 深色模式一键切换。
-  - 顶部 **Dynamic Island 灵动岛状态卡片** + 桌面置顶灵动岛悬浮进度胶囊，实时查看步骤、百分比和倒计时，运行中可随时点击「停止」。
-  - 标准 iOS 分段滑块、苹果绿弹簧开关、时间选择器胶囊与手风琴折叠设置组，修改参数**自动保存并实时热生效**。
-- **WPS 汇总表复制为图片高可靠性修复**
-  - 检测末行前原生清空系统剪贴板，避免读到上一轮 TSV 残留数据导致选区行数错乱。
-  - 增加 `D8` 姓名列兜底探测，并在画布绿框内部动态计算右键点击坐标（不再写死固定屏幕坐标）。
-  - 复制后自动校验剪贴板位图尺寸，杜绝误复制空单元格或单格。
-- **钉钉精准搜群、静音发送与防误贴四重护栏**
-  - 自动剥离群名中的 Emoji 表情，优先使用纯文字核心词段进行精准搜索与多词匹配，大幅提升含 Emoji 长群名命中率。
-  - 搜索期间剪贴板不放图片；通过 Win32 检测全局搜索弹窗（`ToolSaveBits`）彻底消失、自动定位底部聊天输入区并在粘贴图片与文字前双重核验当前系统焦点控件，**100% 防止将图片误贴入搜索框**。
-  - **发送前自动清空发送框残留草稿**，防止把未删完的内容误发出去；支持自动点击发送右侧菜单勾选 **「设为静音（静音发送）」**，且默认贴好后先暂不发出，方便确认后手动发送。
+- **全自动抓数写表 & 自定义格位**
+  - 自动登录后台拉取三份源数据，自动规范格式并精准写入 WPS 金山在线汇总表，同步自动清理多余旧标签页。
+  - 支持自由配置单元格规则（如日期按天加减、指定团队或筛选词），并具备软件自检、数据自检与每轮异常归档功能。
+- **4K / 多缩放自适应钉钉静音投递**
+  - 基于 UIA 控件定位与多尺度图像模板双重识别，适配不同屏幕分辨率与系统缩放比，不依赖写死坐标。
+  - 支持多群组顺序连发、**静音发送**（群成员收得到消息但不响铃打扰）、发送前群名二次核验与防键鼠误触护栏。
+- **大白话排期 & 单点独立联动**
+  - 支持白天 / 夜间双时段、工作日 / 每天 / 自定义星期，内置桌面灵动岛悬浮进度胶囊与值守防电脑休眠。
+  - 点击排期列表中的任意时间点，可用大白话直接单独调整：**「按默认 / 发钉钉 / 不发钉钉」** 与 **「今天 / 昨天 / 前天」**；选中「不发钉钉」后弹窗与列表零延迟同步隐藏多余配文与静音项。
+- **云端异地远程连接 & 多人防撞排队**
+  - 每一位使用成员设置唯一名字并挑选可爱的萌宠头像，支持通过云端协作空间在多人共用同一张线上表格时**自动互锁排队防撞**。
+  - 无论在家还是出差，通过 [云端远程网址](https://sorenskr.github.io/SheetMate/) 输入本机唯一名字与自设远程密码即可端到端加密连回电脑（PBKDF2-SHA256 密钥派生 + 认证加密 + 防重放防篡改），电脑与手机聊天记录实时双向同步。
+- **内置智能伙伴与数据管家**
+  - 每轮跑完表自动对照上一轮播报数据增量亮点；支持用自然语言让智能助手帮忙改排期、复盘异常或做数据自检；支持「换一句」清爽问候语刷新。
+- **Apple iOS 18 昼夜动态光效界面**
+  - 随清晨、白昼、黄昏、夜晚自动变换磨砂玻璃动态天光背景，卡片化分组设置修改即生效。
 
 ---
 
-## 🛠 源码运行与本地打包
+## 🚀 三步快速上手
+
+1. **下载运行**：点击上方下载 [**SheetMate.exe**](https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe)（或下载解压便携压缩包），在 Windows 电脑上双击打开。首次使用如尚未安装浏览器内核，程序会引导或自动完成 Chromium 初始化。
+2. **填好配置与起名字**：在右上角设置一个**全队不重名的专属名字**并挑选萌宠头像；填好 WPS 汇总表链接、数据账号与目标钉钉群名称（若需手机或外地电脑遥控，在【远程网站】中设置好您自己的远程密码即可）。
+3. **一键启动或定时值守**：点击控制中心底部的 **「立即全流程」** 即可自动完成抓数、写表、截图并投递钉钉；首次使用如 WPS 需要登录，手机扫码确认一次后后续即可全自动定时执行。
+
+---
+
+## 🛠 开发者本地运行与打包
+
+如果您希望查看或二次修改源码运行：
 
 ```bash
 # 1. 克隆仓库
 git clone https://github.com/Sorenskr/SheetMate.git
 cd SheetMate
 
-# 2. 安装依赖与浏览器内核
+# 2. 安装 Python 依赖与 Playwright Chromium 内核
 pip install -r requirements.txt
 python -m playwright install chromium
 
-# 3. 直接运行
+# 3. 直接启动图形界面控制中心
 python auto_report.py
 
-# 4. 打包成单文件 SheetMate.exe
-pyinstaller SheetMate.spec --noconfirm
+# 4. 打包本地极速目录版（产物位于 dist/SheetMate_bundle）
+pyinstaller SheetMate.spec --clean --noconfirm
 ```
 
 ---
 
-## 📂 项目结构
+## 📂 仓库主要文件说明
 
-| 文件 | 说明 |
+| 文件 / 目录 | 功能说明 |
 | :--- | :--- |
-| `auto_report.py` | 核心自动化引擎（后台下载、格式转换、WPS 写入与截图、钉钉发送、单实例控制） |
-| `ios_ui.py` | iOS 18 风格控制中心前端界面、本地接口服务及动态定时值守调度器 |
-| `neu_ui.py` | Windows 高分屏适配与桌面灵动岛悬浮进度胶囊组件 |
-| `sheetmate_ui.py` | 界面入口兼容转发层 |
-| `SheetMate.spec` | PyInstaller 单文件打包配置文件 |
-| `probe_dingtalk_silent.py` | 本机钉钉主窗与静音菜单 UIA 控件树独立探测脚本 |
-| `templates/` | 图像匹配兜底用的钉钉发送按钮/菜单/徽标干净模板图 |
-| `一键运行.bat` | Windows 一键安装依赖并无黑框启动脚本 |
-| `version.json` | 在线自动检测新版本清单 |
+| `auto_report.py` | 核心自动化引擎（后台抓取、表格读写、选区截图、钉钉无坐标投递、AI 对话与定时调度原语） |
+| `ios_ui.py` | iOS 18 昼夜动态光效桌面控制中心前端界面与本地安全 API 服务 |
+| `mobile_bridge.py` | 云端异地端到端加密中继通信、远程网页控制台模板生成与静态站点导出工具 |
+| `team_hub.py` | 成员唯一昵称档案、萌宠头像体系、云端多人防撞锁 / 排队与凭据脱敏管理 |
+| `neu_ui.py` | 高分屏 Win32 桌面灵动岛悬浮进度胶囊组件 |
+| `docs/` | GitHub Pages 托管的云端异地远程控制台在线站点 |
+| `templates/` | 钉钉界面控件视觉识别模板图与客户端应用图标资源 |
+| `SheetMate.spec` | PyInstaller 桌面客户端打包规格文件 |
+| `version.json` | 客户端在线检查更新清单 |

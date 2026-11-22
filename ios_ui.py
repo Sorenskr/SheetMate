@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.8.7 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.8.8 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -2018,8 +2018,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/png" href="/icon.png?v=2.8.7" />
-<link rel="shortcut icon" href="/favicon.ico?v=2.8.7" />
+<link rel="icon" type="image/png" href="/icon.png?v=2.8.8" />
+<link rel="shortcut icon" href="/favicon.ico?v=2.8.8" />
 <style>
   :root {
     --bg: #EAF0F8;
@@ -4395,9 +4395,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.8.7" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.8.8" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.8.7</span>
+          <span class="ver-pill" id="verBadge">v2.8.8</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 

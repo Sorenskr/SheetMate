@@ -580,6 +580,12 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .m-title { font-size: 15px; font-weight: 800; line-height: 1.2; }
   .m-sub { font-size: 11px; color: var(--sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .m-hdr-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
   .m-pill {
     border: none;
     background: var(--pill);
@@ -591,15 +597,86 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     border-radius: 999px;
     cursor: pointer;
     flex-shrink: 0;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    transition: opacity 0.15s ease;
   }
+  .m-pill:hover { opacity: 0.85; }
   .m-login-wrap {
     flex: 1;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    justify-content: center;
-    padding: 18px 16px;
+    justify-content: flex-start;
+    gap: 12px;
+    padding: 20px 16px 28px;
   }
+  .m-login-wrap > .m-card:first-child { margin-top: auto; }
+  .m-login-wrap > :last-child { margin-bottom: auto; }
+  .m-dl-card {
+    background: var(--card);
+    border: 0.5px solid var(--sep);
+    border-radius: 18px;
+    padding: 14px 16px;
+    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+  .m-dl-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .m-dl-title { font-size: 13.5px; font-weight: 800; color: var(--text); }
+  .m-dl-badge {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--green);
+    background: rgba(52, 199, 89, 0.14);
+    padding: 3px 8px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .m-dl-desc {
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--sub);
+  }
+  .m-dl-btn-main {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    text-decoration: none;
+    background: rgba(10, 132, 255, 0.12);
+    border: 1px solid rgba(10, 132, 255, 0.25);
+    color: var(--blue);
+    font-size: 13.5px;
+    font-weight: 700;
+    padding: 10px 14px;
+    border-radius: 12px;
+    transition: background 0.15s ease;
+  }
+  .m-dl-btn-main:hover { background: rgba(10, 132, 255, 0.20); }
+  .m-dl-subrow {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding-top: 2px;
+  }
+  .m-dl-link {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--blue);
+    text-decoration: none;
+  }
+  .m-dl-link:hover { text-decoration: underline; }
   .m-intro-box {
     background: linear-gradient(135deg, rgba(10, 132, 255, 0.10), rgba(88, 86, 214, 0.10));
     border: 0.5px solid rgba(10, 132, 255, 0.24);
@@ -829,7 +906,10 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="m-sub" id="mHeaderSub">无论身在何处，云端连上电脑就能查数据、聊工作、遥控跑表</div>
       </div>
     </div>
-    <button type="button" class="m-pill" id="mSwitchUserBtn" style="display:none;">切换电脑</button>
+    <div class="m-hdr-actions">
+      <a class="m-pill" href="https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe" target="_blank" rel="noopener noreferrer" title="下载 Windows 电脑端客户端">下载电脑版</a>
+      <button type="button" class="m-pill" id="mSwitchUserBtn" style="display:none;">切换电脑</button>
+    </div>
   </header>
 
   <div class="m-login-wrap" id="mLoginGate">
@@ -849,6 +929,28 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <div id="mLoginErr" style="font-size:12.5px;color:var(--red);display:none;line-height:1.45;"></div>
       <button type="button" class="m-btn-primary" id="mLoginSubmitBtn">云端连接我的电脑</button>
+    </div>
+
+    <div class="m-dl-card" id="mDownloadCard">
+      <div class="m-dl-head">
+        <div class="m-dl-title">电脑还没装软件？免费下载客户端</div>
+        <span class="m-dl-badge">v2.8.8 Windows</span>
+      </div>
+      <div class="m-dl-desc">
+        下载到 Windows 电脑双击即可使用（无需配置任何运行环境），支持自动抓数写入 WPS 表格、智能截图、钉钉静音发群与云端异地遥控。
+      </div>
+      <a class="m-dl-btn-main" href="https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate.exe" target="_blank" rel="noopener noreferrer">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <polyline points="7 10 12 15 17 10"></polyline>
+          <line x1="12" y1="15" x2="12" y2="3"></line>
+        </svg>
+        <span>直接下载 Windows 单文件版 (SheetMate.exe)</span>
+      </a>
+      <div class="m-dl-subrow">
+        <a class="m-dl-link" href="https://github.com/Sorenskr/SheetMate/releases/latest/download/SheetMate-Windows-x64-Portable.zip" target="_blank" rel="noopener noreferrer">下载免安装极速压缩包 (.zip)</a>
+        <a class="m-dl-link" href="https://github.com/Sorenskr/SheetMate/releases/latest" target="_blank" rel="noopener noreferrer">查看 GitHub 发行说明</a>
+      </div>
     </div>
   </div>
 
