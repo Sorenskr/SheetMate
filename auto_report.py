@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
 """
-暗号表助手 SheetMate v1.3.0
-- 白天/晚上时段、每天/工作日运行
-- 计划运行时可手动立即跑
-- 自动清理旧WPS标签页，最多保留2个
-- 顶部置顶显示当前步骤/上次/下次抓取时间/报错步骤
-- 可开关：WPS选区复制为图片、发送到钉钉；可改钉钉会话名与消息后缀，配置持久化
-- 选区复制图片、钉钉唤起均已真机联调：键盘方向键选区→右键「复制为图片」，剪贴板实测含图
-- 无黑窗口，步骤和报错都显示在弹窗里
-- iOS 风格面板，数字支持鼠标滚轮调整
+暗号表助手 SheetMate 核心自动化引擎（v2.9.3）：
+- 自动登录数据后台拉取、格式清洗与 WPS 在线表格自动写入
+- 汇总表自定义格位校准、高清选区截图与多尺度无坐标钉钉静音发群
+- 支持白天/夜间自定义排期、AI 个人习惯持久化记忆与跨电脑云同步扩展
 """
 
+import ipaddress
 import os
 import sys
 import time
@@ -112,6 +108,53 @@ MAX_KEEP_WPS_TABS = 2
 def app_dir():
     """兼容源码、目录版与单文件纯净版（单文件自动隔离数据目录，不在 exe 旁生成杂乱文件夹）。"""
     return _early_app_dir()
+
+
+_FILE_WRITE_LOCK = threading.RLock()
+
+
+def _atomic_write_text(path_obj, text):
+    """使用同目录临时文件 + os.replace 原子写盘，防止并发或断电导致 JSON/日志截断损坏。"""
+    p = Path(path_obj)
+    tmp = p.with_name(f".{p.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    with _FILE_WRITE_LOCK:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8", newline="") as fp:
+                fp.write(text)
+                fp.flush()
+            os.replace(str(tmp), str(p))
+            return True
+        except Exception:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            return False
+
+
+def _atomic_write_json(path_obj, data):
+    """线程安全地以 UTF-8 JSON 格式原子落盘。"""
+    return _atomic_write_text(path_obj, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _read_head_nonempty_lines(path_obj, max_lines=800, count_total=False):
+    """流式读取文件前 max_lines 条非空行，避免大体积 TSV/日志整文件一次性读入内存。"""
+    lines = []
+    total = 0
+    lim = max(1, int(max_lines))
+    with open(path_obj, "r", encoding="utf-8", errors="ignore") as fp:
+        for raw_ln in fp:
+            s = raw_ln.rstrip("\r\n")
+            if not s.strip():
+                continue
+            total += 1
+            if len(lines) < lim:
+                lines.append(s)
+            elif not count_total:
+                break
+    return (lines, total) if count_total else lines
 
 
 def get_local_runtime_dir():
@@ -304,9 +347,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.9.2"
+APP_VERSION = "2.9.3"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.9.2","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.9.3","url":"新版exe的下载直链"}
 DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
 GEMINI_MODEL_CANDIDATES = (
     "gemini-flash-latest",
@@ -1000,9 +1043,9 @@ def classify_error_detail(exc=None, stage="", extra=None):
     if "预设" in err_s or "名称框" in err_s or "edit-box" in low:
         return _pack(
             "ERR-WPS-203",
-            "汇总表自动校准单元格（如 D2/L3/L4）没成功",
+            "汇总表自动校准单元格（如 D3/L3/Y3/AA5）没成功",
             "往左上角名称框输入位置并写入固定值或日期时没有生效。",
-            "1. 检查「钉钉投递 -> 汇总表筛选预设校准」里填写的单元格位置（例如 D2/L3/L4）对不对；\n2. 确认您对数据汇总表有编辑权限（没有被锁定保护）。",
+            "1. 检查「钉钉投递 -> 格位校准」里填写的单元格位置（例如 D3/L3/Y3/AA5）对不对；\n2. 确认您对数据汇总表有编辑权限（没有被锁定保护）。",
             "优化 WPS 左上角名称框校准单元格及公式编辑栏写入回读逻辑",
         )
 
@@ -1068,6 +1111,9 @@ def _extract_log_traits(logs_lines):
     }
 
 
+_JOURNAL_IO_LOCK = threading.RLock()
+
+
 def record_run_journal(cfg, status, mode="full", round_label="", error_detail=None, duration_sec=0, logs_tail=None):
     """追加记录每次成功或受阻/失败的运行快照至 run_journal.jsonl（保留最近 100 条）。"""
     try:
@@ -1094,13 +1140,14 @@ def record_run_journal(cfg, status, mode="full", round_label="", error_detail=No
             },
             "log_excerpt": [str(x) for x in tail[-12:]],
         }
-        p = _run_journal_path()
-        lines = []
-        if p.exists():
-            lines = [ln for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
-        lines.append(json.dumps(entry, ensure_ascii=False))
-        lines = lines[-100:]
-        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with _JOURNAL_IO_LOCK:
+            p = _run_journal_path()
+            lines = []
+            if p.exists():
+                lines = [ln for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines = lines[-100:]
+            _atomic_write_text(p, "\n".join(lines) + "\n")
         return entry
     except Exception:
         return None
@@ -1425,9 +1472,9 @@ def _local_ai_fallback_reply(mode, err_detail, cfg_snap, question="", hist_ctx="
             tips.append("• 「粘贴后自动按 Enter 发送」目前关闭，脚本会在贴好截图后停下等您手动敲回车；若要无人值守全自动发送，记得打开它。")
         if cfg_snap.get("dt_minimize_after_send", True):
             tips.append("• 当前开启了「发送后最小化钉钉」，第1次发完收起后第2次唤醒最容易因为聊天框未加载完而卡住，建议关闭它。")
-        d2 = next((x for x in (cfg_snap.get("summary_presets_cells") or []) if x.get("cell") == "D2"), None)
-        if d2 and not d2.get("cutoff_enabled"):
-            tips.append("• 如果您有凌晨班次（比如早上 9 点前要发昨天数据），建议在 D2 的「自动日期」下打开【跨天凌晨分界点】，设定时间点前自动减 1 天。")
+        d3 = next((x for x in (cfg_snap.get("summary_presets_cells") or []) if x.get("cell") in ("D3", "D2")), None)
+        if d3 and not d3.get("cutoff_enabled"):
+            tips.append("• 如果您有凌晨班次（比如早上 9 点前要发昨天数据），建议在 D3 的「自动日期」下打开【跨天凌晨分界点】，设定时间点前自动减 1 天。")
         if not tips:
             tips.append("• 当前时段排期、汇总表预设校准与静音设置搭配很合理！")
         return (
@@ -1522,8 +1569,8 @@ def get_candidate_teams(cfg=None):
 AI_SUMMARY_STYLES = build_ai_summary_styles("")
 
 
-def _validate_safe_http_url(raw_url, require_https=False):
-    """校验外部请求或更新 URL 必须为安全 HTTP(S) 地址，阻断 file://、控制字符与云元数据内网地址。"""
+def _validate_safe_http_url(raw_url, require_https=False, allow_loopback=False):
+    """校验外部请求或更新 URL 必须为安全 HTTP(S) 地址，阻断 file://、控制字符、本机回环及云元数据内网地址。"""
     u = str(raw_url or "").strip()
     if not u or any(ch in u for ch in ("\r", "\n", "\x00")):
         return None
@@ -1534,10 +1581,39 @@ def _validate_safe_http_url(raw_url, require_https=False):
     allowed_schemes = ("https",) if require_https else ("http", "https")
     if p.scheme.lower() not in allowed_schemes or not p.netloc:
         return None
-    host = (p.hostname or "").strip().lower()
-    if not host or host == "169.254.169.254" or host.startswith("169.254."):
+    host = (p.hostname or "").strip().lower().rstrip(".")
+    if not host:
         return None
+    if not allow_loopback and (host == "localhost" or host.endswith(".localhost")):
+        return None
+    if host == "169.254.169.254" or host.startswith("169.254."):
+        return None
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if (
+            (not allow_loopback and ip_obj.is_loopback)
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+        ):
+            return None
+        if require_https and ip_obj.is_private:
+            return None
+    except ValueError:
+        if require_https and host.endswith(".local"):
+            return None
     return u
+
+
+class _SafeHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """校验 HTTP 重定向目标 URL，阻止通过 302 跳转访问内网、回环或非 HTTPS 资源。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        abs_url = urllib.parse.urljoin(req.full_url, str(newurl or ""))
+        if not _validate_safe_http_url(abs_url, require_https=True):
+            raise urllib.error.HTTPError(abs_url, code, "Unsafe redirect blocked", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _call_openai_compat_generate(api_base, api_key, model_name, sys_prompt, contents, temperature=0.4, max_tokens=900, timeout_sec=24):
@@ -1736,7 +1812,7 @@ _SHEETMATE_AI_KNOWLEDGE = """【软件身份与核心功能说明书】
   2) 没有任何读取、查看或访问管理员密码/口令、权限控制、隐藏管理界面、他人隐私聊天记录或接口密钥的能力；遇到相关提问必须礼貌拒绝并说明“没有读取与访问权限”。
 - 我能做什么：
   1) 全自动抓数填表发群：自动登录 Luya 数据后台下载「暗号数据」「注册数据」「短链数据」，转为 TSV 后写入 WPS 在线表格；
-  2) 自定义任意单元格写入：在「钉钉投递 -> 汇总表筛选预设校准」中点击快捷格位胶囊或「+ 新增位置」，可为任意工作表（如数据汇总/团队成员/看板）的任意格位（如 D2/D4:E4/F2/H4/I4/L3/L4/S4）自由定义：自动日期（支持跨天凌晨自动减天）、当前时间、自定义文字、Excel 公式或清空；
+  2) 自定义任意单元格写入：在「钉钉投递 -> 格位校准」中点击快捷格位胶囊或「+ 新增位置」，可为任意工作表（如数据汇总/团队成员/看板）的任意格位（如 D3/D4:E4/D5/L3/Y3/Y4/Y5/AA2/AA5/R4）自由定义：自动日期（支持跨天凌晨自动减天）、当前时间、自定义文字、Excel 公式或清空；
   3) 自然语言直接改排期：用户可直接说“帮我设置每周一到周五 9点到18点每2小时把昨天数据发送到 XX群”，我会自动修改软件设置并列出核对清单让用户确认对不对；
   4) 钉钉稳妥投递：自动探测当前电脑分辨率、DPI 缩放与深色模式适配方案，支持多群顺序投递、防卡顿直通搜索、无坐标静音发送、富文本发送按钮补发，并在粘贴操作期间全屏提示勿动键鼠；
   5) AI 看图自愈与档案记忆：遇错自动弹窗给出 ERR 错误码大白话解决方案，支持「遇错 AI 自动看图自愈」先截屏调整现场并续跑，还能自动对比历次成功/失败原因、调整内部模块顺序并生成改代码指令；同时每轮将表格数字与排行归档到本地 `report_archive.jsonl`，公平对比各团队与个人数据。
@@ -1862,7 +1938,7 @@ def parse_summary_tsv_snapshot(summary_tsv="", report_dir=None):
         reg_p = rep_dir / "注册数据.tsv"
         if reg_p.exists():
             try:
-                lines = [ln for ln in reg_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+                lines = _read_head_nonempty_lines(reg_p, max_lines=16)
                 for ln in lines[1:9]:
                     ps = ln.split("\t")
                     if len(ps) >= 4:
@@ -1877,7 +1953,7 @@ def parse_summary_tsv_snapshot(summary_tsv="", report_dir=None):
         kw_p = rep_dir / "暗号数据.tsv"
         if kw_p.exists():
             try:
-                lines = [ln for ln in kw_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+                lines = _read_head_nonempty_lines(kw_p, max_lines=200)
                 latest_d = lines[1].split("\t")[0].strip() if len(lines) > 1 else ""
                 for ln in lines[1:]:
                     ps = ln.split("\t")
@@ -1894,7 +1970,7 @@ def parse_summary_tsv_snapshot(summary_tsv="", report_dir=None):
         ch_p = rep_dir / "短链数据.tsv"
         if ch_p.exists():
             try:
-                lines = [ln for ln in ch_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+                lines = _read_head_nonempty_lines(ch_p, max_lines=200)
                 latest_d = lines[1].split("\t")[0].strip() if len(lines) > 1 else ""
                 for ln in lines[1:]:
                     ps = ln.split("\t")
@@ -2325,10 +2401,7 @@ def generate_unique_startup_greeting(cfg=None, nickname="", force=False):
     state["recent_texts"] = (state["recent_texts"] + [chosen])[-16:]
     state["last_ts"] = now_ts
     state["last_date"] = today_s
-    try:
-        seen_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    _atomic_write_json(seen_path, state)
 
     return {
         "show": True,
@@ -2336,6 +2409,9 @@ def generate_unique_startup_greeting(cfg=None, nickname="", force=False):
         "period": period_tag,
         "reply": chosen,
     }
+
+
+_ARCHIVE_IO_LOCK = threading.RLock()
 
 
 def record_report_archive(cfg=None, round_label="手动", summary_tsv="", shot_path=None, report_dir=None):
@@ -2355,53 +2431,54 @@ def record_report_archive(cfg=None, round_label="手动", summary_tsv="", shot_p
     now_ts = time.time()
     # 防止同一次执行既在截图结束又在发送后重复落盘两份完全相同的数据
     cur_sig = f"{int(now_ts // 30)}|{sig_payload}"
-    if cur_sig == _last_archive_sig:
-        return None
-    _last_archive_sig = cur_sig
+    with _ARCHIVE_IO_LOCK:
+        if cur_sig == _last_archive_sig:
+            return None
+        _last_archive_sig = cur_sig
 
-    prev_recs = load_report_archive(limit=5)
-    prev_rec = prev_recs[-1] if prev_recs else None
+        prev_recs = load_report_archive(limit=5)
+        prev_rec = prev_recs[-1] if prev_recs else None
 
-    shot_name = Path(shot_path).name if shot_path else ""
-    rec = {
-        "ts": int(now_ts),
-        "time_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts)),
-        "round": str(round_label or "手动"),
-        "shot": shot_name,
-        "personal": parsed["personal"],
-        "teams": parsed["teams"],
-        "summary_totals": parsed["summary_totals"],
-        "daily_reg": parsed["daily_reg"],
-        "top_keywords": parsed["top_keywords"],
-        "top_channels": parsed["top_channels"],
-        "raw_tsv": tsv_use[:12000],
-    }
+        shot_name = Path(shot_path).name if shot_path else ""
+        rec = {
+            "ts": int(now_ts),
+            "time_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts)),
+            "round": str(round_label or "手动"),
+            "shot": shot_name,
+            "personal": parsed["personal"],
+            "teams": parsed["teams"],
+            "summary_totals": parsed["summary_totals"],
+            "daily_reg": parsed["daily_reg"],
+            "top_keywords": parsed["top_keywords"],
+            "top_channels": parsed["top_channels"],
+            "raw_tsv": tsv_use[:12000],
+        }
 
-    arch_p = _archive_file_path()
-    try:
-        existing_lines = []
-        if arch_p.exists():
-            existing_lines = [ln for ln in arch_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
-        existing_lines.append(json.dumps(rec, ensure_ascii=False))
-        if len(existing_lines) > 120:
-            existing_lines = existing_lines[-120:]
-        arch_p.write_text("\n".join(existing_lines) + "\n", encoding="utf-8")
+        arch_p = _archive_file_path()
+        try:
+            existing_lines = []
+            if arch_p.exists():
+                existing_lines = [ln for ln in arch_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+            existing_lines.append(json.dumps(rec, ensure_ascii=False))
+            if len(existing_lines) > 120:
+                existing_lines = existing_lines[-120:]
+            _atomic_write_text(arch_p, "\n".join(existing_lines) + "\n")
 
-        ft = str(((cfg or {}).get("ai_assistant") or {}).get("focus_team") or "").strip()
-        spot = build_round_change_spotlight(prev_rec, rec, focus_team=ft)
-        with _runtime_lock:
-            _latest_round_spotlight = spot
-            sp_cb = _spotlight_callback
-        if spot.get("summary_line"):
-            log(f"  💡 [数据变化速递] {spot['summary_line']}")
-        if sp_cb is not None:
-            try:
-                sp_cb(spot)
-            except Exception:
-                pass
-        return rec
-    except Exception:
-        return None
+            ft = str(((cfg or {}).get("ai_assistant") or {}).get("focus_team") or "").strip()
+            spot = build_round_change_spotlight(prev_rec, rec, focus_team=ft)
+            with _runtime_lock:
+                _latest_round_spotlight = spot
+                sp_cb = _spotlight_callback
+            if spot.get("summary_line"):
+                log(f"  💡 [数据变化速递] {spot['summary_line']}")
+            if sp_cb is not None:
+                try:
+                    sp_cb(spot)
+                except Exception:
+                    pass
+            return rec
+        except Exception:
+            return None
 
 
 def load_report_archive(limit=30):
@@ -2411,7 +2488,8 @@ def load_report_archive(limit=30):
         return []
     out = []
     try:
-        lines = [ln for ln in arch_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+        with _ARCHIVE_IO_LOCK:
+            lines = [ln for ln in arch_p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
         for ln in lines[-int(limit):]:
             try:
                 obj = json.loads(ln)
@@ -2581,6 +2659,480 @@ def build_archive_query_context(user_text="", report_dir=None, focus_team=""):
     return out[:4800]
 
 
+_AI_MEM_LOCK = threading.RLock()
+_AI_MEM_CACHE = {}
+_AI_MEM_CHANGE_LOCK = threading.Lock()
+_AI_MEM_CHANGE_CB = None
+
+
+def set_ai_memory_change_callback(fn):
+    """注册 AI 记忆/话术变更回调，供账号云同步防抖上传。"""
+    global _AI_MEM_CHANGE_CB
+    with _AI_MEM_CHANGE_LOCK:
+        _AI_MEM_CHANGE_CB = fn
+
+
+def _notify_ai_memory_changed(reason="memory"):
+    with _AI_MEM_CHANGE_LOCK:
+        cb = _AI_MEM_CHANGE_CB
+    if cb is not None:
+        try:
+            cb(reason)
+        except Exception:
+            pass
+
+
+def _ai_user_memory_path():
+    return app_dir() / "ai_user_memory.json"
+
+
+def _default_ai_user_memory():
+    return {
+        "version": 1,
+        "self_real_name": "",
+        "preferred_targets": [],
+        "last_confirmed_targets": [],
+        "last_action": "",
+        "preferred_day_offset": None,
+        "preferred_silent": None,
+        "forbid_group_send": False,
+        "name_corrections": {},
+        "habit_notes": [],
+        "chat_history": [],
+    }
+
+
+def _normalize_ai_user_memory(raw):
+    import copy
+    base = _default_ai_user_memory()
+    if not isinstance(raw, dict):
+        return base
+    srn = str(raw.get("self_real_name") or "").strip()
+    if srn and not is_likely_real_person_name(srn):
+        srn = ""
+    base["self_real_name"] = srn
+
+    for k in ("preferred_targets", "last_confirmed_targets"):
+        vals = raw.get(k)
+        if isinstance(vals, list):
+            clean_v = []
+            for x in vals:
+                sx = str(x or "").strip()
+                if sx and not _is_chat_sentence_noise(sx) and sx not in clean_v:
+                    clean_v.append(sx[:24])
+            base[k] = clean_v[:8]
+
+    act = str(raw.get("last_action") or "").strip()
+    base["last_action"] = act if act in ("", "run_full", "capture_send", "text_send") else ""
+
+    pdo = raw.get("preferred_day_offset")
+    if pdo is not None and not isinstance(pdo, bool) and str(pdo).strip() != "":
+        try:
+            base["preferred_day_offset"] = max(-60, min(7, int(pdo)))
+        except Exception:
+            base["preferred_day_offset"] = None
+
+    ps = raw.get("preferred_silent")
+    base["preferred_silent"] = ps if isinstance(ps, bool) else None
+    base["forbid_group_send"] = bool(raw.get("forbid_group_send", False))
+
+    corr = raw.get("name_corrections")
+    if isinstance(corr, dict):
+        clean_corr = {}
+        for wk, rv in corr.items():
+            wks = str(wk or "").strip()
+            rvs = str(rv or "").strip()
+            if wks and rvs and wks != rvs and wks not in _DT_GENERIC_ALIAS_WORDS and rvs not in _DT_GENERIC_ALIAS_WORDS:
+                if not _is_chat_sentence_noise(wks) and not _is_chat_sentence_noise(rvs):
+                    clean_corr[wks[:24]] = rvs[:24]
+        base["name_corrections"] = clean_corr
+
+    notes = raw.get("habit_notes")
+    if isinstance(notes, list):
+        clean_notes = []
+        for n in notes:
+            sn = str(n or "").strip()
+            if sn and len(sn) <= 120 and sn not in clean_notes:
+                clean_notes.append(sn)
+        base["habit_notes"] = clean_notes[-30:]
+
+    hist = raw.get("chat_history")
+    if isinstance(hist, list):
+        clean_h = []
+        for h in hist[-30:]:
+            if not isinstance(h, dict):
+                continue
+            txt = str(h.get("text") or "").strip()
+            if not txt:
+                continue
+            item = {
+                "role": "model" if h.get("role") == "model" else "user",
+                "text": txt[:2400],
+                "time": str(h.get("time") or ""),
+                "source": str(h.get("source") or ""),
+                "shot_info": str(h.get("shot_info") or ""),
+                "via": str(h.get("via") or "pc"),
+            }
+            if h.get("sender"):
+                item["sender"] = str(h["sender"])[:30]
+            if isinstance(h.get("on_demand_meta"), dict):
+                item["on_demand_meta"] = copy.deepcopy(h["on_demand_meta"])
+            clean_h.append(item)
+        base["chat_history"] = clean_h[-30:]
+    return base
+
+
+def load_ai_user_memory():
+    """读取本机专属 AI 个人习惯、姓名纠错与近期聊天持久化记忆（按路径缓存）。"""
+    import copy
+    p = _ai_user_memory_path()
+    key = str(p)
+    with _AI_MEM_LOCK:
+        if key in _AI_MEM_CACHE:
+            return copy.deepcopy(_AI_MEM_CACHE[key])
+        data = None
+        if p.exists():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+        norm = _normalize_ai_user_memory(data)
+        _AI_MEM_CACHE[key] = copy.deepcopy(norm)
+        return copy.deepcopy(norm)
+
+
+def save_ai_user_memory(mem, notify=True):
+    """线程安全地原子持久化保存本机 AI 个人习惯与记忆。"""
+    import copy
+    p = _ai_user_memory_path()
+    key = str(p)
+    norm = _normalize_ai_user_memory(mem)
+    with _AI_MEM_LOCK:
+        _AI_MEM_CACHE[key] = copy.deepcopy(norm)
+        _atomic_write_json(p, norm)
+    if notify:
+        _notify_ai_memory_changed("memory")
+    return copy.deepcopy(norm)
+
+
+def export_ai_sync_bundle():
+    """导出可用于跨电脑云同步的个人 AI 记忆、话术偏好及已验证人名纠错映射。"""
+    return {
+        "ai_user_memory": load_ai_user_memory(),
+        "dt_verified_targets": _load_verified_dingtalk_targets(),
+    }
+
+
+def import_ai_sync_bundle(bundle, reset_if_missing=False):
+    """从云端同步包恢复本机 AI 记忆与人名映射，不触发回推避免循环同步。"""
+    b = bundle if isinstance(bundle, dict) else {}
+    if isinstance(b.get("ai_user_memory"), dict):
+        save_ai_user_memory(b["ai_user_memory"], notify=False)
+    elif reset_if_missing:
+        save_ai_user_memory(_default_ai_user_memory(), notify=False)
+    vt_in = b.get("dt_verified_targets")
+    if isinstance(vt_in, dict):
+        clean_vt = {
+            str(k).strip(): str(v).strip()
+            for k, v in vt_in.items()
+            if _is_valid_verified_dingtalk_target(k, v)
+        }
+        with _AI_MEM_LOCK:
+            _atomic_write_json(_verified_targets_file(), clean_vt)
+    elif reset_if_missing:
+        with _AI_MEM_LOCK:
+            _atomic_write_json(_verified_targets_file(), {})
+    return export_ai_sync_bundle()
+
+
+def append_ai_chat_turn(role, text, time_str="", source="", shot_info="", via="pc", sender="", on_demand_meta=None):
+    """追加一条 AI 对话轮次到持久化档案（最多保留最近 30 条）。"""
+    txt = str(text or "").strip()
+    if not txt:
+        return []
+    with _AI_MEM_LOCK:
+        mem = load_ai_user_memory()
+        item = {
+            "role": "model" if role == "model" else "user",
+            "text": txt[:2400],
+            "time": str(time_str or time.strftime("%H:%M:%S")),
+            "source": str(source or ""),
+            "shot_info": str(shot_info or ""),
+            "via": str(via or "pc"),
+        }
+        if sender:
+            item["sender"] = str(sender)[:30]
+        if isinstance(on_demand_meta, dict):
+            item["on_demand_meta"] = on_demand_meta
+        mem["chat_history"].append(item)
+        mem["chat_history"] = mem["chat_history"][-30:]
+        saved = save_ai_user_memory(mem)
+        return list(saved["chat_history"])
+
+
+def clear_ai_chat_turns_only():
+    """清空对话框气泡记录，但完整保留已经记住的本机个人习惯、实名与纠错映射。"""
+    with _AI_MEM_LOCK:
+        mem = load_ai_user_memory()
+        mem["chat_history"] = []
+        save_ai_user_memory(mem)
+
+
+def _format_day_offset_cn(off):
+    if off is None:
+        return "跟随当前配置"
+    n = int(off)
+    if n == 0:
+        return "当天(0天)"
+    if n == -1:
+        return "昨天(-1天)"
+    if n == -2:
+        return "前天(-2天)"
+    return f"{n:+d}天"
+
+
+def learn_user_habits_from_interaction(user_text="", speaker_name="", is_local_speaker=True, resolved_targets=None, action=None):
+    """从用户的对话纠错、偏好表达和已确认投递结果中持续学习个人习惯并持久化。"""
+    raw = str(user_text or "").strip()
+    if raw and check_ai_security_and_creator_guardrail(raw):
+        return {"learned": [], "memory": load_ai_user_memory()}
+
+    learned = []
+    with _AI_MEM_LOCK:
+        mem = load_ai_user_memory()
+        changed = False
+
+        if raw:
+            # 1) 识别并绑定本机实名：“我是XX / 我叫XX / 我的钉钉名是XX / 以后叫我XX”
+            m_self = re.search(
+                r"(?:^|[，。,.;；!\s])(?:记住[：:]?\s*)?(?:我是|我叫|我本人是|我本人叫|我的真名是?|我的真实姓名是?|我的钉钉名(?:字)?是?|我钉钉叫|以后叫我)\s*[「\"'『]?([\u4e00-\u9fffA-Za-z0-9·]{2,12})",
+                raw,
+            )
+            if is_local_speaker and m_self:
+                cand_self = re.sub(r"(?:啊|呀|哦|哈|吧|的)$", "", m_self.group(1).strip())
+                bad_starts = ("谁", "什么", "怎么", "哪个", "想", "要", "来", "看", "问", "让", "发", "测试", "管理员")
+                if (
+                    cand_self
+                    and not cand_self.startswith(bad_starts)
+                    and not any(k in cand_self for k in ("数据", "昨天", "今天", "报表", "表格", "群里", "文件助手"))
+                    and is_likely_real_person_name(cand_self)
+                ):
+                    if mem.get("self_real_name") != cand_self:
+                        mem["self_real_name"] = cand_self
+                        learned.append(f"记住您的本人姓名是「{cand_self}」")
+                        changed = True
+
+            # 2) 识别人名/群名纠错：“不是X是Y / 没有X，是Y / X不对，应该是Y / 把X改成Y”
+            corr_pairs = []
+            for pm in re.finditer(
+                r"(?:不是|没有|别找|不要找|不是找)\s*[「\"'『]?([^\s，。,.;；!\n？?」\"'』]{2,12})[」\"'』]?\s*[，,、]?\s*(?:应该是|应是|而是|其实是|实际是|真名是|改成|换成|叫|是)\s*[「\"'『]?([^\s，。,.;；!\n？?」\"'』]{2,12})[」\"'』]?",
+                raw,
+            ):
+                corr_pairs.append((pm.group(1), pm.group(2)))
+            for pm in re.finditer(
+                r"([\u4e00-\u9fffA-Za-z0-9]{2,10})\s*(?:不对|错了|写错了|打错了|不是这个人)[，,.\s]*(?:应该是|应是|而是|其实是|实际是|改成|换成|真名是|叫|是)\s*([\u4e00-\u9fffA-Za-z0-9]{2,10})",
+                raw,
+            ):
+                corr_pairs.append((pm.group(1), pm.group(2)))
+            for pm in re.finditer(
+                r"把\s*[「\"'『]?([\u4e00-\u9fffA-Za-z0-9]{2,10})[」\"'』]?\s*(?:改成|换成|纠正为|记成)\s*[「\"'『]?([\u4e00-\u9fffA-Za-z0-9]{2,10})[」\"'』]?",
+                raw,
+            ):
+                corr_pairs.append((pm.group(1), pm.group(2)))
+
+            for raw_w, raw_r in corr_pairs:
+                w_n = re.sub(r"(?:的|吧|啊|哦)$", "", str(raw_w or "").strip())
+                r_n = re.sub(r"(?:的|吧|啊|哦)$", "", str(raw_r or "").strip())
+                if (
+                    len(w_n) >= 2 and len(r_n) >= 2 and w_n != r_n
+                    and w_n not in _DT_GENERIC_ALIAS_WORDS and r_n not in _DT_GENERIC_ALIAS_WORDS
+                    and not _is_chat_sentence_noise(w_n) and not _is_chat_sentence_noise(r_n)
+                    and not any(k in w_n for k in ("发送", "表格", "数据", "群里"))
+                ):
+                    if mem["name_corrections"].get(w_n) != r_n:
+                        mem["name_corrections"][w_n] = r_n
+                        _save_verified_dingtalk_target(w_n, r_n)
+                        for list_k in ("preferred_targets", "last_confirmed_targets"):
+                            mem[list_k] = [r_n if x == w_n else x for x in (mem.get(list_k) or [])]
+                        learned.append(f"永久纠错：「{w_n}」->「{r_n}」")
+                        changed = True
+
+            # 3) 禁发群 / 恢复发群偏好
+            if any(k in raw for k in ("以后不要发群", "以后别发群", "默认不发群", "永远别发群", "别再发群", "不要再发群", "记住不发群", "不要发到群", "别发到群")):
+                if not mem.get("forbid_group_send"):
+                    mem["forbid_group_send"] = True
+                    learned.append("记住您的偏好：默认不自动发大群")
+                    changed = True
+            elif any(k in raw for k in ("恢复发群", "以后发群", "默认发群", "取消不发群")):
+                if mem.get("forbid_group_send"):
+                    mem["forbid_group_send"] = False
+                    learned.append("已恢复允许默认发群")
+                    changed = True
+
+            # 4) 默认投递目标：“以后默认发给XX / 每次都发给XX / 习惯发给我”
+            for m_pref in re.finditer(
+                r"(?:以后|每次都?|默认|平时|习惯|记住)\s*(?:默认|直接|都|只)?\s*(?:只)?(?:发给|发送到|发到|投递给|私发给?|推给)\s*([^，。,.;；!\n？?]{1,24})",
+                raw,
+            ):
+                prev_ctx = raw[max(0, m_pref.start() - 4):m_pref.start() + 6]
+                if any(neg in prev_ctx for neg in ("不要发", "别发", "不发", "禁止发")):
+                    continue
+                seg = re.split(r"(?:\s+|并|然后|同时|就行|就好|不要|不用|别)", m_pref.group(1).strip())[0].strip()
+                pref_list = []
+                for part in re.split(r"[、,，和与及]+", seg):
+                    p = _clean_spoken_target_phrase(part)
+                    if not p:
+                        continue
+                    if p in ("我", "我自己", "本人", "我本人", "自己", "我的钉钉"):
+                        resolved_me = mem.get("self_real_name") or (speaker_name if (is_local_speaker and is_likely_real_person_name(speaker_name)) else "")
+                        p_val = resolved_me or "我"
+                    else:
+                        p_val = mem["name_corrections"].get(p, p)
+                    if p_val and p_val not in pref_list and not _is_chat_sentence_noise(p_val):
+                        pref_list.append(p_val)
+                if pref_list and mem.get("preferred_targets") != pref_list:
+                    mem["preferred_targets"] = pref_list
+                    learned.append(f"记住您的默认发送对象：「{'、'.join(pref_list)}」")
+                    changed = True
+
+            # 5) 默认日期偏移与静音偏好
+            if any(k in raw for k in ("以后默认看昨天", "以后默认发昨天", "以后默认跑昨天", "以后都发昨天", "以后都看昨天", "习惯看昨天", "习惯发昨天", "习惯跑昨天", "每次都跑昨天", "每次都看昨天", "默认看昨天", "默认发昨天", "默认跑昨天")):
+                if mem.get("preferred_day_offset") != -1:
+                    mem["preferred_day_offset"] = -1
+                    learned.append("记住您的日期偏好：默认看昨天(-1天)")
+                    changed = True
+            elif any(k in raw for k in ("以后默认看前天", "以后默认发前天", "以后默认跑前天", "习惯跑前天", "默认跑前天")):
+                if mem.get("preferred_day_offset") != -2:
+                    mem["preferred_day_offset"] = -2
+                    learned.append("记住您的日期偏好：默认看前天(-2天)")
+                    changed = True
+            elif any(k in raw for k in ("以后默认看今天", "以后默认发今天", "以后默认跑今天", "以后都看今天", "习惯看今天", "习惯跑今天", "每次都跑今天", "默认看今天", "默认发今天", "默认跑今天")):
+                if mem.get("preferred_day_offset") != 0:
+                    mem["preferred_day_offset"] = 0
+                    learned.append("记住您的日期偏好：默认看今天(0天)")
+                    changed = True
+
+            if any(k in raw for k in ("以后默认静音", "以后都静音", "习惯静音", "每次都静音", "默认都静音", "记住静音发送")):
+                if mem.get("preferred_silent") is not True:
+                    mem["preferred_silent"] = True
+                    learned.append("记住您的发送偏好：默认静音发送")
+                    changed = True
+            elif any(k in raw for k in ("以后取消静音", "以后别静音", "以后不静音", "习惯不静音", "默认不静音")):
+                if mem.get("preferred_silent") is not False:
+                    mem["preferred_silent"] = False
+                    learned.append("记住您的发送偏好：常规提醒(不静音)")
+                    changed = True
+
+            # 6) 个人风格与注意事项笔记
+            if (
+                any(k in raw for k in ("以后", "记住", "我习惯", "我喜欢", "每次都", "默认都", "不要再", "别再", "请记得", "偏好"))
+                and not raw.endswith(("吗", "吗？", "吗?", "？", "?"))
+                and not any(k in raw for k in ("每周", "每天", "工作日", "定时计划"))
+            ):
+                note_clean = re.sub(r"^(?:请)?记住[：:，,\s]*", "", raw).strip()[:80]
+                if len(note_clean) >= 4 and note_clean not in mem["habit_notes"]:
+                    mem["habit_notes"].append(note_clean)
+                    mem["habit_notes"] = mem["habit_notes"][-30:]
+                    if not learned:
+                        learned.append(f"记住您的个人偏好：「{note_clean}」")
+                    changed = True
+
+        # 7) 记录最近一次已确认目标与动作，用于跨重启“续跑”
+        if isinstance(resolved_targets, list) and resolved_targets:
+            clean_rt = [str(x).strip() for x in resolved_targets if str(x).strip() and not _is_chat_sentence_noise(str(x).strip())]
+            if clean_rt and (mem.get("last_confirmed_targets") != clean_rt or (action and mem.get("last_action") != action)):
+                mem["last_confirmed_targets"] = clean_rt[:8]
+                if action in ("run_full", "capture_send", "text_send"):
+                    mem["last_action"] = action
+                changed = True
+
+        if changed:
+            mem = save_ai_user_memory(mem)
+    return {"learned": learned, "memory": mem}
+
+
+def build_ai_user_memory_context():
+    """生成精炼的本机用户个人习惯与纠错记忆摘要，供每次对话与总结参考。"""
+    mem = load_ai_user_memory()
+    lines = []
+    if mem.get("self_real_name"):
+        lines.append(f"- 本机主人姓名（当他说“我/发给我”时优先对应）：{mem['self_real_name']}")
+    if mem.get("preferred_targets"):
+        lines.append(f"- 默认首选投递对象：{'、'.join(mem['preferred_targets'])}")
+    if mem.get("last_confirmed_targets"):
+        lines.append(f"- 上次已确认发送目标：{'、'.join(mem['last_confirmed_targets'])}")
+    if mem.get("preferred_day_offset") is not None:
+        lines.append(f"- 常用数据日期偏好：{_format_day_offset_cn(mem['preferred_day_offset'])}")
+    if mem.get("preferred_silent") is not None:
+        lines.append(f"- 常用静音习惯：{'静音发送' if mem['preferred_silent'] else '常规提醒(不静音)'}")
+    if mem.get("forbid_group_send"):
+        lines.append("- 重要禁忌：用户交代过平时不要随便发到大群")
+    if mem.get("name_corrections"):
+        pairs = [f"{k}->{v}" for k, v in list(mem["name_corrections"].items())[-12:]]
+        lines.append(f"- 人名纠错映射（必须遵守）：{'；'.join(pairs)}")
+    if mem.get("habit_notes"):
+        notes = mem["habit_notes"][-8:]
+        lines.append("- 用户历史嘱咐与习惯：\n  • " + "\n  • ".join(notes))
+    return "\n".join(lines)
+
+
+def try_handle_ai_memory_command(user_text, cfg=None, speaker_name="", is_local_speaker=True):
+    """处理用户明确询问/教导/重置个人习惯记忆的对话请求。"""
+    raw = str(user_text or "").strip()
+    if not raw or check_ai_security_and_creator_guardrail(raw):
+        return {"handled": False}
+
+    if any(k in raw for k in ("清除习惯记忆", "清空习惯记忆", "忘掉我的习惯", "重置习惯记忆", "忘记我的偏好")):
+        mem = _default_ai_user_memory()
+        save_ai_user_memory(mem)
+        return {
+            "handled": True,
+            "source": "habit_memory",
+            "shot_info": "个人习惯记忆已重置",
+            "reply": "好的，已经清空本机保存的个人习惯与人名纠错记忆。接下来您随时告诉我新偏好，我会重新记住！",
+        }
+
+    if any(k in raw for k in ("查看记忆", "查看习惯", "我的习惯记忆", "你记住了我什么", "你记住我什么", "我的个人习惯", "记住什么了")):
+        ctx = build_ai_user_memory_context()
+        mem = load_ai_user_memory()
+        cnt_chat = len(mem.get("chat_history") or [])
+        if not ctx:
+            return {
+                "handled": True,
+                "source": "habit_memory",
+                "shot_info": "暂无个人习惯记录",
+                "reply": (
+                    f"这台电脑目前保存了最近 **{cnt_chat}** 条聊天记录，还没有额外记录您的专属习惯。\n\n"
+                    "您可以直接对我说：\n"
+                    "• `我叫张xx，以后默认发给我`\n"
+                    "• `以后默认看昨天数据，不要发群`\n"
+                    "• `不是卢慧珍，是娄慧珍`\n"
+                    "我会永久记在这台电脑上，重启软件也不会忘记！"
+                ),
+            }
+        return {
+            "handled": True,
+            "source": "habit_memory",
+            "shot_info": "已加载本机长期记忆",
+            "reply": f"我在当前这台电脑为您记住了以下专属习惯（共留存 {cnt_chat} 条近期对话）：\n\n{ctx}\n\n（无论软件重启多少次我都会遵守，您随时说「清空习惯记忆」或直接教我新习惯即可更新）",
+        }
+
+    if any(k in raw for k in ("每周", "每天", "工作日", "定时计划", "帮我设置", "帮我改", "为什么", "怎么设置")):
+        return {"handled": False}
+
+    res = learn_user_habits_from_interaction(raw, speaker_name=speaker_name, is_local_speaker=is_local_speaker)
+    if res.get("learned"):
+        ctx = build_ai_user_memory_context()
+        items_txt = "\n".join(f"• {x}" for x in res["learned"])
+        return {
+            "handled": True,
+            "source": "habit_memory",
+            "shot_info": "已永久记住您的习惯",
+            "reply": f"✅ 收到，我已经牢牢记在当前电脑上啦（下次重启也会继续按这个习惯来）：\n{items_txt}\n\n**当前已生效记忆总览**：\n{ctx}",
+        }
+    return {"handled": False}
+
+
 def _local_smart_chat_fallback(cfg_norm, user_prompt, arch_ctx, api_err="", hist_diff="", ag_prompt=""):
     """离线本地全能管家兜底：回答署名/身份/如何设单元格/当前状态/安全边界与历史成败分析（绝不提及外部 AI 品牌）。"""
     guard = check_ai_security_and_creator_guardrail(user_prompt)
@@ -2589,6 +3141,8 @@ def _local_smart_chat_fallback(cfg_norm, user_prompt, arch_ctx, api_err="", hist
     q = str(user_prompt or "").strip()
     low = q.lower()
     tail_note = "\n\n（当前已由内置本地分析引擎为您实时解答）" if api_err else ""
+    mem_ctx = build_ai_user_memory_context()
+    mem_tail = f"\n\n【我已记住您的本机习惯】\n{mem_ctx}" if mem_ctx else ""
     if any(k in low for k in ("报错", "失败", "为什么", "第一次", "第二次", "怎么改", "代码", "antigravity", "顺序")):
         return (
             "已为您调取历次运行成败日志并整理出原因与修复参考建议：\n\n"
@@ -2601,29 +3155,32 @@ def _local_smart_chat_fallback(cfg_norm, user_prompt, arch_ctx, api_err="", hist
             "我是「暗号表助手 (SheetMate)」专属内置的智能小猫伙伴！\n"
             "• 一句话自动排期：直接跟我说“哪天几点把什么数据发到哪个群”，我能直接帮您设置并回传核对结果；\n"
             "• 每轮数据变化播报：每次表格处理完我都会帮您比比总数据从多少变成了多少、哪位伙伴或团队有变化；\n"
-            "• 故障自诊与长期记忆：卡住时帮您排忧解难，并记着历次数字变化方便您随时问。"
+            "• 本机永久习惯记忆：我会记住您在这台电脑教过我的人名纠错、常用收信人与日期偏好，重启不丢失。"
+            + mem_tail
             + tail_note
         )
     if any(k in q for k in ("单元格", "格位", "写入", "公式", "自己定义", "自定义")):
         return (
-            "您可以在顶部切换到【钉钉投递】页面，在右列找到「汇总表筛选预设校准（名称框定位）」：\n"
-            "1. 直接点顶部彩色快捷胶囊（如 + F2 筛选模版 / + I4 减去短链 / + 自定义格位）一键添加；\n"
-            "2. 每个格位都能自由填写工作表名称（默认「数据汇总」，也能写其他页签）、单元格位置（如 D2、I4 或区间 D4:E4）与用途备注；\n"
+            "您可以在顶部切换到【钉钉投递】页面，在右列找到「格位校准（名称框定位）」：\n"
+            "1. 默认已配置数据汇总常用 10 项（D3 查询日期、D4:E4 范围、D5 整周周报清空、L3 慕杰组、Y3/Y4/Y5/AA2/AA5 及 R4 最后更新时间）；\n"
+            "2. 每个格位都能自由填写工作表名称（默认「数据汇总」，也能写其他页签）、单元格位置与用途备注；\n"
             "3. 写入方式支持 5 种：自动日期（含凌晨跨天减天）、当前时间、自定义内容、公式（=开头）以及清空。"
             + tail_note
         )
     if any(k in low for k in ("状态", "配置", "设置", "发几个群", "静音")):
         snap = _safe_ai_cfg_snapshot(cfg_norm)
         brief = get_dashboard_data_brief()
+        ut_cell = (snap.get("update_time_cell") or {}).get("cell") or "R4"
         return (
             f"当前暗号表助手 v{APP_VERSION} 运行状态速览：\n"
             f"• 自动截图：{'开启' if snap.get('enable_capture') else '关闭'}｜自动发钉钉：{'开启' if snap.get('enable_dingtalk') else '关闭'}（{'静音' if snap.get('dt_silent_send') else '常规'} · {'自动发送' if snap.get('dt_auto_send') else '贴图待发'}）\n"
-            f"• 目标会话：{snap.get('dt_targets_count')} 个｜预设校准格位：{len(snap.get('summary_presets_cells') or [])} 项｜S4 更新时间：{'开启' if (snap.get('update_time_cell') or {}).get('enabled') else '关闭'}\n"
+            f"• 目标会话：{snap.get('dt_targets_count')} 个｜预设校准格位：{len(snap.get('summary_presets_cells') or [])} 项｜{ut_cell} 更新时间：{'开启' if (snap.get('update_time_cell') or {}).get('enabled') else '关闭'}\n"
             f"• 历史数据档案：{brief.get('archive_count')} 轮｜最新盘面：{brief.get('reg_val')}｜{brief.get('top_val')}"
+            + mem_tail
             + tail_note
         )
     return (
-        f"已检索本地数据档案为您整理要点：\n{arch_ctx[:900]}" + tail_note
+        f"已检索本地数据档案为您整理要点：\n{arch_ctx[:900]}" + mem_tail + tail_note
     )
 
 
@@ -2689,11 +3246,10 @@ def collect_report_context_for_ai(include_prev_shot=False, extra_img_path=None, 
             tp = tsv_dir / f"{nm}.tsv"
             try:
                 if tp.exists() and (now_ts - tp.stat().st_mtime) <= 18 * 3600:
-                    lines = [ln for ln in tp.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
-                    if lines:
-                        head_lines = lines[:28]
+                    head_lines, total_lines = _read_head_nonempty_lines(tp, max_lines=28, count_total=True)
+                    if head_lines:
                         tsv_blocks.append(
-                            f"【{nm} 明细表（更新于 {time.strftime('%m-%d %H:%M', time.localtime(tp.stat().st_mtime))}，共 {max(0, len(lines) - 1)} 条记录）】\n"
+                            f"【{nm} 明细表（更新于 {time.strftime('%m-%d %H:%M', time.localtime(tp.stat().st_mtime))}，共 {max(0, total_lines - 1)} 条记录）】\n"
                             + "\n".join(head_lines)
                         )
             except Exception:
@@ -2849,14 +3405,14 @@ def _save_verified_dingtalk_target(alias_name, confirmed_dt_name):
     if not _is_valid_verified_dingtalk_target(a, c):
         return
     try:
-        cur = _load_verified_dingtalk_targets()
-        cur[a] = c
-        if len(cur) > 200:
-            keys = list(cur.keys())[-200:]
-            cur = {k: cur[k] for k in keys}
-        p = _verified_targets_file()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+        with _AI_MEM_LOCK:
+            cur = _load_verified_dingtalk_targets()
+            cur[a] = c
+            if len(cur) > 200:
+                keys = list(cur.keys())[-200:]
+                cur = {k: cur[k] for k in keys}
+            _atomic_write_json(_verified_targets_file(), cur)
+        _notify_ai_memory_changed("verified_targets")
     except Exception:
         pass
 
@@ -2865,7 +3421,7 @@ _DAILY_TSV_NAMES_CACHE = {"sig": "", "people": [], "groups": []}
 
 
 def _load_names_from_daily_tsv(report_dir=None):
-    """读取桌面数据日报 TSV 全员真实姓名与组别，并按文件 mtime 缓存避免反复读盘。"""
+    """流式读取桌面数据日报 TSV 前 800 行全员真实姓名与组别，并按文件 mtime 缓存避免反复读盘。"""
     base = Path(report_dir) if report_dir else (Path.home() / "Desktop" / "数据日报")
     if not base.exists():
         return [], []
@@ -2888,13 +3444,13 @@ def _load_names_from_daily_tsv(report_dir=None):
     skip_vals = {"合计", "总计", "汇总", "小计", "全员", "未知", "-", "—", "无", "空", "null", "none", "nan"}
     for p in files:
         try:
-            lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+            lines = _read_head_nonempty_lines(p, max_lines=800)
             if len(lines) < 2:
                 continue
             hdr = [h.strip() for h in lines[0].split("\t")]
             p_cols = [i for i, h in enumerate(hdr) if any(k in h for k in ("姓名", "员工", "归属", "负责", "人员", "成员", "用户名", "推广员"))]
             g_cols = [i for i, h in enumerate(hdr) if any(k in h for k in ("团队", "小组", "组别", "部门", "战队"))]
-            for ln in lines[1:800]:
+            for ln in lines[1:]:
                 cols = ln.split("\t")
                 for ci in p_cols:
                     if ci < len(cols):
@@ -3176,6 +3732,20 @@ def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_r
     norm_cfg = normalize_config(cfg if isinstance(cfg, dict) else {})
     roster = collect_known_people_and_groups(cfg=norm_cfg, extra_roster=extra_roster)
     verified = _load_verified_dingtalk_targets()
+    ai_mem = load_ai_user_memory()
+    mem_corr = ai_mem.get("name_corrections") or {}
+
+    if cleaned in mem_corr:
+        best_corr = mem_corr[cleaned]
+        return {
+            "ok": True,
+            "raw": str(raw_target or ""),
+            "resolved_name": best_corr,
+            "candidates": list(dict.fromkeys([best_corr, cleaned])),
+            "matched_from_roster": True,
+            "is_self": False,
+            "note": f"已按本机纠错习惯将「{cleaned}」识别为「{best_corr}」",
+        }
 
     if cleaned in ("文件小助手", "文件传输助手", "小助手", "传输助手"):
         return {
@@ -3224,8 +3794,9 @@ def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_r
                         remark_real = rmk
                     break
 
+        mem_self = str(ai_mem.get("self_real_name") or "").strip() if is_local_speaker else ""
         dt_self = detect_dingtalk_logged_in_user_name() if is_local_speaker else ""
-        real_cands = [x for x in dict.fromkeys([sp_real, remark_real, dt_self]) if x]
+        real_cands = [x for x in dict.fromkeys([sp_real, remark_real, mem_self, dt_self]) if x]
         if not real_cands:
             sp_desc = f"当前登录名为「{sp}」，" if sp else ""
             return {
@@ -3485,6 +4056,17 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
     ):
         return {"handled": False}
 
+    has_immediate_run_intent = any(k in raw for k in (
+        "跑一下", "跑个", "跑一次", "跑程序", "自动运行", "立即运行", "马上运行", "马上跑",
+        "现在发", "立刻发", "直接发", "马上发", "截图", "续跑", "再跑", "再来一次", "重跑", "重发", "再发", "一份", "看看",
+    ))
+    is_pure_habit_teach = (
+        any(k in raw for k in ("记住", "以后默认", "以后都", "习惯默认", "习惯看", "习惯跑", "以后不要发", "以后别发", "默认不发", "清除习惯", "清空习惯", "查看记忆", "查看习惯", "你记住了", "恢复发群", "取消不发群"))
+        or bool(re.search(r"(?:我是|我叫|我的钉钉名|不是[\u4e00-\u9fff]{2,8}[，,]?是[\u4e00-\u9fff]{2,8}|没有[\u4e00-\u9fff]{2,8}[，,]?是[\u4e00-\u9fff]{2,8})", raw))
+    )
+    if is_pure_habit_teach and not has_immediate_run_intent:
+        return {"handled": False}
+
     hist_ctx = _extract_last_on_demand_context(chat_history)
     scan_text = re.sub(
         r"(?:不要|不用|别|不是|勿|切勿)\s*(?:发给|发送到|发到|投递给|私发给?|传给|推给|发)\s*[^，。,.;；!\n？?\s]{1,16}",
@@ -3521,15 +4103,40 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
     if not raw_targets and not has_run_verb:
         return {"handled": False}
 
+    try:
+        learn_user_habits_from_interaction(raw, speaker_name=speaker_name, is_local_speaker=is_local_speaker)
+    except Exception:
+        pass
+
     import copy
     run_cfg = normalize_config(copy.deepcopy(cfg if isinstance(cfg, dict) else {}))
     date_spec = parse_natural_date_spec(raw)
+    ai_mem = load_ai_user_memory()
 
-    # 续跑/再跑时未点名发谁：自动继承上一轮对话已锁定的目标，不再反复追问确认
-    if not raw_targets and hist_ctx.get("targets") and any(
-        k in raw for k in ("续跑", "再跑", "再来一次", "再来一遍", "重跑", "重发", "再发")
-    ):
-        raw_targets = list(hist_ctx["targets"])
+    # 优先尊重用户教导的个人偏好记忆（日期偏移、静音、跨重启续跑目标、默认收信人、禁发群规则）
+    if not date_spec.get("explicit") and ai_mem.get("preferred_day_offset") is not None:
+        pref_off = int(ai_mem["preferred_day_offset"])
+        date_spec = {
+            "explicit": True,
+            "mode": "offset",
+            "day_offset": pref_off,
+            "label": f"按您习惯的偏好({_format_day_offset_cn(pref_off)})",
+        }
+
+    # 续跑/再跑时未点名发谁：先查内存对话历史，再查持久化记忆上次确认目标与默认偏好目标
+    if not raw_targets and any(k in raw for k in ("续跑", "再跑", "再来一次", "再来一遍", "重跑", "重发", "再发")):
+        if hist_ctx.get("targets"):
+            raw_targets = list(hist_ctx["targets"])
+        else:
+            persisted_ctx = _extract_last_on_demand_context(ai_mem.get("chat_history") or [])
+            if persisted_ctx.get("targets"):
+                raw_targets = list(persisted_ctx["targets"])
+            elif ai_mem.get("last_confirmed_targets"):
+                raw_targets = list(ai_mem["last_confirmed_targets"])
+            elif ai_mem.get("preferred_targets"):
+                raw_targets = list(ai_mem["preferred_targets"])
+    elif not raw_targets and has_run_verb and ai_mem.get("preferred_targets"):
+        raw_targets = list(ai_mem["preferred_targets"])
 
     resolved_list = []
     res_notes = []
@@ -3561,7 +4168,23 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
             res_notes.append(r_obj["note"])
 
     if not resolved_list:
-        resolved_list = get_enabled_dt_targets(run_cfg)
+        if ai_mem.get("forbid_group_send"):
+            if ai_mem.get("preferred_targets"):
+                resolved_list = list(ai_mem["preferred_targets"])
+            elif ai_mem.get("self_real_name") and is_local_speaker:
+                resolved_list = [ai_mem["self_real_name"]]
+                search_cand_map[ai_mem["self_real_name"]] = [ai_mem["self_real_name"]]
+                res_notes.append(f"遵循您不发大群的习惯，默认发往「{ai_mem['self_real_name']}」")
+            else:
+                return {
+                    "handled": True,
+                    "action": "error_only",
+                    "targets": [],
+                    "date_spec": date_spec,
+                    "reply": "❌ 记住您平时交代过不要直接发大群，但当前尚未指明个人收信人，请告诉我「发给 某某某」或恢复发群。",
+                }
+        else:
+            resolved_list = get_enabled_dt_targets(run_cfg)
         if not resolved_list:
             return {
                 "handled": True,
@@ -3587,6 +4210,8 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
         run_cfg["dt_silent_send"] = False
     elif "静音" in raw:
         run_cfg["dt_silent_send"] = True
+    elif ai_mem.get("preferred_silent") is not None:
+        run_cfg["dt_silent_send"] = bool(ai_mem["preferred_silent"])
     run_cfg["dt_targets"] = [{"name": t, "enabled": True} for t in resolved_list]
     run_cfg["dt_search"] = resolved_list[0]
     run_cfg["_smart_target_candidates"] = search_cand_map
@@ -3597,21 +4222,32 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
         sp = run_cfg.setdefault("summary_presets", {})
         sp["enabled"] = True
         items = sp.setdefault("items", [])
-        d2 = next((it for it in items if isinstance(it, dict) and str(it.get("cell") or "").upper() == "D2"), None)
-        if d2 is None:
-            d2 = {"enabled": True, "sheet": "数据汇总", "cell": "D2", "label": "查询日期", "action": "today", "date_fmt": "YYYY年M月D日", "day_offset": 0}
-            items.insert(0, d2)
-        d2["enabled"] = True
+        d3 = next((it for it in items if isinstance(it, dict) and str(it.get("cell") or "").upper() in ("D3", "D2")), None)
+        if d3 is None:
+            d3 = {"enabled": True, "sheet": "数据汇总", "cell": "D3", "label": "查询日期", "action": "today", "date_fmt": "YYYY年M月D日", "day_offset": 0}
+            items.insert(0, d3)
+        d3["enabled"] = True
         if date_spec.get("mode") == "exact":
-            d2["action"] = "value"
-            d2["value"] = date_spec["formatted_cn"]
+            d3["action"] = "value"
+            d3["value"] = date_spec["formatted_cn"]
             run_cfg["dt_suffix"] = f"{date_spec['label']}数据"
         else:
-            d2["action"] = "today"
-            d2["cutoff_enabled"] = False
-            d2["day_offset"] = int(date_spec.get("day_offset", 0))
+            d3["action"] = "today"
+            d3["cutoff_enabled"] = False
+            d3["day_offset"] = int(date_spec.get("day_offset", 0))
             run_cfg["dt_cutoff_enabled"] = False
             run_cfg["dt_day_offset"] = int(date_spec.get("day_offset", 0))
+
+    try:
+        learn_user_habits_from_interaction(
+            raw,
+            speaker_name=speaker_name,
+            is_local_speaker=is_local_speaker,
+            resolved_targets=resolved_list,
+            action=action,
+        )
+    except Exception:
+        pass
 
     act_label = {
         "run_full": "全流程跑表 + 发钉钉",
@@ -3661,11 +4297,11 @@ def _build_config_verification_summary(new_cfg, changes):
     tgt_desc = "、".join(targets) if targets else "暂未启用任何群聊（将跳过发钉钉）"
 
     sp_items = ((c.get("summary_presets") or {}).get("items") or [])
-    d2 = next((it for it in sp_items if isinstance(it, dict) and str(it.get("cell", "")).upper() == "D2"), None)
-    d2_desc = "当天"
-    if d2:
-        off = int(d2.get("day_offset", 0) or 0)
-        d2_desc = "昨天（前一天 -1 天）" if off == -1 else ("前天（-2天）" if off == -2 else (f"当天 ({off:+d}天)" if off else "当天（0天）"))
+    d3 = next((it for it in sp_items if isinstance(it, dict) and str(it.get("cell", "")).upper() in ("D3", "D2")), None)
+    d3_desc = "当天"
+    if d3:
+        off = int(d3.get("day_offset", 0) or 0)
+        d3_desc = "昨天（前一天 -1 天）" if off == -1 else ("前天（-2天）" if off == -2 else (f"当天 ({off:+d}天)" if off else "当天（0天）"))
 
     cell_notes = []
     for it in sp_items:
@@ -3674,7 +4310,7 @@ def _build_config_verification_summary(new_cfg, changes):
         cell = str(it.get("cell") or "").upper()
         act = it.get("action", "value")
         val = str(it.get("value") or "")
-        if cell in ("L3", "L4", "F2", "H4", "I4") or act == "value":
+        if cell in ("L3", "Y3", "Y4", "Y5", "AA2", "AA5", "F2", "H4", "I4") or act == "value":
             if val:
                 cell_notes.append(f"{cell}={val}")
 
@@ -3696,7 +4332,7 @@ def _build_config_verification_summary(new_cfg, changes):
         "### 请您核对一下，这样设置对不对？",
         f"1. **执行周期**：{day_desc}",
         f"2. **每天触发时间**：{tt_desc}",
-        f"3. **要的数据日期**：表格 D2 日期 = **{d2_desc}**" + (f"（关键自定义格：{', '.join(cell_notes[:6])}）" if cell_notes else ""),
+        f"3. **要的数据日期**：表格 D3 日期 = **{d3_desc}**" + (f"（关键自定义格：{', '.join(cell_notes[:6])}）" if cell_notes else ""),
         f"4. **目标钉钉会话**：**{tgt_desc}**",
         f"5. **投递方式与等待**：{'自动打开钉钉发送' if c.get('enable_dingtalk') else '仅写表不发钉钉'}｜{silent_txt}｜{send_mode_txt}｜打开聊天后等 {delay_sec} 秒粘贴",
         "",
@@ -3808,18 +4444,18 @@ def try_handle_ai_config_command(user_text, cfg):
     sp_items = new_cfg.setdefault("summary_presets", {}).setdefault("items", [])
     if any(k in raw for k in ("昨天数据", "昨天的数据", "前一天数据", "昨日数据", "减1天", "减一天")):
         new_cfg["summary_presets"]["enabled"] = True
-        d2 = next((it for it in sp_items if isinstance(it, dict) and str(it.get("cell", "")).upper() == "D2"), None)
-        if d2 is not None:
-            d2["enabled"] = True
-            d2["day_offset"] = -1
-        changes.append("表格查询日期(D2)设为「昨天(-1天)」")
+        d3 = next((it for it in sp_items if isinstance(it, dict) and str(it.get("cell", "")).upper() in ("D3", "D2")), None)
+        if d3 is not None:
+            d3["enabled"] = True
+            d3["day_offset"] = -1
+        changes.append("表格查询日期(D3)设为「昨天(-1天)」")
     elif any(k in raw for k in ("今天数据", "今天的数据", "当天数据", "今日数据")):
         new_cfg["summary_presets"]["enabled"] = True
-        d2 = next((it for it in sp_items if isinstance(it, dict) and str(it.get("cell", "")).upper() == "D2"), None)
-        if d2 is not None:
-            d2["enabled"] = True
-            d2["day_offset"] = 0
-        changes.append("表格查询日期(D2)设为「当天(0天)」")
+        d3 = next((it for it in sp_items if isinstance(it, dict) and str(it.get("cell", "")).upper() in ("D3", "D2")), None)
+        if d3 is not None:
+            d3["enabled"] = True
+            d3["day_offset"] = 0
+        changes.append("表格查询日期(D3)设为「当天(0天)」")
 
     for cm in re.finditer(r"([A-Z]{1,3}\d+(?::[A-Z]{1,3}\d+)?)\s*(?:格|单元格)?\s*(?:写入|填入|填|设为|改成|改为)\s*[「\"'『]?([^\s，。,.;；\n」\"'』]{1,36})[」\"'』]?", raw):
         c_addr = cm.group(1).upper()
@@ -3949,11 +4585,13 @@ def summarize_report_with_ai(cfg, style_id="brief", user_prompt="", chat_history
     )
 
     contents = []
+    mem_ctx_str = build_ai_user_memory_context()
     first_parts = [{
         "text": (
             f"【实时软件配置快照】{json.dumps(cfg_snap, ensure_ascii=False)}\n"
             f"【顶部数据看板摘要】{json.dumps(data_brief, ensure_ascii=False)}\n"
-            f"【持久化历次表格档案检索上下文】\n{arch_ctx}\n"
+            + (f"【本机用户长期习惯与纠错记忆（务必严格遵守）】\n{mem_ctx_str}\n" if mem_ctx_str else "")
+            + f"【持久化历次表格档案检索上下文】\n{arch_ctx}\n"
             + (f"【历次运行成败对比分析】\n{hist_diff}\n" if hist_diff else "")
             + (f"【发给 Antigravity 的改代码参考模板】\n{ag_prompt}\n" if ag_prompt else "")
             + (f"【最近运行日志节选】\n{recent_logs_txt}\n" if recent_logs_txt else "")
@@ -4065,16 +4703,20 @@ def ask_gemini_assistant(cfg, mode="diagnose", error_detail=None, recent_logs=No
     )
 
     if mode == "suggest":
+        mem_ctx_s = build_ai_user_memory_context()
         user_prompt = (
             f"请帮我全面审核当前配置，指出潜在踩坑并给出 3~4 条大白话优化建议：\n"
             f"配置摘要：{json.dumps(cfg_snap, ensure_ascii=False)}\n"
-            f"历次运行统计：\n{hist_diff}\n"
+            + (f"【本机用户长期习惯】\n{mem_ctx_s}\n" if mem_ctx_s else "")
+            + f"历次运行统计：\n{hist_diff}\n"
             + (f"附加补充要求：{question}\n" if question else "")
         )
     elif mode == "ask":
+        mem_ctx_s = build_ai_user_memory_context()
         user_prompt = (
             f"用户提问：{question or '请介绍当前如何配置最稳'}\n"
             f"当前配置摘要：{json.dumps(cfg_snap, ensure_ascii=False)}\n"
+            + (f"【本机用户长期习惯与偏好（务必贴合他的习惯回答）】\n{mem_ctx_s}\n" if mem_ctx_s else "")
             + (f"历次运行统计：\n{hist_diff}\n" if hist_diff else "")
             + (f"最近报错：{json.dumps(err_d, ensure_ascii=False)}\n" if err_d.get("code") else "")
             + (f"最近运行日志：\n{logs_tail}\n" if logs_tail else "")
@@ -4735,13 +5377,13 @@ def wait_for_recovery(title, detail, hint="", actions=None, timeout_sec=900, err
 
 
 def fetch_remote_version():
-    """联网取最新版本号与下载链接；未配置或失败返回 None。"""
-    if not UPDATE_CHECK_URL:
+    """联网取最新版本号与下载链接；严格校验证书与重定向目标，未配置或失败返回 None。"""
+    if not UPDATE_CHECK_URL or not _validate_safe_http_url(UPDATE_CHECK_URL, require_https=True):
         return None
     try:
-        import urllib.request, json
-        req = urllib.request.Request(UPDATE_CHECK_URL, headers={"User-Agent": "SheetMate"})
-        with urllib.request.urlopen(req, timeout=8) as r:
+        req = urllib.request.Request(UPDATE_CHECK_URL, headers={"User-Agent": f"SheetMate/{APP_VERSION}"})
+        opener = urllib.request.build_opener(_SafeHttpsRedirectHandler())
+        with opener.open(req, timeout=8) as r:
             data = json.loads(r.read().decode("utf-8"))
         ver, url = data.get("version"), data.get("url")
         safe_u = _validate_safe_http_url(url, require_https=True)
@@ -4833,19 +5475,35 @@ def log(msg):
         _recent_logs_buffer.append(line)
         if len(_recent_logs_buffer) > 80:
             del _recent_logs_buffer[:-80]
-    try:
-        if sys.stdout is not None:
-            print(line)
-    except Exception:
-        pass
-    # 落盘一份运行日志，方便排查“界面跑完但没发出去”这类静默问题
-    try:
-        p = app_dir() / "run.log"
-        if not p.exists() or p.stat().st_size < 2_000_000:
-            with open(p, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-    except Exception:
-        pass
+        try:
+            if sys.stdout is not None:
+                print(line)
+        except Exception:
+            pass
+        # 落盘运行日志，超 2MB 自动滚动保留最近约 2000 行，避免长期值守后丢日志
+        try:
+            p = app_dir() / "run.log"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.exists() and p.stat().st_size >= 2_000_000:
+                tail_lines = []
+                try:
+                    with open(p, "rb") as rf:
+                        rf.seek(0, os.SEEK_END)
+                        sz = rf.tell()
+                        rf.seek(max(0, sz - 600_000), os.SEEK_SET)
+                        chunk = rf.read().decode("utf-8", errors="ignore")
+                    if sz > 600_000 and "\n" in chunk:
+                        chunk = chunk.split("\n", 1)[1]
+                    tail_lines = [ln for ln in chunk.splitlines()[-2000:] if ln.strip()]
+                except Exception:
+                    tail_lines = []
+                tail_lines.append(line)
+                _atomic_write_text(p, "\n".join(tail_lines) + "\n")
+            else:
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        except Exception:
+            pass
     if _gui_logger:
         try:
             _gui_logger(msg)
@@ -5198,13 +5856,21 @@ def set_clipboard_image_from_file(path):
 
 
 # ==================== 配置持久化 ====================
-CONFIG_PATH = app_dir() / "config.json"
+_INITIAL_APP_DIR = app_dir()
+CONFIG_PATH = _INITIAL_APP_DIR / "config.json"
+_CONFIG_LOCK = threading.RLock()
+
+
+def _config_file_path():
+    if CONFIG_PATH != (_INITIAL_APP_DIR / "config.json"):
+        return Path(CONFIG_PATH)
+    return app_dir() / "config.json"
 
 DEFAULT_SUMMARY_PRESET_ITEMS = [
     {
         "enabled": True,
         "sheet": "数据汇总",
-        "cell": "D2",
+        "cell": "D3",
         "label": "查询日期",
         "action": "today",
         "date_fmt": "YYYY年M月D日",
@@ -5249,9 +5915,9 @@ DEFAULT_SUMMARY_PRESET_ITEMS = [
     {
         "enabled": True,
         "sheet": "数据汇总",
-        "cell": "L3",
-        "label": "参与计算小组",
-        "action": "value",
+        "cell": "D5",
+        "label": "整周周报",
+        "action": "clear",
         "date_fmt": "YYYY年M月D日",
         "time_fmt": "full",
         "day_offset": 0,
@@ -5259,12 +5925,12 @@ DEFAULT_SUMMARY_PRESET_ITEMS = [
         "cutoff_hm": "09:00",
         "before_cutoff_offset": -1,
         "only_after_paste": False,
-        "value": "宋磊组,娄慧珍组,江峰组,刘全泉组,潘立浩组,李俊鑫组,慕杰组",
+        "value": "",
     },
     {
         "enabled": True,
         "sheet": "数据汇总",
-        "cell": "L4",
+        "cell": "L3",
         "label": "需要标记的团队",
         "action": "value",
         "date_fmt": "YYYY年M月D日",
@@ -5276,9 +5942,85 @@ DEFAULT_SUMMARY_PRESET_ITEMS = [
         "only_after_paste": False,
         "value": "慕杰组",
     },
+    {
+        "enabled": True,
+        "sheet": "数据汇总",
+        "cell": "Y3",
+        "label": "排除模板",
+        "action": "value",
+        "date_fmt": "YYYY年M月D日",
+        "time_fmt": "full",
+        "day_offset": 0,
+        "cutoff_enabled": False,
+        "cutoff_hm": "09:00",
+        "before_cutoff_offset": -1,
+        "only_after_paste": False,
+        "value": "排除所有模板",
+    },
+    {
+        "enabled": True,
+        "sheet": "数据汇总",
+        "cell": "Y4",
+        "label": "减去短链",
+        "action": "value",
+        "date_fmt": "YYYY年M月D日",
+        "time_fmt": "full",
+        "day_offset": 0,
+        "cutoff_enabled": False,
+        "cutoff_hm": "09:00",
+        "before_cutoff_offset": -1,
+        "only_after_paste": False,
+        "value": "减去短链",
+    },
+    {
+        "enabled": True,
+        "sheet": "数据汇总",
+        "cell": "Y5",
+        "label": "筛选暗号",
+        "action": "value",
+        "date_fmt": "YYYY年M月D日",
+        "time_fmt": "full",
+        "day_offset": 0,
+        "cutoff_enabled": False,
+        "cutoff_hm": "09:00",
+        "before_cutoff_offset": -1,
+        "only_after_paste": False,
+        "value": "当前筛选暗号",
+    },
+    {
+        "enabled": True,
+        "sheet": "数据汇总",
+        "cell": "AA2",
+        "label": "排除暗号",
+        "action": "value",
+        "date_fmt": "YYYY年M月D日",
+        "time_fmt": "full",
+        "day_offset": 0,
+        "cutoff_enabled": False,
+        "cutoff_hm": "09:00",
+        "before_cutoff_offset": -1,
+        "only_after_paste": False,
+        "value": "备用,备用2,CS暗号",
+    },
+    {
+        "enabled": True,
+        "sheet": "数据汇总",
+        "cell": "AA5",
+        "label": "在职组范围",
+        "action": "value",
+        "date_fmt": "YYYY年M月D日",
+        "time_fmt": "full",
+        "day_offset": 0,
+        "cutoff_enabled": False,
+        "cutoff_hm": "09:00",
+        "before_cutoff_offset": -1,
+        "only_after_paste": False,
+        "value": "全部在职组",
+    },
 ]
 
 DEFAULT_CONFIG = {
+    "preset_schema_v": 2,
     "day_mode": "daily",         # daily | workday | weekend | custom
     "custom_days": [0, 1, 2, 3, 4],  # 0=周一 .. 6=周日
     "day": {"sh": 9, "sm": 0, "eh": 18, "em": 0, "ih": 2, "im": 0},
@@ -5321,6 +6063,7 @@ DEFAULT_CONFIG = {
         "attach_style": "brief",
         "focus_team": "",
         "custom_summary_prompt": "",
+        "custom_phrases": [],
     },
     "summary_presets": {
         "enabled": True,
@@ -5328,7 +6071,7 @@ DEFAULT_CONFIG = {
     },
     "update_time_cell": {
         "enabled": True,           # 是否在粘贴数据后写入最后更新时间（对应 P4 标题）
-        "cell": "S4",              # 目标单元格（默认 S4）
+        "cell": "R4",              # 目标单元格（默认 R4）
         "only_after_paste": True,  # True=仅全流程粘贴数据后写入；False=仅截图模式也同步更新
     },
     "pipeline_tuning": {
@@ -5475,6 +6218,15 @@ def normalize_config(cfg):
     attach_st = str(ai_cfg.get("attach_style") or "brief").strip().lower()
     if attach_st not in AI_SUMMARY_STYLES:
         attach_st = "brief"
+    raw_phrases = ai_cfg.get("custom_phrases")
+    clean_phrases = []
+    if isinstance(raw_phrases, list):
+        for ph in raw_phrases:
+            sp = str(ph or "").strip()[:120]
+            if sp and sp not in clean_phrases:
+                clean_phrases.append(sp)
+            if len(clean_phrases) >= 16:
+                break
     out["ai_assistant"] = {
         "enabled": bool(ai_cfg.get("enabled", True)),
         "provider": ai_prov,
@@ -5487,6 +6239,7 @@ def normalize_config(cfg):
         "attach_style": attach_st,
         "focus_team": str(ai_cfg.get("focus_team") or "").strip()[:24],
         "custom_summary_prompt": str(ai_cfg.get("custom_summary_prompt") or "").strip(),
+        "custom_phrases": clean_phrases,
     }
 
     pt_cfg = out.get("pipeline_tuning") if isinstance(out.get("pipeline_tuning"), dict) else {}
@@ -5652,12 +6405,72 @@ def normalize_config(cfg):
             "value": "" if item.get("value") is None else str(item.get("value")).strip(),
         })
     sp["enabled"] = bool(raw_sp.get("enabled", sp.get("enabled", True)))
-    sp["items"] = sp_items
-    out["summary_presets"] = sp
+    in_schema_v = 0
+    if isinstance(cfg, dict):
+        try:
+            in_schema_v = int(cfg.get("preset_schema_v") or 0)
+        except Exception:
+            in_schema_v = 0
 
     raw_ut = cfg.get("update_time_cell") if isinstance(cfg, dict) and isinstance(cfg.get("update_time_cell"), dict) else {}
     def_ut = out.get("update_time_cell") if isinstance(out.get("update_time_cell"), dict) else {}
-    ut_cell = re.sub(r"\s+", "", str(raw_ut.get("cell", def_ut.get("cell", "S4")) or "")).upper() or "S4"
+    ut_cell = re.sub(r"\s+", "", str(raw_ut.get("cell", def_ut.get("cell", "R4")) or "")).upper() or "R4"
+
+    # 从旧版 (preset_schema_v < 2) 平滑迁移：S4 -> R4，D2 -> D3，删原 L3 参与计算小组，L4 移至 L3，补齐 D5/Y3/Y4/Y5/AA2/AA5
+    if isinstance(cfg, dict) and cfg and in_schema_v < 2:
+        if ut_cell == "S4":
+            ut_cell = "R4"
+        if "items" in raw_sp and isinstance(raw_sp.get("items"), list):
+            def _is_legacy_l3_grp(it):
+                lbl = it.get("label") or ""
+                val = it.get("value") or ""
+                return it.get("cell") == "L3" and ("参与计算" in lbl or "," in val or "宋磊组" in val)
+
+            def _is_legacy_l4_mark(it):
+                lbl = it.get("label") or ""
+                val = it.get("value") or ""
+                return it.get("cell") == "L4" and ("需要标记" in lbl or val == "慕杰组")
+
+            has_v1_marker = any(it.get("cell") == "D2" or _is_legacy_l3_grp(it) or _is_legacy_l4_mark(it) for it in sp_items)
+            if has_v1_marker:
+                migrated_sp = []
+                seen_cells = set()
+                has_d3 = any(it.get("cell") == "D3" for it in sp_items)
+                for it in sp_items:
+                    if _is_legacy_l3_grp(it):
+                        continue
+                    it_c = dict(it)
+                    if it_c.get("cell") == "D2" and not has_d3:
+                        it_c["cell"] = "D3"
+                    elif _is_legacy_l4_mark(it_c):
+                        it_c["cell"] = "L3"
+                        it_c["label"] = it_c.get("label") or "需要标记的团队"
+                        it_c["value"] = it_c.get("value") or "慕杰组"
+                    ck = it_c.get("cell") or ""
+                    if ck not in seen_cells:
+                        seen_cells.add(ck)
+                        migrated_sp.append(it_c)
+                by_cell = {it["cell"]: it for it in migrated_sp}
+                ordered_items = []
+                for def_it in DEFAULT_SUMMARY_PRESET_ITEMS:
+                    dc = def_it["cell"]
+                    if dc in by_cell:
+                        cur_it = by_cell.pop(dc)
+                        if dc == "D5" and str(cur_it.get("value") or "").strip() == "":
+                            cur_it["action"] = "clear"
+                            cur_it["value"] = ""
+                        ordered_items.append(cur_it)
+                    else:
+                        ordered_items.append(copy.deepcopy(def_it))
+                for rem_it in migrated_sp:
+                    if rem_it["cell"] in by_cell:
+                        ordered_items.append(rem_it)
+                sp_items = ordered_items
+
+    sp["items"] = sp_items
+    out["summary_presets"] = sp
+    out["preset_schema_v"] = 2
+
     out["update_time_cell"] = {
         "enabled": bool(raw_ut.get("enabled", def_ut.get("enabled", True))),
         "cell": ut_cell,
@@ -5667,24 +6480,30 @@ def normalize_config(cfg):
 
 
 def load_config():
-    try:
-        if CONFIG_PATH.exists():
-            import json
-            saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            return normalize_config(saved)
-    except Exception:
-        pass
-    return normalize_config({})
+    with _CONFIG_LOCK:
+        try:
+            cfg_p = _config_file_path()
+            if cfg_p.exists():
+                saved = json.loads(cfg_p.read_text(encoding="utf-8"))
+                normed = normalize_config(saved)
+                try:
+                    if isinstance(saved, dict) and int(saved.get("preset_schema_v") or 0) < 2:
+                        save_config(normed)
+                except Exception:
+                    pass
+                return normed
+        except Exception:
+            pass
+        return normalize_config({})
 
 
 def save_config(cfg):
-    try:
-        import json
-        normed = normalize_config(cfg)
-        CONFIG_PATH.write_text(json.dumps(normed, ensure_ascii=False, indent=2),
-                               encoding="utf-8")
-    except Exception:
-        pass
+    with _CONFIG_LOCK:
+        try:
+            normed = normalize_config(cfg)
+            _atomic_write_json(_config_file_path(), normed)
+        except Exception:
+            pass
 
 
 def parse_hm(s):
@@ -6688,10 +7507,10 @@ def format_update_timestamp(lt=None):
 
 
 def apply_wps_update_timestamp(page, cfg, after_data_paste=True, now_lt=None):
-    """在数据粘贴完成后，通过名称框定位并在 S4（对应 P4 最后更新时间）写入当前精确到秒的时间。"""
+    """在数据粘贴完成后，通过名称框定位并在 R4（对应 P4 最后更新时间）写入当前精确到秒的时间。"""
     raw_ut = (cfg or {}).get("update_time_cell")
     if not isinstance(raw_ut, dict):
-        ut = {"enabled": True, "cell": "S4", "only_after_paste": True}
+        ut = {"enabled": True, "cell": "R4", "only_after_paste": True}
     else:
         ut = raw_ut
     if not ut.get("enabled", True):
@@ -6699,7 +7518,7 @@ def apply_wps_update_timestamp(page, cfg, after_data_paste=True, now_lt=None):
     if ut.get("only_after_paste", True) and not after_data_paste:
         return 0
 
-    cells = expand_preset_cells(ut.get("cell") or "S4") or ["S4"]
+    cells = expand_preset_cells(ut.get("cell") or "R4") or ["R4"]
     ts_str = format_update_timestamp(now_lt)
     written = 0
 

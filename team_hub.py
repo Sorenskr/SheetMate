@@ -256,7 +256,7 @@ RANDOM_NICKNAMES = [
 PERMISSION_META = [
     ("can_run", "允许启动跑表与截图", "控制是否允许点击开始全流程、截图或开启定时值守"),
     ("can_edit_targets", "允许改钉钉群与文案后缀", "控制目标群聊、发送时间样式与后缀规则的修改权"),
-    ("can_edit_cells", "允许改表格自定义单元格", "控制是否能增删或修改 D2/D4/E4/L3/L4/S4 等单元格规则"),
+    ("can_edit_cells", "允许改表格自定义单元格", "控制是否能增删或修改 D3/D4/E4/D5/L3/Y3/AA5/R4 等单元格规则"),
     ("can_edit_schedule", "允许修改定时自动排期", "控制运行周期、白夜时段和单点计划覆盖的修改权"),
     ("can_edit_accounts", "允许修改WPS链接与账号", "保护源数据后台账号密码与在线表格链接不被误改"),
     ("can_edit_logic", "允许改等待秒数与内部顺序", "控制粘贴等待秒数、发后最小化与模块执行顺序"),
@@ -267,8 +267,11 @@ DEFAULT_PERMISSIONS = {k: True for k, _t, _d in PERMISSION_META}
 
 
 MAX_HUB_BODY_BYTES = 2 * 1024 * 1024
+MAX_DECOMPRESSED_BYTES = 4 * 1024 * 1024
 ADMIN_MAX_FAILS = 5
 ADMIN_LOCKOUT_SEC = 60.0
+ACCOUNT_MAX_FAILS = 5
+ACCOUNT_LOCKOUT_SEC = 60.0
 SYNC_PULL_COOLDOWN_SEC = 2.0
 AUTO_CLOUD_PULL_COOLDOWN_SEC = 18.0
 _AUTO_CLOUD_TOPIC = "sm28_th_" + hmac.new(
@@ -402,6 +405,109 @@ def _th_mqtt_retained_push(topic, text, timeout=3.0):
         except Exception:
             continue
     return ok_any
+def _safe_zlib_decompress(data, max_bytes=MAX_DECOMPRESSED_BYTES):
+    """带最大解压字节上限的安全解压，阻断压缩炸弹造成内存溢出。"""
+    dobj = zlib.decompressobj()
+    out = dobj.decompress(data, max_bytes)
+    if dobj.unconsumed_tail:
+        raise ValueError("Decompressed payload exceeds limit")
+    tail = dobj.flush(max(1, max_bytes - len(out) + 1))
+    if len(out) + len(tail) > max_bytes:
+        raise ValueError("Decompressed payload exceeds limit")
+    return out + tail
+
+
+def _acct_mqtt_pull_all(topic, timeout=2.2):
+    """并发从国内/海外双公共云节点拉取账号加密保留包，返回所有读到的密文列表。"""
+    results = []
+    res_lock = threading.Lock()
+    ctx = ssl.create_default_context()
+
+    def _pull_one(host, port):
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+                with ctx.wrap_socket(raw_sock, server_hostname=host) as ss:
+                    ss.settimeout(timeout)
+                    cid = f"sma_r_{os.getpid()}_{secrets.token_hex(3)}"
+                    vh = _th_mqtt_str("MQTT") + bytes([4, 2, 0, 20])
+                    pl = _th_mqtt_str(cid)
+                    ss.sendall(b"\x10" + _th_mqtt_enc_varlen(len(vh) + len(pl)) + vh + pl)
+                    hdr0, _ = _th_mqtt_read_packet(ss)
+                    if (hdr0 & 0xF0) != 0x20:
+                        return
+                    s_vh = struct.pack("!H", 1)
+                    s_pl = _th_mqtt_str(topic) + b"\x00"
+                    ss.sendall(b"\x82" + _th_mqtt_enc_varlen(len(s_vh) + len(s_pl)) + s_vh + s_pl)
+                    ss.settimeout(0.55)
+                    deadline = time.monotonic() + 0.70
+                    while time.monotonic() < deadline:
+                        try:
+                            hdr, body = _th_mqtt_read_packet(ss)
+                        except (socket.timeout, TimeoutError, ConnectionError, OSError):
+                            break
+                        if (hdr & 0xF0) == 0x30 and len(body) >= 2:
+                            tlen = struct.unpack("!H", body[:2])[0]
+                            pos = 2 + tlen + (2 if (hdr & 0x06) != 0 else 0)
+                            if pos <= len(body):
+                                txt = body[pos:].decode("utf-8", errors="ignore").strip()
+                                if txt:
+                                    with res_lock:
+                                        results.append(txt)
+                                break
+                    try:
+                        ss.sendall(b"\xe0\x00")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    ths = [threading.Thread(target=_pull_one, args=(h, p), daemon=True) for h, p in _AUTO_CLOUD_BROKERS]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join(timeout=timeout + 0.9)
+    return results
+
+
+def _acct_mqtt_push_all(topic, text, timeout=2.8):
+    """并发将账号加密保留包推送至双节点云服务，确保跨地域登录即得最新配置。"""
+    data_b = str(text or "").encode("utf-8")
+    vh_p = _th_mqtt_str(topic)
+    pub_pkt = b"\x31" + _th_mqtt_enc_varlen(len(vh_p) + len(data_b)) + vh_p + data_b
+    ctx = ssl.create_default_context()
+    ok_flags = []
+    ok_lock = threading.Lock()
+
+    def _push_one(host, port):
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+                with ctx.wrap_socket(raw_sock, server_hostname=host) as ss:
+                    ss.settimeout(timeout)
+                    cid = f"sma_w_{os.getpid()}_{secrets.token_hex(3)}"
+                    vh = _th_mqtt_str("MQTT") + bytes([4, 2, 0, 20])
+                    pl = _th_mqtt_str(cid)
+                    ss.sendall(b"\x10" + _th_mqtt_enc_varlen(len(vh) + len(pl)) + vh + pl)
+                    hdr0, _ = _th_mqtt_read_packet(ss)
+                    if (hdr0 & 0xF0) != 0x20:
+                        return
+                    ss.sendall(pub_pkt)
+                    try:
+                        ss.sendall(b"\xe0\x00")
+                    except Exception:
+                        pass
+                    with ok_lock:
+                        ok_flags.append(True)
+        except Exception:
+            pass
+
+    ths = [threading.Thread(target=_push_one, args=(h, p), daemon=True) for h, p in _AUTO_CLOUD_BROKERS]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join(timeout=timeout + 0.8)
+    return bool(ok_flags)
+
+
 _SAFE_AVATAR_RE = re.compile(r"^data:image/(?:png|jpeg|jpg|webp|svg\+xml);base64,[A-Za-z0-9+/=]+$", re.ASCII)
 
 
@@ -475,7 +581,7 @@ def _auto_cloud_unpack(token_str):
         idx += 1
     comp = bytes(a ^ b for a, b in zip(ct, ks[:len(ct)]))
     try:
-        obj = json.loads(zlib.decompress(comp).decode("utf-8"))
+        obj = json.loads(_safe_zlib_decompress(comp).decode("utf-8"))
         return obj if isinstance(obj, dict) else None
     except Exception:
         return None
@@ -536,16 +642,24 @@ def _sha256_secret(val):
 
 
 _DEFAULT_ADMIN_PASSCODE_HASH = "6ff431d101324476ed36a697cb43b4a46b8c74118d3ad950e8415ec40f36ade9"
-_DEFAULT_ADMIN_PASSWORD_HASH = "41492bcbcf0beda3e0ab90a0db689a19129de809d2cb26f9083e29d314fb80d8"
+_DEFAULT_ADMIN_PASSWORD_HASH = "6011f04699646c70fc2b2e861b8ba0a570b8c2f209f900a09a14abfb7951c1b1"
+_COMPAT_ADMIN_PASSWORD_HASHES = (
+    "6011f04699646c70fc2b2e861b8ba0a570b8c2f209f900a09a14abfb7951c1b1",
+    "41492bcbcf0beda3e0ab90a0db689a19129de809d2cb26f9083e29d314fb80d8",
+)
 _LEGACY_ADMIN_PASSCODE_HASH = "37a491493857d5f0dde3bd6af4520c2bc584cce05ea4bd5647df2640a5ad6eb2"
 _LEGACY_ADMIN_PASSWORD_HASHES = (
     "1639db4be408463baedd13400614163c8f1399c441c2fe90f950a8ffc43c9e33",
-    "6011f04699646c70fc2b2e861b8ba0a570b8c2f209f900a09a14abfb7951c1b1",
 )
 
 
 def _norm_admin_passcode(val):
-    return " ".join(str(val or "").strip().split())
+    s = unicodedata.normalize("NFKC", str(val or ""))
+    return " ".join(s.strip().split())
+
+
+def _norm_admin_password(val):
+    return unicodedata.normalize("NFKC", str(val or "")).strip()
 
 
 def normalize_nickname_key(name):
@@ -719,6 +833,7 @@ class TeamHubManager:
         self._admin_fail_tracker = {}
         self._last_pull_ts = 0.0
         self._last_auto_pull_ts = 0.0
+        self._lan_ips_cache = (0.0, ["127.0.0.1"])
         self._auto_cloud_enabled = not _is_ephemeral_test_dir(self.base_dir)
         self._push_lock = threading.Lock()
         self._push_thread = None
@@ -729,6 +844,7 @@ class TeamHubManager:
         self._state = self._load_state_raw()
         self._ensure_state_schema()
         self._backfill_local_runs_once()
+        self.account_sync = AccountCloudSyncManager(self.base_dir, hub=self)
         self._maybe_start_center_server()
         if self._auto_cloud_enabled:
             self._schedule_async_remote_pull(force=True)
@@ -933,13 +1049,99 @@ class TeamHubManager:
             **prof,
         }
 
+    def apply_synced_profile(self, nickname=None, avatar=None, initialized=None, reset_guest=False):
+        """用于账号云同步登录或退出时，免重名冲突地切换本地成员名片与头像。"""
+        with self._lock:
+            if reset_guest:
+                self._profile["nickname"] = ""
+                self._profile["avatar"] = PRESET_AVATARS[0]["url"] if PRESET_AVATARS else ""
+                self._profile["initialized"] = False
+            else:
+                if nickname is not None:
+                    nm = str(nickname or "").strip()[:24]
+                    if nm and not nm.startswith("未命名"):
+                        self._profile["nickname"] = nm
+                if avatar is not None and str(avatar).strip():
+                    self._profile["avatar"] = sanitize_avatar_url(upgrade_legacy_avatar(avatar))
+                else:
+                    self._profile["avatar"] = sanitize_avatar_url(self._profile.get("avatar"))
+                if initialized is not None:
+                    self._profile["initialized"] = bool(initialized)
+                elif self._profile.get("nickname"):
+                    self._profile["initialized"] = True
+            self._save_profile()
+            prof = self.get_profile()
+        try:
+            self.sync_member_snapshot(status_level="idle", step_text="恢复访客默认态" if reset_guest else "已同步云账号名片")
+        except Exception:
+            pass
+        return prof
+
+    def _get_account_vault_record(self, topic):
+        with self._lock:
+            vaults = self._state.get("account_vaults") or {}
+            rec = vaults.get(str(topic or ""))
+            return dict(rec) if isinstance(rec, dict) else None
+
+    def _set_account_vault_record(self, topic, pkt, rev, updated_ts):
+        t = str(topic or "").strip()
+        p = str(pkt or "").strip()
+        if not t or not p.startswith("SMV29:"):
+            return
+        with self._lock:
+            vaults = self._state.setdefault("account_vaults", {})
+            if not isinstance(vaults, dict):
+                vaults = {}
+                self._state["account_vaults"] = vaults
+            vaults[t] = {
+                "pkt": p,
+                "rev": int(rev or 1),
+                "updated_ts": float(updated_ts or time.time()),
+            }
+            if len(vaults) > 200:
+                keep = sorted(
+                    vaults.items(),
+                    key=lambda kv: (int((kv[1] or {}).get("rev") or 0), float((kv[1] or {}).get("updated_ts") or 0.0)),
+                )[-200:]
+                self._state["account_vaults"] = dict(keep)
+            self._save_state_local_and_push()
+
+    def _pull_account_vault_from_hub_sources(self):
+        with self._lock:
+            sync = dict(self._state.get("sync_settings") or {})
+        mode = sync.get("mode", "local_or_shared")
+        if mode == "local_or_shared":
+            sf = self._shared_state_file()
+            if sf is not None and sf.exists():
+                try:
+                    remote = json.loads(sf.read_text(encoding="utf-8"))
+                    if isinstance(remote, dict):
+                        with self._lock:
+                            self._merge_remote_state(remote)
+                except Exception:
+                    pass
+        elif mode in ("http_hub", "gist_cloud"):
+            remote = self._fetch_remote_state_unlocked(sync)
+            if isinstance(remote, dict):
+                with self._lock:
+                    self._merge_remote_state(remote)
+
+    def _push_account_vault_to_hub_sources(self):
+        with self._lock:
+            sync = dict(self._state.get("sync_settings") or {})
+            payload = self._export_sync_payload()
+        if sync.get("mode", "local_or_shared") in ("http_hub", "gist_cloud"):
+            self._push_remote_snapshot(sync, payload)
+
     def _default_state(self):
         return {
             "admin_auth": {
                 "passcode_hash": _DEFAULT_ADMIN_PASSCODE_HASH,
                 "password_hash": _DEFAULT_ADMIN_PASSWORD_HASH,
+                "custom_set": False,
                 "admin_v2_migrated": True,
                 "admin_v3_migrated": True,
+                "admin_v4_migrated": True,
             },
             "global_logic": {
                 "lock_timeout_sec": 180,
@@ -982,6 +1184,7 @@ class TeamHubManager:
             "ai_chats": [],
             "feedbacks": [],
             "backfilled_keys": [],
+            "account_vaults": {},
         }
 
     def _load_state_raw(self):
@@ -1002,14 +1205,27 @@ class TeamHubManager:
         for sk, sv in d["admin_auth"].items():
             self._state["admin_auth"].setdefault(sk, sv)
         auth_blk = self._state["admin_auth"]
-        if not auth_blk.get("admin_v3_migrated") or auth_blk.get("password_hash") in _LEGACY_ADMIN_PASSWORD_HASHES:
-            if not auth_blk.get("passcode_hash") or auth_blk.get("passcode_hash") == _LEGACY_ADMIN_PASSCODE_HASH:
+        if not auth_blk.get("custom_set") and (
+            not auth_blk.get("admin_v4_migrated")
+            or auth_blk.get("passcode_hash") == _LEGACY_ADMIN_PASSCODE_HASH
+            or auth_blk.get("password_hash") in _LEGACY_ADMIN_PASSWORD_HASHES
+            or auth_blk.get("password_hash") != _DEFAULT_ADMIN_PASSWORD_HASH
+        ):
+            changed_auth = False
+            if auth_blk.get("passcode_hash") != _DEFAULT_ADMIN_PASSCODE_HASH:
                 auth_blk["passcode_hash"] = _DEFAULT_ADMIN_PASSCODE_HASH
-            if not auth_blk.get("password_hash") or auth_blk.get("password_hash") in _LEGACY_ADMIN_PASSWORD_HASHES:
+                changed_auth = True
+            if auth_blk.get("password_hash") != _DEFAULT_ADMIN_PASSWORD_HASH:
                 auth_blk["password_hash"] = _DEFAULT_ADMIN_PASSWORD_HASH
+                changed_auth = True
+            if not auth_blk.get("admin_v4_migrated"):
+                changed_auth = True
+            auth_blk["custom_set"] = False
             auth_blk["admin_v2_migrated"] = True
             auth_blk["admin_v3_migrated"] = True
-            self._save_state_local_and_push(push_remote=False)
+            auth_blk["admin_v4_migrated"] = True
+            if changed_auth:
+                self._save_state_local_and_push(push_remote=False)
         for sk, sv in d["global_logic"].items():
             self._state["global_logic"].setdefault(sk, sv)
         self._state["global_logic"]["default_permissions"] = normalize_permissions(
@@ -1072,8 +1288,9 @@ class TeamHubManager:
                 raw_msg = _th_mqtt_retained_pull(_AUTO_CLOUD_TOPIC, timeout=2.2)
                 if raw_msg:
                     latest_obj = _auto_cloud_unpack(raw_msg)
-                    if isinstance(latest_obj, dict) and "members" in latest_obj:
-                        return latest_obj
+                    if isinstance(latest_obj, dict) and ("members" in latest_obj or "lock" in latest_obj):
+                        # 公共频道强制降级为 compact 并标记来源，阻断管理员凭据与全局 AI 接口投毒
+                        return {**latest_obj, "compact": True, "_from_public_cloud": True}
             except Exception:
                 return None
         return None
@@ -1142,8 +1359,45 @@ class TeamHubManager:
         return False
 
     def _merge_remote_state(self, remote):
+        if not isinstance(remote, dict):
+            return
         cur_sync = dict(self._state.get("sync_settings") or {})
-        if remote.get("compact"):
+        from_public = bool(remote.get("_from_public_cloud"))
+        if isinstance(remote.get("account_vaults"), dict):
+            cur_v = self._state.setdefault("account_vaults", {})
+            if not isinstance(cur_v, dict):
+                cur_v = {}
+                self._state["account_vaults"] = cur_v
+            for tk, rv in remote["account_vaults"].items():
+                tks = str(tk or "").strip()
+                if not tks or not isinstance(rv, dict):
+                    continue
+                pkt = str(rv.get("pkt") or "").strip()
+                if not pkt.startswith("SMV29:"):
+                    continue
+                try:
+                    n_rev = int(rv.get("rev") or 0)
+                    n_ts = float(rv.get("updated_ts") or 0.0)
+                except Exception:
+                    continue
+                old_v = cur_v.get(tks)
+                if isinstance(old_v, dict):
+                    try:
+                        o_ver = (int(old_v.get("rev") or 0), float(old_v.get("updated_ts") or 0.0))
+                    except Exception:
+                        o_ver = (-1, -1.0)
+                else:
+                    o_ver = (-1, -1.0)
+                if (n_rev, n_ts) > o_ver:
+                    cur_v[tks] = {"pkt": pkt, "rev": n_rev, "updated_ts": n_ts}
+            if len(cur_v) > 200:
+                keep_v = sorted(
+                    cur_v.items(),
+                    key=lambda kv: (int((kv[1] or {}).get("rev") or 0), float((kv[1] or {}).get("updated_ts") or 0.0)),
+                )[-200:]
+                self._state["account_vaults"] = dict(keep_v)
+
+        if remote.get("compact") or from_public:
             if isinstance(remote.get("lock"), dict):
                 self._state["lock"] = remote["lock"]
             if isinstance(remote.get("queue"), list):
@@ -1152,9 +1406,15 @@ class TeamHubManager:
                 old_gl = self._state.get("global_logic") if isinstance(self._state.get("global_logic"), dict) else {}
                 new_gl = copy.deepcopy(remote["global_logic"])
                 old_ai = old_gl.get("global_ai_api") if isinstance(old_gl.get("global_ai_api"), dict) else {}
-                new_ai = new_gl.get("global_ai_api") if isinstance(new_gl.get("global_ai_api"), dict) else {}
-                if not new_ai.get("api_key") and old_ai.get("api_key"):
-                    new_gl.setdefault("global_ai_api", {})["api_key"] = old_ai["api_key"]
+                if from_public:
+                    # 公共云频道禁止改写全局 AI 接口与 api_base，防止接口地址投毒重定向
+                    new_gl["global_ai_api"] = copy.deepcopy(old_ai) if old_ai else {
+                        "provider": "gemini", "api_base": "", "api_key": "", "model": "",
+                    }
+                else:
+                    new_ai = new_gl.get("global_ai_api") if isinstance(new_gl.get("global_ai_api"), dict) else {}
+                    if not new_ai.get("api_key") and old_ai.get("api_key"):
+                        new_gl.setdefault("global_ai_api", {})["api_key"] = old_ai["api_key"]
                 self._state["global_logic"] = new_gl
             if isinstance(remote.get("members"), dict):
                 mems = self._state.setdefault("members", {})
@@ -1176,18 +1436,39 @@ class TeamHubManager:
                     exist = list(self._state.get(lk) or [])
                     seen_sigs = {json.dumps(x, sort_keys=True, ensure_ascii=False) for x in exist[-120:]}
                     for it in r_list:
+                        if not isinstance(it, dict):
+                            continue
                         sig = json.dumps(it, sort_keys=True, ensure_ascii=False)
                         if sig not in seen_sigs:
                             exist.append(it)
                             seen_sigs.add(sig)
-                    self._state[lk] = exist
+                    self._state[lk] = exist[-800:]
         else:
-            for k in ("lock", "queue", "members", "runs", "errors", "ai_chats", "feedbacks", "global_logic", "admin_auth"):
-                if k in remote:
-                    self._state[k] = remote[k]
-            for mem in (self._state.get("members") or {}).values():
-                if isinstance(mem, dict) and mem.get("avatar"):
-                    mem["avatar"] = sanitize_avatar_url(upgrade_legacy_avatar(mem.get("avatar")))
+            typed_checks = {
+                "lock": dict,
+                "queue": list,
+                "members": dict,
+                "runs": list,
+                "errors": list,
+                "ai_chats": list,
+                "feedbacks": list,
+                "global_logic": dict,
+            }
+            for k, expected_t in typed_checks.items():
+                if k in remote and isinstance(remote[k], expected_t):
+                    if k == "members":
+                        clean_mems = {}
+                        for uid, mem in remote[k].items():
+                            if isinstance(mem, dict):
+                                mem_c = copy.deepcopy(mem)
+                                if mem_c.get("avatar"):
+                                    mem_c["avatar"] = sanitize_avatar_url(upgrade_legacy_avatar(mem_c.get("avatar")))
+                                clean_mems[uid] = mem_c
+                        self._state[k] = clean_mems
+                    else:
+                        self._state[k] = copy.deepcopy(remote[k])
+            if isinstance(remote.get("admin_auth"), dict) and remote["admin_auth"].get("custom_set") is True:
+                self._state["admin_auth"] = copy.deepcopy(remote["admin_auth"])
         self._state["sync_settings"] = cur_sync
         self._ensure_state_schema()
 
@@ -1344,6 +1625,7 @@ class TeamHubManager:
             "errors": (self._state.get("errors") or [])[-200:],
             "ai_chats": (self._state.get("ai_chats") or [])[-300:],
             "feedbacks": (self._state.get("feedbacks") or [])[-150:],
+            "account_vaults": dict(self._state.get("account_vaults") or {}),
         }
 
     def _backfill_local_runs_once(self):
@@ -1573,12 +1855,98 @@ class TeamHubManager:
     def get_sync_settings(self):
         with self._lock:
             sc = dict(self._state.get("sync_settings") or {})
-            return {
-                **sc,
-                "server_running": self._server is not None,
-                "server_port": self._server_port or int(sc.get("server_port") or 18790),
-                "lan_urls": [f"http://{ip}:{self._server_port or int(sc.get('server_port') or 18790)}" for ip in self._detect_lan_ips()],
+            srv_running = self._server is not None
+            srv_port = self._server_port or int(sc.get("server_port") or 18790)
+        local_ips = self._detect_lan_ips(use_cache=True)
+        return {
+            **sc,
+            "server_running": srv_running,
+            "server_port": srv_port,
+            "lan_urls": [f"http://{ip}:{srv_port}" for ip in local_ips],
+        }
+
+    def get_ui_poll_bundle(self, cur_cfg=None):
+        """单次短锁聚合前端轮询所需的全部协同状态，绝不持锁做 DNS/网络阻塞调用。"""
+        with self._lock:
+            self._sync_pull_if_needed()
+            self._clean_expired_lock_locked()
+
+            prof = dict(self._profile or {})
+            nick = str(prof.get("nickname") or "").strip()
+            prof["avatar"] = sanitize_avatar_url(prof.get("avatar"))
+            prof["display_name"] = nick or prof.get("member_code", "成员")
+            uid = prof.get("user_id", "")
+
+            members = self._state.get("members") or {}
+            mem = members.get(uid)
+            pending_cfg = None
+            if isinstance(mem, dict):
+                pending = mem.get("pending_remote_config")
+                if isinstance(pending, dict):
+                    mem["pending_remote_config"] = None
+                    restored = copy.deepcopy(pending)
+                    if isinstance(cur_cfg, dict):
+                        if not restored.get("luya_pass") and cur_cfg.get("luya_pass"):
+                            restored["luya_pass"] = cur_cfg["luya_pass"]
+                        cur_ai = cur_cfg.get("ai_assistant")
+                        res_ai = restored.get("ai_assistant")
+                        if isinstance(cur_ai, dict) and isinstance(res_ai, dict):
+                            if not res_ai.get("api_key") and cur_ai.get("api_key"):
+                                res_ai["api_key"] = cur_ai["api_key"]
+                    mem["config"] = restored
+                    self._save_state_local_and_push()
+                    pending_cfg = restored
+
+            mem_safe = mem if isinstance(mem, dict) else {}
+            gl = copy.deepcopy(self._state.get("global_logic") or {})
+            def_p = gl.get("default_permissions") or DEFAULT_PERMISSIONS
+            perms = normalize_permissions(mem_safe.get("permissions") or def_p)
+
+            lk = dict(self._state.get("lock") or {})
+            q = [dict(it) for it in (self._state.get("queue") or [])]
+            now = time.time()
+            held_sec = int(max(0, now - float(lk.get("acquired_ts") or now))) if lk.get("holder_id") else 0
+            lk["held_seconds"] = held_sec
+            lock_status = {
+                "locked": bool(lk.get("holder_id")),
+                "lock": lk,
+                "queue": q,
             }
+
+            my_idx = next((i for i, it in enumerate(q) if it.get("user_id") == uid), -1)
+            if my_idx < 0:
+                queue_status = {"in_queue": False, "my_turn": False, "position": 0}
+            elif (not lock_status["locked"]) and my_idx == 0:
+                queue_status = {"in_queue": True, "my_turn": True, "position": 1, "run_type": q[0].get("run_type", "full")}
+            else:
+                queue_status = {
+                    "in_queue": True,
+                    "my_turn": False,
+                    "position": my_idx + 1,
+                    "run_type": q[my_idx].get("run_type", "full"),
+                    "locked_by": lk if lock_status["locked"] else None,
+                }
+
+            sc = dict(self._state.get("sync_settings") or {})
+            srv_running = self._server is not None
+            srv_port = self._server_port or int(sc.get("server_port") or 18790)
+
+        local_ips = self._detect_lan_ips(use_cache=True)
+        sync_settings = {
+            **sc,
+            "server_running": srv_running,
+            "server_port": srv_port,
+            "lan_urls": [f"http://{ip}:{srv_port}" for ip in local_ips],
+        }
+        return {
+            "pending_cfg": pending_cfg,
+            "member_profile": prof,
+            "permissions": perms,
+            "global_logic": gl,
+            "lock_status": lock_status,
+            "queue_status": queue_status,
+            "sync_settings": sync_settings,
+        }
 
     def pull_remote_config_if_updated(self, cur_cfg):
         """若超管后台远程改动了本成员的配置，自动将远程配置下发回本地并返回新配置。"""
@@ -1866,12 +2234,33 @@ class TeamHubManager:
             if rec.get("until", 0.0) > now:
                 wait_s = max(1, int(rec["until"] - now))
                 return {"ok": False, "locked": True, "message": f"管理员验证连续失败过多，请 {wait_s} 秒后再试"}
-            self._sync_pull_if_needed(force=True)
-            auth = self._state.get("admin_auth") or {}
-            ok = (
-                hmac.compare_digest(_sha256_secret(_norm_admin_passcode(passcode)), str(auth.get("passcode_hash") or ""))
-                and hmac.compare_digest(_sha256_secret(str(password or "").strip()), str(auth.get("password_hash") or ""))
-            )
+
+            pc_norm = _norm_admin_passcode(passcode)
+            pw_norm = _norm_admin_password(password)
+            pc_cands = [h for h in dict.fromkeys([
+                _sha256_secret(pc_norm),
+                _sha256_secret(pc_norm.title()),
+            ])]
+            pw_hash = _sha256_secret(pw_norm)
+
+            def _check_auth_dict(auth_obj):
+                a = auth_obj if isinstance(auth_obj, dict) else {}
+                stored_pc = str(a.get("passcode_hash") or "")
+                stored_pw = str(a.get("password_hash") or "")
+                if not pc_norm or not pw_norm or pw_hash in _LEGACY_ADMIN_PASSWORD_HASHES:
+                    return False
+                pc_ok = any(hmac.compare_digest(c, stored_pc) for c in pc_cands)
+                if not pc_ok:
+                    return False
+                if a.get("custom_set"):
+                    return hmac.compare_digest(pw_hash, stored_pw)
+                allowed_pw = {h for h in (stored_pw, *_COMPAT_ADMIN_PASSWORD_HASHES) if h and h not in _LEGACY_ADMIN_PASSWORD_HASHES}
+                return any(hmac.compare_digest(pw_hash, h) for h in allowed_pw)
+
+            ok = _check_auth_dict(self._state.get("admin_auth"))
+            if not ok:
+                self._sync_pull_if_needed()
+                ok = _check_auth_dict(self._state.get("admin_auth"))
             if not ok:
                 cnt = int(rec.get("cnt", 0)) + 1
                 until = (now + ADMIN_LOCKOUT_SEC) if cnt >= ADMIN_MAX_FAILS else 0.0
@@ -1893,18 +2282,22 @@ class TeamHubManager:
             return {"ok": True, "admin_token": tok, "message": "已进入超级管理员后台"}
 
     def is_admin_token_valid(self, tok):
-        if not tok:
+        t_str = str(tok or "")
+        if not t_str:
             return False
         now = time.time()
-        exp = self._admin_tokens.get(tok, 0)
-        if exp <= now:
-            self._admin_tokens.pop(tok, None)
+        with self._lock:
+            expired = [k for k, exp_t in self._admin_tokens.items() if exp_t <= now]
+            for k in expired:
+                self._admin_tokens.pop(k, None)
+            for k, exp_t in self._admin_tokens.items():
+                if exp_t > now and hmac.compare_digest(k, t_str):
+                    return True
             return False
-        return True
 
     def update_admin_credentials(self, new_passcode="", new_password=""):
         pc = _norm_admin_passcode(new_passcode)
-        pw = str(new_password or "").strip()
+        pw = _norm_admin_password(new_password)
         if not pc or not pw:
             return {"ok": False, "message": "管理员姓名和密码均不能为空"}
         with self._lock:
@@ -1912,8 +2305,10 @@ class TeamHubManager:
             self._state["admin_auth"] = {
                 "passcode_hash": _sha256_secret(pc),
                 "password_hash": _sha256_secret(pw),
+                "custom_set": True,
                 "admin_v2_migrated": True,
                 "admin_v3_migrated": True,
+                "admin_v4_migrated": True,
             }
             self._save_state_local_and_push()
             return {"ok": True, "message": "管理员姓名与密码已更新保存"}
@@ -2101,7 +2496,11 @@ class TeamHubManager:
                     return {"ok": True, "message": "反馈状态已更新"}
             return {"ok": False, "message": "未找到该条反馈"}
 
-    def _detect_lan_ips(self):
+    def _detect_lan_ips(self, use_cache=True):
+        now_m = time.monotonic()
+        cached_ts, cached_ips = getattr(self, "_lan_ips_cache", (0.0, ["127.0.0.1"]))
+        if use_cache and cached_ts and (now_m - cached_ts) < 60.0 and cached_ips:
+            return list(cached_ips)
         ips = []
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -2111,14 +2510,17 @@ class TeamHubManager:
                 ips.append(ip)
         except Exception:
             pass
-        try:
-            for item in socket.getaddrinfo(socket.gethostname(), None):
-                ip = item[4][0]
-                if "." in ip and not ip.startswith("127.") and ip not in ips:
-                    ips.append(ip)
-        except Exception:
-            pass
-        return ips or ["127.0.0.1"]
+        if not ips:
+            try:
+                for item in socket.getaddrinfo(socket.gethostname(), None):
+                    ip = item[4][0]
+                    if "." in ip and not ip.startswith("127.") and ip not in ips:
+                        ips.append(ip)
+            except Exception:
+                pass
+        res = ips or ["127.0.0.1"]
+        self._lan_ips_cache = (now_m, list(res))
+        return res
 
     def _maybe_start_center_server(self):
         sc = self._state.get("sync_settings") or {}
@@ -2199,3 +2601,469 @@ class TeamHubManager:
                 srv.server_close()
             except Exception:
                 pass
+
+
+class AccountAuthError(ValueError):
+    """账号云同步密码错误或密文校验失败异常。"""
+
+
+def _hub_atomic_write_json(path_obj, data):
+    p = Path(path_obj)
+    tmp = p.with_name(f".{p.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8", newline="") as fp:
+            fp.write(json.dumps(data, ensure_ascii=False, indent=2))
+            fp.flush()
+        os.replace(str(tmp), str(p))
+        return True
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def _derive_account_credentials(account, password):
+    raw_acct = " ".join(unicodedata.normalize("NFKC", str(account or "")).strip().split())
+    acct_key = normalize_nickname_key(raw_acct)
+    pw = _norm_admin_password(password)
+    if len(acct_key) < 2 or len(raw_acct) > 32:
+        raise ValueError("账号长度需在 2~32 个字符之间")
+    if len(pw) < 4 or len(pw) > 64:
+        raise ValueError("同步密码长度需在 4~64 个字符之间")
+    topic = "sm29_acct_" + hmac.new(
+        b"SheetMate-AcctTopic-v29",
+        acct_key.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:28]
+    master_key = hashlib.pbkdf2_hmac(
+        "sha256",
+        pw.encode("utf-8"),
+        f"SheetMate-AcctVault-v29::{acct_key}".encode("utf-8"),
+        60000,
+        dklen=32,
+    )
+    return raw_acct, acct_key, topic, master_key
+
+
+def _account_vault_subkeys(master_key):
+    mk = bytes(master_key)
+    enc_key = hmac.new(mk, b"SheetMate-Vault-ENC-v29", hashlib.sha256).digest()
+    mac_key = hmac.new(mk, b"SheetMate-Vault-MAC-v29", hashlib.sha256).digest()
+    return enc_key, mac_key
+
+
+def pack_account_vault(master_key, vault_dict):
+    """使用密钥分离 Encrypt-then-MAC (CTR-SHA256 + 32B HMAC-SHA256) 打包跨电脑账号金库。"""
+    enc_key, mac_key = _account_vault_subkeys(master_key)
+    raw = json.dumps(vault_dict, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    comp = zlib.compress(raw, level=6)
+    if len(comp) > MAX_HUB_BODY_BYTES:
+        raise ValueError("同步配置体积超过安全限制")
+    nonce = secrets.token_bytes(12)
+    ks = bytearray()
+    idx = 0
+    while len(ks) < len(comp):
+        ks.extend(hashlib.sha256(enc_key + nonce + idx.to_bytes(4, "big")).digest())
+        idx += 1
+    ct = bytes(a ^ b for a, b in zip(comp, ks[:len(comp)]))
+    mac = hmac.new(mac_key, b"SMV29|" + nonce + ct, hashlib.sha256).digest()
+    return "SMV29:" + base64.b64encode(nonce + mac + ct).decode("ascii")
+
+
+def unpack_account_vault(master_key, token_str):
+    """先验证完整 32 字节 MAC 再解密并受限解压账号金库；密码错或密文篡改抛出 AccountAuthError。"""
+    s = str(token_str or "").strip()
+    if not s.startswith("SMV29:"):
+        raise AccountAuthError("云端数据包格式无效")
+    try:
+        raw = base64.b64decode(s[6:].encode("ascii"), validate=True)
+    except Exception as exc:
+        raise AccountAuthError("云端数据包编码损坏") from exc
+    if len(raw) < 44:
+        raise AccountAuthError("云端数据包长度异常")
+    nonce, mac, ct = raw[:12], raw[12:44], raw[44:]
+    enc_key, mac_key = _account_vault_subkeys(master_key)
+    exp = hmac.new(mac_key, b"SMV29|" + nonce + ct, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, exp):
+        raise AccountAuthError("账号或同步密码不正确")
+    ks = bytearray()
+    idx = 0
+    while len(ks) < len(ct):
+        ks.extend(hashlib.sha256(enc_key + nonce + idx.to_bytes(4, "big")).digest())
+        idx += 1
+    comp = bytes(a ^ b for a, b in zip(ct, ks[:len(ct)]))
+    try:
+        obj = json.loads(_safe_zlib_decompress(comp, max_bytes=MAX_DECOMPRESSED_BYTES).decode("utf-8"))
+    except Exception as exc:
+        raise AccountAuthError("账号数据解压或解析失败") from exc
+    if not isinstance(obj, dict):
+        raise AccountAuthError("账号数据结构无效")
+    return obj
+
+
+class AccountCloudSyncManager:
+    """跨电脑可选账号登录与端到端加密同步管理器（支持免登录默认使用 + 登录后设置/AI话术全同步）。"""
+
+    def __init__(self, base_dir, hub=None):
+        self.base_dir = Path(base_dir)
+        self._hub = hub
+        self._lock = threading.RLock()
+        self._session_path = self.base_dir / "cloud_account.json"
+        self._guest_backup_path = self.base_dir / "guest_backup.json"
+        self._fail_tracker = {}
+        self._session = self._load_session()
+
+    def _load_session(self):
+        if self._session_path.exists():
+            try:
+                data = json.loads(self._session_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("topic") and data.get("master_key_b64"):
+                    mk = base64.b64decode(str(data["master_key_b64"]).encode("ascii"), validate=True)
+                    if len(mk) == 32:
+                        return {
+                            "account": str(data.get("account") or "").strip(),
+                            "acct_key": str(data.get("acct_key") or "").strip(),
+                            "topic": str(data.get("topic") or "").strip(),
+                            "master_key_b64": str(data.get("master_key_b64") or "").strip(),
+                            "rev": int(data.get("rev") or 0),
+                            "last_synced_ts": float(data.get("last_synced_ts") or 0.0),
+                            "last_sync_str": str(data.get("last_sync_str") or ""),
+                            "logged_in_at": str(data.get("logged_in_at") or ""),
+                        }
+            except Exception:
+                pass
+        return {}
+
+    def _save_session(self, sess):
+        self._session = dict(sess) if isinstance(sess, dict) else {}
+        if self._session:
+            _hub_atomic_write_json(self._session_path, {"version": 1, **self._session})
+        else:
+            try:
+                if self._session_path.exists():
+                    self._session_path.unlink()
+            except Exception:
+                pass
+
+    def get_status(self):
+        with self._lock:
+            s = self._session
+            logged = bool(s and s.get("topic") and s.get("master_key_b64"))
+            return {
+                "logged_in": logged,
+                "account": s.get("account", "") if logged else "",
+                "rev": int(s.get("rev") or 0) if logged else 0,
+                "last_synced_ts": float(s.get("last_synced_ts") or 0.0) if logged else 0.0,
+                "last_sync_str": s.get("last_sync_str", "") if logged else "",
+                "logged_in_at": s.get("logged_in_at", "") if logged else "",
+            }
+
+    def _collect_cloud_vault_candidates(self, topic):
+        cands = []
+        seen = set()
+
+        def _add(pkt):
+            ps = str(pkt or "").strip()
+            if ps.startswith("SMV29:") and ps not in seen:
+                seen.add(ps)
+                cands.append(ps)
+
+        if self._hub is not None:
+            try:
+                self._hub._pull_account_vault_from_hub_sources()
+                rec = self._hub._get_account_vault_record(topic)
+                if isinstance(rec, dict):
+                    _add(rec.get("pkt"))
+            except Exception:
+                pass
+            if getattr(self._hub, "_auto_cloud_enabled", False):
+                for mp in _acct_mqtt_pull_all(topic, timeout=2.2):
+                    _add(mp)
+        return cands
+
+    def _publish_vault_packet(self, topic, pkt, rev, updated_ts):
+        cloud_ok = False
+        if self._hub is not None:
+            try:
+                self._hub._set_account_vault_record(topic, pkt, rev, updated_ts)
+                self._hub._push_account_vault_to_hub_sources()
+                sync = (self._hub._state.get("sync_settings") or {})
+                if sync.get("shared_dir") or sync.get("hub_url") or sync.get("gist_id"):
+                    cloud_ok = True
+            except Exception:
+                pass
+            if getattr(self._hub, "_auto_cloud_enabled", False):
+                if _acct_mqtt_push_all(topic, pkt, timeout=2.8):
+                    cloud_ok = True
+        return cloud_ok
+
+    @staticmethod
+    def _decrypt_best_vault(master_key, candidates):
+        if not candidates:
+            return None, None, False, False
+        valid_vaults = []
+        for pkt in candidates:
+            try:
+                obj = unpack_account_vault(master_key, pkt)
+                rev_n = int(obj.get("rev") or 0)
+                ts_n = float(obj.get("updated_ts") or 0.0)
+                valid_vaults.append(((rev_n, ts_n), obj, pkt))
+            except AccountAuthError:
+                continue
+        if not valid_vaults:
+            return None, None, True, True
+        valid_vaults.sort(key=lambda x: x[0], reverse=True)
+        _, best_obj, best_pkt = valid_vaults[0]
+        return best_obj, best_pkt, True, False
+
+    def login_or_register(self, account, password, current_bundle, client_id="local"):
+        """登录已有同步账号（拉取恢复云端设置与 AI 话术）或首次创建同步账号并上传本机配置。"""
+        now = time.time()
+        with self._lock:
+            if len(self._fail_tracker) > 64:
+                _prune_fail_tracker(self._fail_tracker, now)
+            rec = self._fail_tracker.get(client_id) or {"cnt": 0, "until": 0.0}
+            if rec.get("until", 0.0) > now:
+                wait_s = max(1, int(rec["until"] - now))
+                return {"ok": False, "locked": True, "message": f"账号密码连续输错过多，请 {wait_s} 秒后再试"}
+
+        try:
+            raw_acct, acct_key, topic, master_key = _derive_account_credentials(account, password)
+        except ValueError as exc:
+            return {"ok": False, "message": str(exc)}
+
+        # 若此前处于未登录访客态且尚无访客备份，保留非敏感名片备份以便退出恢复
+        if not self.get_status()["logged_in"] and not self._guest_backup_path.exists() and self._hub is not None:
+            try:
+                gp = self._hub.get_profile()
+                _hub_atomic_write_json(self._guest_backup_path, {
+                    "guest_profile": {
+                        "nickname": str(gp.get("nickname") or ""),
+                        "avatar": sanitize_avatar_url(gp.get("avatar")),
+                        "initialized": bool(gp.get("initialized")),
+                    }
+                })
+            except Exception:
+                pass
+
+        cands = self._collect_cloud_vault_candidates(topic)
+        best_obj, best_pkt, _had_cands, auth_failed = self._decrypt_best_vault(master_key, cands)
+
+        if auth_failed:
+            with self._lock:
+                cnt = int((self._fail_tracker.get(client_id) or {}).get("cnt", 0)) + 1
+                until = (now + ACCOUNT_LOCKOUT_SEC) if cnt >= ACCOUNT_MAX_FAILS else 0.0
+                self._fail_tracker[client_id] = {"cnt": cnt, "until": until, "last_ts": now}
+                _prune_fail_tracker(self._fail_tracker, now)
+                if cnt >= ACCOUNT_MAX_FAILS:
+                    return {
+                        "ok": False,
+                        "locked": True,
+                        "wrong_password": True,
+                        "message": f"账号或同步密码连续错误过多，已锁定 {int(ACCOUNT_LOCKOUT_SEC)} 秒后再试",
+                    }
+            return {
+                "ok": False,
+                "wrong_password": True,
+                "message": "同步密码不正确（该账号已存在云端档案，请输入正确密码）",
+            }
+
+        with self._lock:
+            self._fail_tracker.pop(client_id, None)
+
+        mk_b64 = base64.b64encode(master_key).decode("ascii")
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+
+        if best_obj is None:
+            rev = 1
+            vault = {
+                "schema_v": 1,
+                "account": raw_acct,
+                "rev": rev,
+                "updated_ts": now,
+                "bundle": copy.deepcopy(current_bundle if isinstance(current_bundle, dict) else {}),
+            }
+            pkt = pack_account_vault(master_key, vault)
+            cloud_ok = self._publish_vault_packet(topic, pkt, rev, now)
+            with self._lock:
+                self._save_session({
+                    "account": raw_acct,
+                    "acct_key": acct_key,
+                    "topic": topic,
+                    "master_key_b64": mk_b64,
+                    "rev": rev,
+                    "last_synced_ts": now,
+                    "last_sync_str": now_str,
+                    "logged_in_at": now_str,
+                })
+            return {
+                "ok": True,
+                "mode": "registered",
+                "rev": rev,
+                "cloud_pushed": cloud_ok,
+                "bundle": vault["bundle"],
+                "account_status": self.get_status(),
+                "message": f"已绑定同步账号「{raw_acct}」，当前设置与 AI 话术已加密上传云端",
+            }
+
+        rev = int(best_obj.get("rev") or 1)
+        upd_ts = float(best_obj.get("updated_ts") or now)
+        if self._hub is not None and best_pkt:
+            try:
+                self._hub._set_account_vault_record(topic, best_pkt, rev, upd_ts)
+            except Exception:
+                pass
+        with self._lock:
+            self._save_session({
+                "account": str(best_obj.get("account") or raw_acct),
+                "acct_key": acct_key,
+                "topic": topic,
+                "master_key_b64": mk_b64,
+                "rev": rev,
+                "last_synced_ts": upd_ts,
+                "last_sync_str": now_str,
+                "logged_in_at": now_str,
+            })
+        return {
+            "ok": True,
+            "mode": "logged_in",
+            "rev": rev,
+            "bundle": best_obj.get("bundle") if isinstance(best_obj.get("bundle"), dict) else {},
+            "account_status": self.get_status(),
+            "message": f"已登录「{raw_acct}」，已同步该账号在云端保存的全部设置与 AI 话术（v{rev}）",
+        }
+
+    def push_bundle(self, bundle):
+        """将本机最新设置与 AI 话术/记忆加密推送至当前登录账号的云端金库。"""
+        with self._lock:
+            s = dict(self._session or {})
+        if not s or not s.get("topic") or not s.get("master_key_b64"):
+            return {"ok": False, "not_logged_in": True, "message": "当前处于免登录默认模式"}
+        try:
+            mk = base64.b64decode(s["master_key_b64"].encode("ascii"), validate=True)
+        except Exception:
+            return {"ok": False, "message": "本地同步凭据异常，请重新登录"}
+
+        now = time.time()
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        new_rev = int(s.get("rev") or 0) + 1
+        vault = {
+            "schema_v": 1,
+            "account": s.get("account") or "",
+            "rev": new_rev,
+            "updated_ts": now,
+            "bundle": copy.deepcopy(bundle if isinstance(bundle, dict) else {}),
+        }
+        pkt = pack_account_vault(mk, vault)
+        cloud_ok = self._publish_vault_packet(s["topic"], pkt, new_rev, now)
+        with self._lock:
+            if self._session.get("topic") == s["topic"]:
+                self._save_session({
+                    **self._session,
+                    "rev": new_rev,
+                    "last_synced_ts": now,
+                    "last_sync_str": now_str,
+                })
+        return {
+            "ok": True,
+            "rev": new_rev,
+            "cloud_pushed": cloud_ok,
+            "account_status": self.get_status(),
+            "message": f"已将最新设置与 AI 话术同步到账号「{s.get('account')}」（v{new_rev}）",
+        }
+
+    def pull_if_newer(self):
+        """检测云端是否有其他电脑提交的更高版本金库；若有则返回最新同步包。"""
+        with self._lock:
+            s = dict(self._session or {})
+        if not s or not s.get("topic") or not s.get("master_key_b64"):
+            return {"ok": False, "updated": False, "not_logged_in": True}
+        try:
+            mk = base64.b64decode(s["master_key_b64"].encode("ascii"), validate=True)
+        except Exception:
+            return {"ok": False, "updated": False}
+
+        cands = self._collect_cloud_vault_candidates(s["topic"])
+        best_obj, best_pkt, _, auth_failed = self._decrypt_best_vault(mk, cands)
+        if auth_failed or best_obj is None:
+            return {"ok": True, "updated": False}
+        rem_ver = (int(best_obj.get("rev") or 0), float(best_obj.get("updated_ts") or 0.0))
+        loc_ver = (int(s.get("rev") or 0), float(s.get("last_synced_ts") or 0.0))
+        if rem_ver > loc_ver:
+            now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+            with self._lock:
+                if self._session.get("topic") == s["topic"]:
+                    self._save_session({
+                        **self._session,
+                        "rev": rem_ver[0],
+                        "last_synced_ts": rem_ver[1],
+                        "last_sync_str": now_str,
+                    })
+            if self._hub is not None and best_pkt:
+                try:
+                    self._hub._set_account_vault_record(s["topic"], best_pkt, rem_ver[0], rem_ver[1])
+                except Exception:
+                    pass
+            return {
+                "ok": True,
+                "updated": True,
+                "rev": rem_ver[0],
+                "bundle": best_obj.get("bundle") if isinstance(best_obj.get("bundle"), dict) else {},
+                "account_status": self.get_status(),
+            }
+        return {"ok": True, "updated": False, "account_status": self.get_status()}
+
+    def sync_now(self, local_bundle, direction="auto"):
+        """手动立即执行一次同步：若云端更新或明确要求拉取则下载恢复，否则将本机改动推送到云端。"""
+        st = self.get_status()
+        if not st["logged_in"]:
+            return {"ok": False, "not_logged_in": True, "message": "当前为免登录默认模式，请先登录同步账号"}
+        pulled = self.pull_if_newer()
+        if direction == "pull" and pulled.get("updated"):
+            return {
+                "ok": True,
+                "action": "pulled",
+                "bundle": pulled["bundle"],
+                "account_status": self.get_status(),
+                "message": f"已从云端拉取最新配置与 AI 话术（v{pulled.get('rev')}）",
+            }
+        if direction == "auto" and pulled.get("updated"):
+            return {
+                "ok": True,
+                "action": "pulled",
+                "bundle": pulled["bundle"],
+                "account_status": self.get_status(),
+                "message": f"发现另一台电脑的新配置，已自动同步拉取（v{pulled.get('rev')}）",
+            }
+        res_p = self.push_bundle(local_bundle)
+        return {**res_p, "action": "pushed"}
+
+    def logout(self):
+        """退出当前同步账号，清除本机账号凭据并恢复为未登录默认模式信息。"""
+        guest_prof = None
+        if self._guest_backup_path.exists():
+            try:
+                raw_g = json.loads(self._guest_backup_path.read_text(encoding="utf-8"))
+                if isinstance(raw_g, dict) and isinstance(raw_g.get("guest_profile"), dict):
+                    guest_prof = raw_g["guest_profile"]
+            except Exception:
+                guest_prof = None
+        try:
+            if self._guest_backup_path.exists():
+                self._guest_backup_path.unlink()
+        except Exception:
+            pass
+        with self._lock:
+            old_acct = self._session.get("account", "")
+            self._save_session({})
+        return {
+            "ok": True,
+            "logged_out_account": old_acct,
+            "guest_profile": guest_prof,
+            "account_status": self.get_status(),
+            "message": "已退出同步账号，本机已恢复免登录默认设置与纯净状态",
+        }

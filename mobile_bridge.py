@@ -1083,7 +1083,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="m-dl-card" id="mDownloadCard">
       <div class="m-dl-head">
         <div class="m-dl-title">电脑还没装软件？免费下载客户端</div>
-        <span class="m-dl-badge">v2.9.2 纯净单文件版</span>
+        <span class="m-dl-badge">v2.9.3 纯净单文件版</span>
       </div>
       <div class="m-dl-desc">
         下载这单个 SheetMate.exe 双击直接运行（绝不生成杂乱文件夹、无需安装环境、关闭窗口直接结束退出），支持自动抓数写 WPS 表、钉钉静音发群与云端异地遥控。
@@ -2463,6 +2463,12 @@ class MobileBridgeManager:
                         nick = str(body.get("nickname") or "").strip()
                         pin = str(body.get("pin") or "").strip()
                         c_ip = str(self.client_address[0] if self.client_address else "local")
+                        if c_ip in ("127.0.0.1", "::1"):
+                            cf_ip = str(self.headers.get("CF-Connecting-IP") or "").strip()
+                            xff = str(self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+                            fwd = cf_ip or xff
+                            if fwd:
+                                c_ip = f"tunnel:{fwd[:45]}"
                         chk = mgr.verify_pin_and_login(nick, pin, client_id=c_ip)
                         if not chk.get("ok"):
                             code = HTTPStatus.TOO_MANY_REQUESTS if chk.get("locked") else HTTPStatus.OK

@@ -19,10 +19,13 @@ _ui_stderr.log
 _ui_stdout.log
 config.json
 remote_access.json
+cloud_account.json
+guest_backup.json
 member_profile.json
 team_hub_state.json
 ai_data_archive.json
 ai_greetings_seen.json
+ai_user_memory.json
 dt_verified_targets.json
 run_journal.jsonl
 report_archive.jsonl

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.9.2 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.9.3 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -206,8 +206,15 @@ class _SheetMateController:
         self.ai_busy = False
         self.ai_result = None
         self._last_auto_diag_sig = ""
-        self.ai_chat_history = []
-        self._chat_seq = 0
+        init_chat_hist = []
+        if hasattr(app, "load_ai_user_memory"):
+            try:
+                mem0 = app.load_ai_user_memory() or {}
+                init_chat_hist = [dict(x) for x in (mem0.get("chat_history") or [])[-25:] if isinstance(x, dict)]
+            except Exception:
+                init_chat_hist = []
+        self.ai_chat_history = init_chat_hist
+        self._chat_seq = len(init_chat_hist)
         self.latest_spotlight = None
         self._spotlight_seq = 0
         self._startup_greeted = False
@@ -220,6 +227,15 @@ class _SheetMateController:
 
         self.update_info = None
         self._brief_cache = (0.0, {})
+        self._snapshot_sync_lock = threading.Lock()
+        self._snapshot_dirty = False
+        self._snapshot_pending_cfg = None
+        self._snapshot_worker_running = False
+        self._vault_sync_lock = threading.Lock()
+        self._vault_sync_timer = None
+        self._vault_dirty = False
+        self._applying_account_pull = False
+        self._pending_ui_config_reload = False
         self._run_started_at = 0.0
         self._run_mode = "full"
         self._run_trigger_type = "manual"
@@ -229,7 +245,13 @@ class _SheetMateController:
 
         base_dir = self.app.app_dir() if hasattr(self.app, "app_dir") else Path.cwd()
         self.hub = team_hub.TeamHubManager(base_dir, app=self.app) if team_hub is not None else None
+        self.account_sync = getattr(self.hub, "account_sync", None) if self.hub is not None else None
         self._refresh_operator_name()
+        if hasattr(app, "set_ai_memory_change_callback"):
+            try:
+                app.set_ai_memory_change_callback(self._on_ai_memory_changed)
+            except Exception:
+                pass
         self.mobile_bridge = mobile_bridge.MobileBridgeManager(self) if mobile_bridge is not None else None
         if self.mobile_bridge is not None:
             try:
@@ -256,6 +278,8 @@ class _SheetMateController:
         threading.Thread(target=self._check_privilege_startup, daemon=True).start()
         threading.Thread(target=self._check_update_worker, daemon=True).start()
         threading.Thread(target=self._hub_background_loop, daemon=True).start()
+        if self.account_sync is not None and self.account_sync.get_status().get("logged_in"):
+            threading.Thread(target=self._pull_account_on_startup, daemon=True).start()
 
     def _refresh_operator_name(self):
         if self.hub is None or not hasattr(self.app, "set_active_operator_name"):
@@ -353,6 +377,7 @@ class _SheetMateController:
     def _on_last_run(self):
         with self._lock:
             self.last_run_str = time.strftime("%m-%d %H:%M")
+            self._brief_cache = (0.0, {})
 
     def _on_login_prompt_show(self):
         with self._lock:
@@ -407,23 +432,37 @@ class _SheetMateController:
         reply_txt = str(spot.get("reply") or "").strip()
         if not reply_txt:
             return
+        spot_item = {
+            "role": "model",
+            "text": reply_txt,
+            "time": spot.get("time") or time.strftime("%H:%M:%S"),
+            "model": "",
+            "source": "data_spotlight",
+            "shot_info": spot.get("summary_line") or "本轮数据变动播报",
+            "via": "pc",
+        }
         with self._lock:
             self._spotlight_seq += 1
+            self._brief_cache = (0.0, {})
             item = dict(spot)
             item["seq"] = self._spotlight_seq
             self.latest_spotlight = item
-            self.ai_chat_history.append({
-                "role": "model",
-                "text": reply_txt,
-                "time": item.get("time") or time.strftime("%H:%M:%S"),
-                "model": "",
-                "source": "data_spotlight",
-                "shot_info": item.get("summary_line") or "本轮数据变动播报",
-                "via": "pc",
-            })
+            self.ai_chat_history.append(dict(spot_item))
             if len(self.ai_chat_history) > 25:
                 self.ai_chat_history = self.ai_chat_history[-25:]
             self._chat_seq += 1
+        if hasattr(self.app, "append_ai_chat_turn"):
+            try:
+                self.app.append_ai_chat_turn(
+                    "model",
+                    reply_txt,
+                    time_str=spot_item["time"],
+                    source="data_spotlight",
+                    shot_info=spot_item["shot_info"],
+                    via="pc",
+                )
+            except Exception:
+                pass
         if spot.get("summary_line"):
             self._on_log(f"数据变化播报：{spot['summary_line']}")
 
@@ -702,11 +741,12 @@ class _SheetMateController:
         txt = str(text or "").strip()
         if not txt:
             return
+        t_str = time.strftime("%H:%M:%S")
         with self._lock:
             item = {
                 "role": "model",
                 "text": txt,
-                "time": time.strftime("%H:%M:%S"),
+                "time": t_str,
                 "model": "",
                 "source": source,
                 "shot_info": shot_info,
@@ -718,6 +758,19 @@ class _SheetMateController:
             if len(self.ai_chat_history) > 25:
                 self.ai_chat_history = self.ai_chat_history[-25:]
             self._chat_seq += 1
+        if hasattr(self.app, "append_ai_chat_turn"):
+            try:
+                self.app.append_ai_chat_turn(
+                    "model",
+                    txt,
+                    time_str=t_str,
+                    source=source,
+                    shot_info=shot_info,
+                    via="pc",
+                    on_demand_meta=meta if isinstance(meta, dict) else None,
+                )
+            except Exception:
+                pass
         if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
             self.mobile_bridge.notify_state_changed()
 
@@ -863,6 +916,11 @@ class _SheetMateController:
             with self._lock:
                 self.ai_chat_history = []
                 self._chat_seq += 1
+            if hasattr(self.app, "clear_ai_chat_turns_only"):
+                try:
+                    self.app.clear_ai_chat_turns_only()
+                except Exception:
+                    pass
             return {"ok": True, "cleared": True, "history": [], "chat_seq": self._chat_seq}
 
         if self.hub is not None:
@@ -904,19 +962,32 @@ class _SheetMateController:
 
         with self._lock:
             hist_snap = list(self.ai_chat_history[-10:])
+            u_time_str = time.strftime("%H:%M:%S")
             if action == "send":
                 self.ai_chat_history.append({
                     "role": "user",
                     "text": display_user,
-                    "time": time.strftime("%H:%M:%S"),
+                    "time": u_time_str,
                     "via": source_device or "pc",
                     "sender": eff_speaker,
                 })
                 if len(self.ai_chat_history) > 25:
                     self.ai_chat_history = self.ai_chat_history[-25:]
                 self._chat_seq += 1
-        if action == "send" and self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
-            self.mobile_bridge.notify_state_changed()
+        if action == "send":
+            if hasattr(self.app, "append_ai_chat_turn"):
+                try:
+                    self.app.append_ai_chat_turn(
+                        "user",
+                        display_user,
+                        time_str=u_time_str,
+                        via=source_device or "pc",
+                        sender=eff_speaker,
+                    )
+                except Exception:
+                    pass
+            if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+                self.mobile_bridge.notify_state_changed()
 
         on_demand_res = (
             self.app.try_handle_ai_on_demand_task(
@@ -989,13 +1060,41 @@ class _SheetMateController:
                         "reply": f"⚠️ {save_out.get('message', '当前该项采用团队标准设置，暂无需手动调整。')}\n\n如确需调整，可点击右上角【反馈】说明您的排期需求。",
                     }
             else:
-                res = dict(self.app.summarize_report_with_ai(
-                    cfg_snap,
-                    style_id=sid,
-                    user_prompt=clean_prompt,
-                    chat_history=hist_snap,
-                ))
-                res["model"] = ""
+                mem_res = (
+                    self.app.try_handle_ai_memory_command(
+                        clean_prompt,
+                        cfg_snap,
+                        speaker_name=eff_speaker,
+                        is_local_speaker=is_local_speaker,
+                    )
+                    if (clean_prompt and hasattr(self.app, "try_handle_ai_memory_command"))
+                    else {"handled": False}
+                )
+                if mem_res.get("handled"):
+                    res = {
+                        "ok": True,
+                        "source": mem_res.get("source") or "habit_memory",
+                        "model": "",
+                        "shot_info": mem_res.get("shot_info") or "本机长期记忆",
+                        "reply": mem_res["reply"],
+                    }
+                else:
+                    if clean_prompt and hasattr(self.app, "learn_user_habits_from_interaction"):
+                        try:
+                            self.app.learn_user_habits_from_interaction(
+                                clean_prompt,
+                                speaker_name=eff_speaker,
+                                is_local_speaker=is_local_speaker,
+                            )
+                        except Exception:
+                            pass
+                    res = dict(self.app.summarize_report_with_ai(
+                        cfg_snap,
+                        style_id=sid,
+                        user_prompt=clean_prompt,
+                        chat_history=hist_snap,
+                    ))
+                    res["model"] = ""
         reply_txt = str(res.get("reply") or "").strip()
         if self.hub is not None and reply_txt:
             try:
@@ -1004,11 +1103,12 @@ class _SheetMateController:
             except Exception:
                 pass
         if reply_txt:
+            m_time_str = time.strftime("%H:%M:%S")
             with self._lock:
                 model_msg = {
                     "role": "model",
                     "text": reply_txt,
-                    "time": time.strftime("%H:%M:%S"),
+                    "time": m_time_str,
                     "model": "",
                     "source": res.get("source", ""),
                     "shot_info": res.get("shot_info", ""),
@@ -1022,6 +1122,19 @@ class _SheetMateController:
                 self._chat_seq += 1
                 res["history"] = list(self.ai_chat_history)
                 res["chat_seq"] = self._chat_seq
+            if hasattr(self.app, "append_ai_chat_turn"):
+                try:
+                    self.app.append_ai_chat_turn(
+                        "model",
+                        reply_txt,
+                        time_str=m_time_str,
+                        source=res.get("source", ""),
+                        shot_info=res.get("shot_info", ""),
+                        via="pc",
+                        on_demand_meta=res.get("on_demand_meta") if isinstance(res.get("on_demand_meta"), dict) else None,
+                    )
+                except Exception:
+                    pass
             if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
                 self.mobile_bridge.notify_state_changed()
         return res
@@ -1038,7 +1151,7 @@ class _SheetMateController:
         now = time.monotonic()
         with self._lock:
             ts0, cached = self._brief_cache
-            if not force and cached and (now - ts0) < 5.0:
+            if not force and cached and (now - ts0) < 15.0:
                 return cached
         brief = {}
         try:
@@ -1050,17 +1163,21 @@ class _SheetMateController:
             self._brief_cache = (now, brief)
         return brief
 
-    def get_ai_meta(self):
+    def get_ai_meta(self, fast=False):
         cfg_snap = self.get_config()
         ai_cfg = cfg_snap.get("ai_assistant") if isinstance(cfg_snap.get("ai_assistant"), dict) else {}
         focus_team = str(ai_cfg.get("focus_team") or "").strip()
-        ctx = self.app.collect_report_context_for_ai(include_prev_shot=False, encode_images=False) if hasattr(self.app, "collect_report_context_for_ai") else {}
+        if fast:
+            ctx = {}
+            brief = self.get_data_brief(force=False)
+        else:
+            ctx = self.app.collect_report_context_for_ai(include_prev_shot=False, encode_images=False) if hasattr(self.app, "collect_report_context_for_ai") else {}
+            brief = self.get_data_brief(force=False)
         if hasattr(self.app, "build_ai_summary_styles"):
             styles = self.app.build_ai_summary_styles(focus_team)
         else:
             styles = getattr(self.app, "AI_SUMMARY_STYLES", {})
         candidates = self.app.get_candidate_teams(cfg_snap) if hasattr(self.app, "get_candidate_teams") else []
-        brief = self.get_data_brief(force=True)
         with self._lock:
             hist = list(self.ai_chat_history)
         return {
@@ -1072,6 +1189,34 @@ class _SheetMateController:
             "data_brief": brief,
             "history": hist,
         }
+
+    def _schedule_snapshot_sync(self, cfg=None):
+        if self.hub is None:
+            return
+        with self._snapshot_sync_lock:
+            self._snapshot_pending_cfg = copy.deepcopy(cfg) if isinstance(cfg, dict) else None
+            self._snapshot_dirty = True
+            if self._snapshot_worker_running:
+                return
+            self._snapshot_worker_running = True
+
+        def _worker():
+            try:
+                while True:
+                    time.sleep(0.18)
+                    with self._snapshot_sync_lock:
+                        if not self._snapshot_dirty:
+                            self._snapshot_worker_running = False
+                            return
+                        snap_cfg = self._snapshot_pending_cfg
+                        self._snapshot_pending_cfg = None
+                        self._snapshot_dirty = False
+                    self._sync_snapshot_safe(cfg=snap_cfg)
+            except Exception:
+                with self._snapshot_sync_lock:
+                    self._snapshot_worker_running = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _apply_global_logic_to_cfg(self, cfg_dict):
         out = copy.deepcopy(cfg_dict) if isinstance(cfg_dict, dict) else {}
@@ -1088,14 +1233,250 @@ class _SheetMateController:
             out["dt_minimize_after_send"] = gl["enforce_minimize_after_send"]
         return out
 
+    def _on_ai_memory_changed(self, _reason="memory"):
+        with self._lock:
+            if self._applying_account_pull:
+                return
+        self._schedule_account_vault_push()
+
+    def _export_account_bundle(self):
+        cfg_snap = self.get_config()
+        ai_b = self.app.export_ai_sync_bundle() if hasattr(self.app, "export_ai_sync_bundle") else {}
+        prof = self.hub.get_profile() if self.hub is not None else {}
+        mob_pin = getattr(self.mobile_bridge, "mobile_pin", "") if self.mobile_bridge is not None else ""
+        return {
+            "config": cfg_snap,
+            "ai_bundle": ai_b,
+            "profile": {
+                "nickname": str(prof.get("nickname") or ""),
+                "avatar": str(prof.get("avatar") or ""),
+                "initialized": bool(prof.get("initialized")),
+            },
+            "mobile_pin": str(mob_pin or ""),
+        }
+
+    def _apply_account_bundle(self, bundle):
+        b = bundle if isinstance(bundle, dict) else {}
+        with self._vault_sync_lock:
+            self._vault_dirty = False
+            if self._vault_sync_timer is not None:
+                try:
+                    self._vault_sync_timer.cancel()
+                except Exception:
+                    pass
+                self._vault_sync_timer = None
+        with self._lock:
+            self._applying_account_pull = True
+        try:
+            if isinstance(b.get("config"), dict) and b["config"]:
+                merged_c = self._merge_server_ai_secrets(b["config"], self.cfg)
+                normed = self.app.normalize_config(merged_c)
+                self.app.save_config(normed)
+                with self._lock:
+                    self.cfg = copy.deepcopy(normed)
+                    self._brief_cache = (0.0, {})
+            if isinstance(b.get("ai_bundle"), dict) and hasattr(self.app, "import_ai_sync_bundle"):
+                imported = self.app.import_ai_sync_bundle(b["ai_bundle"], reset_if_missing=True)
+                mem = (imported or {}).get("ai_user_memory") or {}
+                hist = [dict(x) for x in (mem.get("chat_history") or [])[-25:] if isinstance(x, dict)]
+                with self._lock:
+                    self.ai_chat_history = hist
+                    self._chat_seq += 1
+            prof_b = b.get("profile")
+            if self.hub is not None and isinstance(prof_b, dict) and hasattr(self.hub, "apply_synced_profile"):
+                self.hub.apply_synced_profile(
+                    nickname=prof_b.get("nickname"),
+                    avatar=prof_b.get("avatar"),
+                    initialized=prof_b.get("initialized"),
+                )
+                self._refresh_operator_name()
+            pin_val = str(b.get("mobile_pin") or "").strip()
+            if pin_val and self.mobile_bridge is not None and hasattr(self.mobile_bridge, "set_pin"):
+                try:
+                    if self.mobile_bridge.mobile_pin != pin_val:
+                        self.mobile_bridge.set_pin(pin_val)
+                except Exception:
+                    pass
+        finally:
+            with self._lock:
+                self._applying_account_pull = False
+        self._schedule_snapshot_sync(cfg=self.get_config())
+
+    def _schedule_account_vault_push(self, delay_sec=0.45):
+        if self.account_sync is None or not self.account_sync.get_status().get("logged_in"):
+            return
+        with self._vault_sync_lock:
+            self._vault_dirty = True
+            if self._vault_sync_timer is not None:
+                try:
+                    self._vault_sync_timer.cancel()
+                except Exception:
+                    pass
+            t = threading.Timer(max(0.1, float(delay_sec)), self._flush_vault_push_worker)
+            t.daemon = True
+            self._vault_sync_timer = t
+            t.start()
+
+    def _flush_vault_push_worker(self):
+        with self._vault_sync_lock:
+            self._vault_sync_timer = None
+            if not self._vault_dirty:
+                return
+            self._vault_dirty = False
+        if self.account_sync is not None and self.account_sync.get_status().get("logged_in"):
+            try:
+                self.account_sync.push_bundle(self._export_account_bundle())
+            except Exception:
+                pass
+
+    def flush_account_vault_sync(self):
+        with self._vault_sync_lock:
+            t = self._vault_sync_timer
+            self._vault_sync_timer = None
+            dirty = self._vault_dirty
+            self._vault_dirty = False
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        if dirty and self.account_sync is not None and self.account_sync.get_status().get("logged_in"):
+            try:
+                self.account_sync.push_bundle(self._export_account_bundle())
+            except Exception:
+                pass
+
+    def _pull_account_on_startup(self):
+        if self.account_sync is None:
+            return
+        try:
+            res = self.account_sync.pull_if_newer()
+            if res.get("updated") and isinstance(res.get("bundle"), dict):
+                self._apply_account_bundle(res["bundle"])
+                with self._lock:
+                    self._pending_ui_config_reload = True
+                self._on_log("已从云端拉取账号最新设置与 AI 话术")
+        except Exception:
+            pass
+
+    def get_account_status_payload(self):
+        if self.account_sync is None:
+            return {"logged_in": False, "account": "", "rev": 0, "last_synced_ts": 0.0, "last_sync_str": ""}
+        return self.account_sync.get_status()
+
+    def account_login_payload(self, body, client_id="local"):
+        if self.account_sync is None:
+            return {"ok": False, "message": "账号同步模块未加载"}
+        b = body if isinstance(body, dict) else {}
+        acct = b.get("account", "")
+        pw = b.get("password", "")
+        res = self.account_sync.login_or_register(acct, pw, self._export_account_bundle(), client_id=client_id)
+        if not res.get("ok"):
+            return res
+        if res.get("mode") == "logged_in" and isinstance(res.get("bundle"), dict):
+            self._apply_account_bundle(res["bundle"])
+            self._on_log(f"已登录同步账号「{res['account_status'].get('account', '')}」并同步云端配置")
+        elif res.get("mode") == "registered":
+            self._on_log(f"已绑定同步账号「{res['account_status'].get('account', '')}」并上传配置到云端")
+        return {
+            **res,
+            "config": self.get_public_config(),
+            "timetable": self.get_timetable(),
+            "ai_meta": self.get_ai_meta(fast=True),
+            "profile": self.hub.get_profile() if self.hub is not None else {},
+            "cloud_account": self.get_account_status_payload(),
+        }
+
+    def account_sync_payload(self, body):
+        if self.account_sync is None:
+            return {"ok": False, "message": "账号同步模块未加载"}
+        with self._vault_sync_lock:
+            self._vault_dirty = False
+            if self._vault_sync_timer is not None:
+                try:
+                    self._vault_sync_timer.cancel()
+                except Exception:
+                    pass
+                self._vault_sync_timer = None
+        b = body if isinstance(body, dict) else {}
+        direction = str(b.get("direction") or "auto").strip()
+        if direction not in ("auto", "pull", "push"):
+            direction = "auto"
+        res = self.account_sync.sync_now(self._export_account_bundle(), direction=direction)
+        if res.get("ok") and res.get("action") == "pulled" and isinstance(res.get("bundle"), dict):
+            self._apply_account_bundle(res["bundle"])
+        return {
+            **res,
+            "config": self.get_public_config(),
+            "timetable": self.get_timetable(),
+            "ai_meta": self.get_ai_meta(fast=True),
+            "profile": self.hub.get_profile() if self.hub is not None else {},
+            "cloud_account": self.get_account_status_payload(),
+        }
+
+    def account_logout_payload(self):
+        if self.account_sync is None:
+            return {"ok": False, "message": "账号同步模块未加载"}
+        with self._vault_sync_lock:
+            self._vault_dirty = False
+            if self._vault_sync_timer is not None:
+                try:
+                    self._vault_sync_timer.cancel()
+                except Exception:
+                    pass
+                self._vault_sync_timer = None
+        res = self.account_sync.logout()
+        with self._lock:
+            self._applying_account_pull = True
+        try:
+            default_cfg = self.app.normalize_config({})
+            self.app.save_config(default_cfg)
+            with self._lock:
+                self.cfg = copy.deepcopy(default_cfg)
+                self._brief_cache = (0.0, {})
+                self.ai_chat_history = []
+                self._chat_seq += 1
+                self._startup_greeted = False
+                self._startup_greeting_data = None
+            if hasattr(self.app, "import_ai_sync_bundle"):
+                self.app.import_ai_sync_bundle({}, reset_if_missing=True)
+            guest_p = res.get("guest_profile")
+            if self.hub is not None and hasattr(self.hub, "apply_synced_profile"):
+                if isinstance(guest_p, dict):
+                    self.hub.apply_synced_profile(
+                        nickname=guest_p.get("nickname") or "",
+                        avatar=guest_p.get("avatar"),
+                        initialized=bool(guest_p.get("initialized")),
+                        reset_guest=not bool(guest_p.get("nickname") or guest_p.get("initialized")),
+                    )
+                else:
+                    self.hub.apply_synced_profile(reset_guest=True)
+                self._refresh_operator_name()
+        finally:
+            with self._lock:
+                self._applying_account_pull = False
+        self._schedule_snapshot_sync(cfg=self.get_config())
+        self._on_log("已退出同步账号，当前已切换为免登录默认模式")
+        return {
+            **res,
+            "config": self.get_public_config(),
+            "timetable": self.get_timetable(),
+            "ai_meta": self.get_ai_meta(fast=True),
+            "profile": self.hub.get_profile() if self.hub is not None else {},
+            "cloud_account": self.get_account_status_payload(),
+        }
+
     def save_config(self, new_cfg):
         with self._lock:
             merged_in = self._merge_server_ai_secrets(new_cfg, self.cfg)
             normed = self.app.normalize_config(merged_in)
             self.app.save_config(normed)
-            self.cfg = self.app.load_config()
+            self.cfg = copy.deepcopy(normed)
             saved = copy.deepcopy(self.cfg)
-        self._sync_snapshot_safe(cfg=saved)
+            should_push_acct = not self._applying_account_pull
+        self._schedule_snapshot_sync(cfg=saved)
+        if should_push_acct:
+            self._schedule_account_vault_push()
         return saved
 
     def save_config_checked(self, new_cfg):
@@ -1114,7 +1495,7 @@ class _SheetMateController:
                     "message": f"当前该项采用团队标准设置，暂无需手动调整：{'、'.join(denied)}",
                     "config": self._sanitize_config_for_client(saved),
                     "timetable": self.get_timetable(),
-                    "ai_meta": self.get_ai_meta(),
+                    "ai_meta": self.get_ai_meta(fast=True),
                 }
         saved = self.save_config(new_norm)
         return {
@@ -1122,16 +1503,17 @@ class _SheetMateController:
             "message": "设置已保存",
             "config": self._sanitize_config_for_client(saved),
             "timetable": self.get_timetable(),
-            "ai_meta": self.get_ai_meta(),
+            "ai_meta": self.get_ai_meta(fast=True),
         }
 
     def reset_config(self):
         with self._lock:
             default = self.app.normalize_config({})
             self.app.save_config(default)
-            self.cfg = self.app.load_config()
+            self.cfg = copy.deepcopy(default)
             saved = copy.deepcopy(self.cfg)
-        self._sync_snapshot_safe(cfg=saved)
+        self._schedule_snapshot_sync(cfg=saved)
+        self._schedule_account_vault_push()
         return saved
 
     def clear_logs(self):
@@ -1178,6 +1560,13 @@ class _SheetMateController:
                         self.hub.heartbeat_run_lock(st_txt)
                     if tick % 3 == 0:
                         self._sync_snapshot_safe()
+                    if not busy and tick % 10 == 0 and self.account_sync is not None and self.account_sync.get_status().get("logged_in"):
+                        pulled = self.account_sync.pull_if_newer()
+                        if pulled.get("updated") and isinstance(pulled.get("bundle"), dict):
+                            self._apply_account_bundle(pulled["bundle"])
+                            with self._lock:
+                                self._pending_ui_config_reload = True
+                            self._on_log("已同步同一账号在其他电脑上的最新设置与 AI 话术")
                     if not busy and not self._queue_auto_starting:
                         qt = self.hub.poll_queue_turn()
                         if qt.get("in_queue") and qt.get("my_turn"):
@@ -1230,6 +1619,7 @@ class _SheetMateController:
                 self.mobile_bridge.notify_credentials_changed()
             except Exception:
                 pass
+        self._schedule_account_vault_push()
         return {
             "ok": True,
             "profile": prof,
@@ -1377,16 +1767,21 @@ class _SheetMateController:
 
     def get_state(self, since=0):
         remote_pulled = False
+        bundle = None
         if self.hub is not None:
             try:
-                pending_cfg = self.hub.pull_remote_config_if_updated(self.cfg)
+                bundle = self.hub.get_ui_poll_bundle(self.cfg)
+                pending_cfg = bundle.get("pending_cfg") if isinstance(bundle, dict) else None
                 if isinstance(pending_cfg, dict):
                     self.save_config(pending_cfg)
                     remote_pulled = True
                     self._on_log("已接收并自动应用最新团队标准配置")
             except Exception:
-                pass
+                bundle = None
         with self._lock:
+            if self._pending_ui_config_reload:
+                self._pending_ui_config_reload = False
+                remote_pulled = True
             self.last_heartbeat = time.time()
             delta = [item for item in self.logs if item["id"] > since]
             rt = self.runtime_state or {}
@@ -1436,8 +1831,16 @@ class _SheetMateController:
                 "chat_seq": self._chat_seq,
                 "ai_history": list(self.ai_chat_history),
                 "mobile_info": self.mobile_bridge.get_brief_info() if self.mobile_bridge is not None else {"running": False},
+                "cloud_account": self.get_account_status_payload(),
             }
-        if self.hub is not None:
+        if isinstance(bundle, dict):
+            state_out["member_profile"] = bundle.get("member_profile") or {}
+            state_out["permissions"] = bundle.get("permissions") or {}
+            state_out["global_logic"] = bundle.get("global_logic") or {}
+            state_out["lock_status"] = bundle.get("lock_status") or {}
+            state_out["queue_status"] = bundle.get("queue_status") or {}
+            state_out["sync_settings"] = bundle.get("sync_settings") or {}
+        elif self.hub is not None:
             try:
                 state_out["member_profile"] = self.hub.get_profile()
                 state_out["permissions"] = self.hub.get_my_permissions()
@@ -2084,18 +2487,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/png" href="/icon.png?v=2.9.2" />
-<link rel="shortcut icon" href="/favicon.ico?v=2.9.2" />
+<link rel="icon" type="image/png" href="/icon.png?v=2.9.3" />
+<link rel="shortcut icon" href="/favicon.ico?v=2.9.3" />
 <style>
   :root {
     --bg: #EAF0F8;
     --bg-grad: radial-gradient(920px 520px at 14% -8%, rgba(0, 122, 255, 0.14), transparent 62%),
                radial-gradient(780px 460px at 88% 4%, rgba(88, 86, 214, 0.11), transparent 64%),
                radial-gradient(740px 460px at 50% 108%, rgba(50, 173, 230, 0.10), transparent 62%);
-    --shell-bg: rgba(255, 255, 255, 0.44);
-    --nav: rgba(247, 249, 254, 0.80);
-    --tabbar: rgba(250, 251, 255, 0.86);
-    --card: rgba(255, 255, 255, 0.93);
+    --shell-bg: rgba(255, 255, 255, 0.56);
+    --nav: rgba(247, 249, 254, 0.96);
+    --tabbar: rgba(250, 251, 255, 0.96);
+    --card: rgba(255, 255, 255, 0.96);
     --card-solid: #FFFFFF;
     --card-press: #F1F4FA;
     --sep: rgba(60, 60, 67, 0.11);
@@ -2109,10 +2512,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --pill-blue: rgba(0, 122, 255, 0.11);
     --pill-indigo: rgba(88, 86, 214, 0.12);
     --switch-off: rgba(120, 120, 128, 0.22);
-    --shadow: 0 4px 18px rgba(15, 32, 68, 0.055), inset 0 1px 0 rgba(255, 255, 255, 0.7);
-    --shadow-hover: 0 10px 26px rgba(0, 92, 230, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.9);
-    --shadow-lg: 0 18px 46px rgba(15, 32, 68, 0.16);
-    --sheet-bg: rgba(255, 255, 255, 0.94);
+    --shadow: 0 3px 12px rgba(15, 32, 68, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.7);
+    --shadow-hover: 0 6px 18px rgba(0, 92, 230, 0.09), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    --shadow-lg: 0 16px 38px rgba(15, 32, 68, 0.18);
+    --sheet-bg: rgba(255, 255, 255, 0.98);
     --blue: #007AFF;
     --green: #28CD41;
     --orange: #FF9500;
@@ -2126,13 +2529,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   [data-theme="dark"] {
     --bg: #080B12;
-    --bg-grad: radial-gradient(900px 480px at 14% -8%, rgba(10, 132, 255, 0.22), transparent 62%),
-               radial-gradient(760px 440px at 88% 4%, rgba(94, 92, 230, 0.20), transparent 64%),
-               radial-gradient(700px 460px at 50% 108%, rgba(50, 173, 230, 0.12), transparent 62%);
-    --shell-bg: rgba(20, 24, 34, 0.54);
-    --nav: rgba(18, 22, 32, 0.84);
-    --tabbar: rgba(24, 28, 38, 0.88);
-    --card: rgba(26, 31, 44, 0.91);
+    --bg-grad: radial-gradient(900px 480px at 14% -8%, rgba(10, 132, 255, 0.20), transparent 62%),
+               radial-gradient(760px 440px at 88% 4%, rgba(94, 92, 230, 0.18), transparent 64%),
+               radial-gradient(700px 460px at 50% 108%, rgba(50, 173, 230, 0.10), transparent 62%);
+    --shell-bg: rgba(20, 24, 34, 0.78);
+    --nav: rgba(18, 22, 32, 0.96);
+    --tabbar: rgba(24, 28, 38, 0.96);
+    --card: rgba(26, 31, 44, 0.96);
     --card-solid: #1E222D;
     --card-press: #2A3040;
     --sep: rgba(148, 163, 184, 0.16);
@@ -2146,10 +2549,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --pill-blue: rgba(10, 132, 255, 0.20);
     --pill-indigo: rgba(94, 92, 230, 0.22);
     --switch-off: rgba(148, 163, 184, 0.28);
-    --shadow: 0 6px 24px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.06);
-    --shadow-hover: 0 12px 32px rgba(10, 132, 255, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.10);
-    --shadow-lg: 0 22px 52px rgba(0, 0, 0, 0.65);
-    --sheet-bg: rgba(28, 32, 44, 0.95);
+    --shadow: 0 4px 16px rgba(0, 0, 0, 0.36), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    --shadow-hover: 0 8px 22px rgba(10, 132, 255, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.10);
+    --shadow-lg: 0 18px 42px rgba(0, 0, 0, 0.65);
+    --sheet-bg: rgba(28, 32, 44, 0.98);
     --blue: #0A84FF;
     --green: #30D158;
     --orange: #FF9F0A;
@@ -2161,13 +2564,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  button, .ios-switch, .ios-row.clickable, .tt-row, .mini-stat-card, .cc-tile, .tab-btn, .kpi-card {
+    touch-action: manipulation;
+  }
   html, body {
     margin: 0;
     padding: 0;
     height: 100%;
     background: var(--bg);
     background-image: var(--bg-grad);
-    background-attachment: fixed;
     color: var(--text);
     font-family: "SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei UI", sans-serif;
     font-size: 13.5px;
@@ -2201,18 +2606,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
   }
 
-  /* 顶部毛玻璃导航 + 灵动岛（绝对固定于顶部，不随下方内容滚动） */
+  /* 顶部固定导航 + 灵动岛（移除重开销高斯模糊，保证高刷零延迟点击） */
   .top-header {
     position: relative;
     flex-shrink: 0;
     z-index: 60;
     padding: 12px 18px 10px;
     background: var(--nav);
-    backdrop-filter: saturate(190%) blur(28px);
-    -webkit-backdrop-filter: saturate(190%) blur(28px);
     border-bottom: 0.5px solid var(--sep);
     border-radius: 26px 26px 0 0;
-    box-shadow: 0 4px 16px rgba(15, 32, 68, 0.045);
+    box-shadow: 0 3px 12px rgba(15, 32, 68, 0.05);
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -2721,43 +3124,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .diag-cols { grid-template-columns: 1fr; }
   }
 
-  .tab-pane.active .bento-col > * {
-    animation: card-rise 0.34s var(--ease) both;
-  }
-  .tab-pane.active .bento-col > *:nth-child(2) { animation-delay: 0.04s; }
-  .tab-pane.active .bento-col > *:nth-child(3) { animation-delay: 0.08s; }
-  .tab-pane.active .bento-col > *:nth-child(4) { animation-delay: 0.12s; }
-  @keyframes card-rise {
-    from { opacity: 0; transform: translateY(10px) scale(0.99); }
-    to { opacity: 1; transform: translateY(0) scale(1); }
-  }
-
-  /* 交互卡片基础聚光灯与微抬升 */
   .ios-group, .cc-tile, .mini-stat-card, .ai-chat-card {
-    --mx: 50%;
-    --my: 50%;
     position: relative;
-    transition: transform 0.24s var(--spring), box-shadow 0.24s var(--ease), border-color 0.2s, background 0.2s;
+    transition: transform 0.14s var(--ease), box-shadow 0.14s var(--ease), border-color 0.14s, background 0.14s;
   }
   .ios-group:hover, .cc-tile:hover, .mini-stat-card:hover, .ai-chat-card:hover {
     box-shadow: var(--shadow-hover);
   }
   .cc-tile:hover, .mini-stat-card:hover {
-    transform: translateY(-2px);
+    transform: translateY(-1px);
   }
-  .cc-tile::before, .mini-stat-card::before {
-    content: "";
-    position: absolute;
-    inset: 0;
-    border-radius: inherit;
-    background: radial-gradient(240px circle at var(--mx) var(--my), rgba(10, 132, 255, 0.11), transparent 65%);
-    opacity: 0;
-    transition: opacity 0.22s;
-    pointer-events: none;
-  }
-  .cc-tile:hover::before, .mini-stat-card:hover::before { opacity: 1; }
 
-  /* 主运行按钮 + Shimmer 光泽扫过 */
+  /* 主运行按钮 */
   .hero-action {
     position: relative;
     overflow: hidden;
@@ -2768,32 +3146,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     padding: 17px 18px;
     background: linear-gradient(135deg, #007AFF 0%, #1B64F2 50%, #5856D6 100%);
     color: #FFFFFF;
-    box-shadow: 0 12px 28px rgba(0, 122, 255, 0.30), inset 0 1px 0 rgba(255, 255, 255, 0.30);
+    box-shadow: 0 10px 24px rgba(0, 122, 255, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.30);
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 14px;
     cursor: pointer;
-    transition: transform 0.22s var(--spring), box-shadow 0.22s var(--ease), opacity 0.2s;
-  }
-  .hero-action::after {
-    content: "";
-    position: absolute;
-    top: -60%;
-    left: -50%;
-    width: 45%;
-    height: 220%;
-    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.24), transparent);
-    transform: rotate(24deg) translateX(-140%);
-    transition: transform 0.7s ease;
-    pointer-events: none;
+    transition: transform 0.12s var(--ease), box-shadow 0.15s var(--ease), opacity 0.15s;
   }
   .hero-action:hover:not(:disabled) {
-    transform: translateY(-2px);
-    box-shadow: 0 16px 34px rgba(0, 122, 255, 0.36), inset 0 1px 0 rgba(255, 255, 255, 0.38);
-  }
-  .hero-action:hover:not(:disabled)::after {
-    transform: rotate(24deg) translateX(460%);
+    transform: translateY(-1px);
+    box-shadow: 0 14px 28px rgba(0, 122, 255, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.38);
   }
   .hero-action:active:not(:disabled) { transform: scale(0.975); }
   .hero-action:disabled { opacity: 0.55; cursor: not-allowed; }
@@ -2805,12 +3168,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     height: 42px;
     border-radius: 50%;
     background: rgba(255, 255, 255, 0.24);
-    backdrop-filter: blur(8px);
     display: flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
-    transition: transform 0.24s var(--spring);
+    transition: transform 0.16s var(--spring);
   }
   .hero-action:hover:not(:disabled) .hero-play { transform: scale(1.1); }
   .hero-play svg { width: 18px; height: 18px; color: #FFFFFF; margin-left: 2px; }
@@ -3620,10 +3982,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .ai-send-btn:active { transform: scale(0.92); }
   .ai-send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-  /* 折叠与预设列表样式 */
-  .accordion-body { max-height: 0; overflow: hidden; transition: max-height 0.34s var(--ease); }
-  .accordion-body.open { max-height: 1200px; }
-  .accordion-body.tall.open { max-height: 3600px; }
+  /* 折叠与预设列表样式（瞬时展开零卡顿） */
+  .accordion-body { display: none; }
+  .accordion-body.open { display: block; }
+  .accordion-body.tall.open { display: block; }
 
   .cell-badge-input {
     width: 62px;
@@ -3936,10 +4298,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     padding: 5px 7px;
     border-radius: 999px;
     background: var(--tabbar);
-    backdrop-filter: saturate(195%) blur(28px);
-    -webkit-backdrop-filter: saturate(195%) blur(28px);
     border: 0.5px solid var(--sep-strong);
-    box-shadow: 0 10px 30px rgba(15, 32, 68, 0.16);
+    box-shadow: 0 8px 22px rgba(15, 32, 68, 0.14);
     display: grid;
     grid-template-columns: repeat(4, 1fr);
     align-items: center;
@@ -3952,7 +4312,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     width: calc((100% - 14px) / 4);
     border-radius: 999px;
     background: var(--pill-blue);
-    transition: transform 0.34s var(--spring);
+    transition: transform 0.18s var(--ease);
     pointer-events: none;
   }
   .tab-btn {
@@ -3977,13 +4337,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tab-btn span { font-size: 10.5px; font-weight: 600; }
   .tab-btn.active { color: var(--blue); }
 
-  /* 弹窗、双轮选择器、双列单点微调弹窗 */
+  /* 弹窗、双轮选择器、双列单点微调弹窗（零重负载模糊） */
   .sheet-mask {
     position: fixed;
     inset: 0;
     z-index: 85;
-    background: rgba(8, 12, 22, 0.38);
-    backdrop-filter: blur(5px);
+    background: rgba(8, 12, 22, 0.44);
     display: none;
     align-items: center;
     justify-content: center;
@@ -3996,13 +4355,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     max-height: 88vh;
     overflow-y: auto;
     background: var(--sheet-bg);
-    backdrop-filter: saturate(190%) blur(32px);
-    -webkit-backdrop-filter: saturate(190%) blur(32px);
     border-radius: 22px;
     box-shadow: var(--shadow-lg);
     border: 0.5px solid var(--sep);
     padding-bottom: 16px;
-    animation: pop-in 0.24s var(--spring);
   }
   .ios-sheet.wide { max-width: 620px; }
   @keyframes pop-in { from { opacity: 0; transform: scale(0.94) translateY(8px); } to { opacity: 1; transform: scale(1) translateY(0); } }
@@ -4037,9 +4393,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     color: var(--text);
   }
 
-  .modal-mask { position: fixed; inset: 0; z-index: 95; background: rgba(0, 0, 0, 0.36); backdrop-filter: blur(6px); display: none; align-items: center; justify-content: center; padding: 24px; }
+  .modal-mask { position: fixed; inset: 0; z-index: 95; background: rgba(0, 0, 0, 0.44); display: none; align-items: center; justify-content: center; padding: 24px; }
   .modal-mask.show { display: flex; }
-  .ios-alert { width: 320px; background: var(--sheet-bg); backdrop-filter: saturate(180%) blur(28px); border-radius: 18px; overflow: hidden; box-shadow: var(--shadow-lg); border: 0.5px solid var(--sep); animation: pop-in 0.22s var(--spring); }
+  .ios-alert { width: 320px; background: var(--sheet-bg); border-radius: 18px; overflow: hidden; box-shadow: var(--shadow-lg); border: 0.5px solid var(--sep); }
   .alert-body { padding: 18px 16px 15px; text-align: center; }
   .alert-title { font-size: 16px; font-weight: 700; margin-bottom: 5px; }
   .alert-msg { font-size: 13px; color: var(--text-2); line-height: 1.5; white-space: pre-line; text-align: left; }
@@ -4055,21 +4411,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     left: 50%;
     transform: translate(-50%, -76px);
     z-index: 105;
-    background: rgba(20, 24, 34, 0.94);
+    background: rgba(20, 24, 34, 0.96);
     color: #FFFFFF;
-    backdrop-filter: blur(18px);
     padding: 8px 16px;
     border-radius: 999px;
     font-size: 12.5px;
     font-weight: 600;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
-    transition: transform 0.3s var(--spring), opacity 0.25s;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.24);
+    transition: transform 0.16s var(--ease), opacity 0.14s;
     opacity: 0;
     pointer-events: none;
   }
   .toast.show { transform: translate(-50%, 0); opacity: 1; }
 
-  /* ==================== 昼夜自适应柔和背景动效（零遮挡文字） ==================== */
+  /* ==================== 昼夜自适应柔和静态渐变背景（零GPU模糊重绘与动画耗电） ==================== */
   .ambient-scene {
     position: fixed;
     inset: 0;
@@ -4080,7 +4435,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .sky-layer {
     position: absolute;
     inset: 0;
-    transition: opacity 0.65s ease;
   }
   .day-sky { opacity: 1; }
   .night-sky { opacity: 0; }
@@ -4094,9 +4448,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     width: 460px;
     height: 460px;
     border-radius: 50%;
-    background: radial-gradient(circle, rgba(255, 214, 132, 0.34) 0%, rgba(125, 198, 255, 0.16) 44%, transparent 72%);
-    filter: blur(18px);
-    animation: sun-breathe 11s ease-in-out infinite;
+    background: radial-gradient(circle, rgba(255, 214, 132, 0.28) 0%, rgba(125, 198, 255, 0.12) 48%, transparent 74%);
   }
   .day-sky-orb {
     position: absolute;
@@ -4105,51 +4457,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     width: 480px;
     height: 360px;
     border-radius: 50%;
-    background: radial-gradient(circle, rgba(96, 175, 255, 0.22) 0%, rgba(152, 224, 255, 0.10) 48%, transparent 74%);
-    filter: blur(28px);
-    animation: orb-sway 17s ease-in-out infinite alternate;
+    background: radial-gradient(circle, rgba(96, 175, 255, 0.18) 0%, rgba(152, 224, 255, 0.08) 52%, transparent 76%);
   }
-  .day-cloud {
-    position: absolute;
-    border-radius: 999px;
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.66), rgba(240, 248, 255, 0.22));
-    filter: blur(26px);
-  }
-  .day-cloud.c1 { top: 48px; left: -120px; width: 420px; height: 92px; animation: cloud-drift-a 48s ease-in-out infinite alternate; }
-  .day-cloud.c2 { top: 170px; right: -110px; width: 360px; height: 78px; opacity: 0.72; animation: cloud-drift-b 58s ease-in-out infinite alternate; }
-  .day-cloud.c3 { bottom: 64px; left: 18%; width: 460px; height: 84px; opacity: 0.52; animation: cloud-drift-a 66s ease-in-out infinite alternate-reverse; }
-  .day-mote {
-    position: absolute;
-    border-radius: 50%;
-    background: radial-gradient(circle, rgba(255, 255, 255, 0.78), rgba(140, 206, 255, 0.25));
-    animation: mote-rise 16s ease-in-out infinite;
-  }
-  .day-mote.m1 { left: 14%; bottom: 10%; width: 10px; height: 10px; animation-delay: -2s; }
-  .day-mote.m2 { left: 36%; bottom: 6%; width: 7px; height: 7px; animation-delay: -6s; animation-duration: 19s; }
-  .day-mote.m3 { left: 68%; bottom: 12%; width: 11px; height: 11px; animation-delay: -11s; animation-duration: 21s; }
-  .day-mote.m4 { left: 86%; bottom: 8%; width: 8px; height: 8px; animation-delay: -4s; animation-duration: 15s; }
+  .day-cloud, .day-mote, .night-meteor { display: none; }
 
   .night-aurora {
     position: absolute;
     border-radius: 50%;
-    filter: blur(42px);
-    mix-blend-mode: screen;
   }
   .night-aurora.a1 {
     top: -130px;
     left: 6%;
     width: 680px;
     height: 310px;
-    background: radial-gradient(ellipse at center, rgba(48, 209, 180, 0.22), rgba(10, 132, 255, 0.16) 52%, transparent 76%);
-    animation: aurora-flow-a 24s ease-in-out infinite alternate;
+    background: radial-gradient(ellipse at center, rgba(48, 209, 180, 0.16), rgba(10, 132, 255, 0.11) 52%, transparent 76%);
   }
   .night-aurora.a2 {
     top: -90px;
     right: 4%;
     width: 620px;
     height: 290px;
-    background: radial-gradient(ellipse at center, rgba(94, 92, 230, 0.24), rgba(191, 90, 242, 0.14) 52%, transparent 76%);
-    animation: aurora-flow-b 30s ease-in-out infinite alternate;
+    background: radial-gradient(ellipse at center, rgba(94, 92, 230, 0.18), rgba(191, 90, 242, 0.10) 52%, transparent 76%);
   }
   .night-stars {
     position: absolute;
@@ -4160,50 +4488,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .night-stars.s1 {
     box-shadow:
-      6vw 9vh 0 0 rgba(255,255,255,0.62), 14vw 22vh 0 0 rgba(200,230,255,0.52), 23vw 11vh 0 1px rgba(255,255,255,0.45),
-      35vw 7vh 0 0 rgba(255,255,255,0.58), 47vw 16vh 0 0 rgba(180,220,255,0.46), 59vw 8vh 0 1px rgba(255,255,255,0.50),
-      71vw 14vh 0 0 rgba(255,255,255,0.64), 83vw 10vh 0 0 rgba(200,232,255,0.56), 92vw 20vh 0 1px rgba(255,255,255,0.48),
-      8vw 78vh 0 0 rgba(255,255,255,0.42), 21vw 86vh 0 0 rgba(190,225,255,0.45), 79vw 82vh 0 0 rgba(255,255,255,0.46),
-      91vw 72vh 0 1px rgba(190,225,255,0.50), 95vw 44vh 0 0 rgba(255,255,255,0.52), 3vw 52vh 0 0 rgba(255,255,255,0.44);
-    animation: star-twinkle 5.5s ease-in-out infinite alternate;
+      6vw 9vh 0 0 rgba(255,255,255,0.52), 23vw 11vh 0 1px rgba(255,255,255,0.38),
+      47vw 16vh 0 0 rgba(180,220,255,0.40), 71vw 14vh 0 0 rgba(255,255,255,0.54),
+      92vw 20vh 0 1px rgba(255,255,255,0.42), 8vw 78vh 0 0 rgba(255,255,255,0.36);
   }
-  .night-stars.s2 {
-    box-shadow:
-      11vw 15vh 0 0 rgba(190,228,255,0.42), 28vw 18vh 0 0 rgba(255,255,255,0.44), 41vw 12vh 0 1px rgba(205,235,255,0.38),
-      54vw 21vh 0 0 rgba(255,255,255,0.40), 65vw 13vh 0 0 rgba(200,230,255,0.46), 76vw 19vh 0 1px rgba(255,255,255,0.38),
-      88vw 27vh 0 0 rgba(255,255,255,0.44), 16vw 89vh 0 0 rgba(255,255,255,0.34), 85vw 88vh 0 0 rgba(205,235,255,0.40);
-    animation: star-twinkle 7.5s ease-in-out infinite alternate-reverse;
-  }
-  .night-meteor {
-    position: absolute;
-    top: 12%;
-    left: 72%;
-    width: 110px;
-    height: 1.5px;
-    background: linear-gradient(90deg, rgba(255,255,255,0), rgba(145, 225, 255, 0.72), rgba(255,255,255,0.92));
-    transform: rotate(-24deg);
-    opacity: 0;
-    animation: meteor-glide 14s ease-in-out infinite;
-  }
-  @keyframes sun-breathe { 0%, 100% { transform: scale(1); opacity: 0.72; } 50% { transform: scale(1.08); opacity: 0.96; } }
-  @keyframes orb-sway { 0% { transform: translate(0, 0); } 100% { transform: translate(60px, -24px); } }
-  @keyframes cloud-drift-a { 0% { transform: translateX(0) translateY(0); } 100% { transform: translateX(180px) translateY(10px); } }
-  @keyframes cloud-drift-b { 0% { transform: translateX(0) translateY(0); } 100% { transform: translateX(-160px) translateY(-10px); } }
-  @keyframes mote-rise {
-    0% { transform: translateY(0) scale(0.8); opacity: 0; }
-    25% { opacity: 0.36; }
-    75% { opacity: 0.24; }
-    100% { transform: translateY(-210px) scale(1.15); opacity: 0; }
-  }
-  @keyframes aurora-flow-a { 0% { transform: translate(0, 0) scale(1); } 100% { transform: translate(90px, 24px) scale(1.08); } }
-  @keyframes aurora-flow-b { 0% { transform: translate(0, 0) scale(1.04); } 100% { transform: translate(-80px, 18px) scale(0.96); } }
-  @keyframes star-twinkle { 0% { opacity: 0.45; } 100% { opacity: 0.95; } }
-  @keyframes meteor-glide {
-    0%, 72% { transform: translate(0, 0) rotate(-24deg); opacity: 0; }
-    76% { opacity: 0.85; }
-    82% { transform: translate(-240px, 110px) rotate(-24deg); opacity: 0; }
-    100% { transform: translate(-240px, 110px) rotate(-24deg); opacity: 0; }
-  }
+  .night-stars.s2 { display: none; }
 
   /* ==================== 成员身份芯片、反馈按钮、自由选组、防撞提醒与隐藏超管后台 ==================== */
   .member-chip-btn {
@@ -4260,7 +4549,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     margin-bottom: 10px;
     border-radius: 15px;
     border: 0.5px solid var(--sep);
-    backdrop-filter: blur(18px);
+    background: var(--card);
     font-size: 12.5px;
   }
   .top-notice-banner.show { display: flex; }
@@ -4330,15 +4619,119 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     width: min(520px, 94vw);
     max-height: 88vh;
     background: var(--sheet-bg);
-    backdrop-filter: saturate(180%) blur(28px);
     border-radius: 22px;
     border: 0.5px solid var(--sep);
     box-shadow: var(--shadow-lg);
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    animation: pop-in 0.22s var(--spring);
   }
+  .admin-input-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--fill-2);
+    border: 0.5px solid var(--sep-strong);
+    border-radius: 10px;
+    padding: 4px 8px 4px 11px;
+  }
+  .acct-chip-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--sub2);
+    flex-shrink: 0;
+    transition: background .2s ease;
+  }
+  .acct-chip-dot.online {
+    background: var(--green);
+    box-shadow: 0 0 0 2px rgba(40, 205, 65, 0.22);
+  }
+  .ai-phrases-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+    flex-wrap: wrap;
+  }
+  .ai-phrases-lbl {
+    font-size: 11px;
+    color: var(--sub);
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .phrase-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--fill-2);
+    border: 0.5px solid var(--sep-strong);
+    border-radius: 999px;
+    padding: 3px 8px;
+    font-size: 11.5px;
+    color: var(--text);
+    max-width: 240px;
+  }
+  .phrase-chip-btn {
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    padding: 0;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 190px;
+  }
+  .phrase-del {
+    background: none;
+    border: none;
+    color: var(--sub);
+    font-size: 13px;
+    line-height: 1;
+    padding: 0 2px;
+    cursor: pointer;
+    border-radius: 50%;
+  }
+  .phrase-del:hover {
+    color: var(--red);
+  }
+  .acct-status-card {
+    background: var(--fill-2);
+    border: 0.5px solid var(--sep-strong);
+    border-radius: 14px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .admin-input-wrap input {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    padding: 5px 0;
+    outline: none;
+    user-select: text;
+  }
+  .admin-eye-btn {
+    border: none;
+    background: transparent;
+    color: var(--sub);
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .admin-eye-btn:hover { background: var(--fill); color: var(--text); }
   .card-modal.wide { width: min(1160px, 95vw); height: min(820px, 90vh); }
   .modal-head {
     display: flex;
@@ -4461,9 +4854,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.9.2" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.9.3" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.9.2</span>
+          <span class="ver-pill" id="verBadge">v2.9.3</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -4519,6 +4912,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
 
         <div class="nav-actions">
+          <button class="member-chip-btn" id="cloudAccountBtn" type="button" title="可选登录云端同步账号：换电脑自动同步设置与 AI 话术；不登录直接按本地默认使用">
+            <span class="acct-chip-dot" id="acctNavDot"></span>
+            <span class="member-chip-name" id="acctNavLabel">账号同步</span>
+          </button>
           <button class="member-chip-btn" id="memberProfileBtn" type="button" title="设置唯一昵称、头像及多人防撞联机（所有人名字不可重复）">
             <img class="member-mini-avatar" id="memberMiniAvatar" src="" alt="" />
             <span id="memberMiniName">设置昵称</span>
@@ -4850,7 +5247,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               <div class="ai-qa-bar" id="aiConfigTplBar" style="margin-bottom:4px;">
                 <button class="ai-style-chip" type="button" data-ai-tpl="帮我设置每周一到周五 9点到18点每2小时把昨天数据静音自动发送到「目标群名」">模板：工作日定时发</button>
                 <button class="ai-style-chip" type="button" data-ai-tpl="帮我设置每天上午 09:30 把昨天数据静音自动发送到「文件小助手」，粘贴等待 5 秒">模板：每天定点发昨天</button>
-                <button class="ai-style-chip" type="button" data-ai-tpl="帮我设置每周一、周三、周五 10点到20点每2小时发送，L4单元格写入「核心组」，发到「数据日报群」">模板：自选星期+写格位</button>
+                <button class="ai-style-chip" type="button" data-ai-tpl="帮我设置每周一、周三、周五 10点到20点每2小时发送，L3单元格写入「慕杰组」，发到「数据日报群」">模板：自选星期+写格位</button>
                 <button class="ai-style-chip" type="button" data-ai-tpl="帮我把钉钉目标群改成「运营群1、运营群2」，粘贴前等待 4 秒并开启静音发送">模板：改群名与等待秒</button>
               </div>
               <div class="ai-qa-bar" id="aiQuickQaBar">
@@ -4859,6 +5256,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <button class="ai-style-chip accent" type="button" data-ai-q="怎么自己定义在表格哪个单元格里写什么内容？">怎么自定义单元格</button>
                 <button class="ai-style-chip accent" type="button" data-ai-q="汇报一下当前软件配置状态与最新数据概况">当前状态概览</button>
                 <button class="ai-style-chip accent" type="button" data-ai-q="结合历史数据档案，对比各团队和前几名个人最近的数据表现">查团队/个人档案</button>
+              </div>
+              <div class="ai-phrases-wrap" id="aiCustomPhrasesWrap" style="display:none;">
+                <span class="ai-phrases-lbl">我的话术：</span>
+                <div class="ai-qa-bar" id="aiCustomPhrasesBar" style="margin-bottom:0;"></div>
               </div>
 
               <div class="ai-chat-feed" id="aiChatFeed">
@@ -4872,6 +5273,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
               <div class="ai-input-bar">
                 <input type="text" id="aiChatInput" placeholder="随时提问：你是谁 / 怎么自定义格位 / 某某某数据怎么样 / 总结今日表…" />
+                <button class="mini-pill" id="saveAiPhraseBtn" type="button" title="把输入框当前句子存为常用话术，登录账号后跨电脑自动同步">存话术</button>
                 <button class="ai-send-btn" id="aiSendBtn" type="button">发送</button>
               </div>
             </div>
@@ -5021,7 +5423,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   </div>
                   <div class="row-main">
                     <div class="row-title">粘贴完数据后写入更新时间</div>
-                    <div class="row-sub">对应 P4 最后更新时间 · 在 S4 写入精确到秒时间</div>
+                    <div class="row-sub">对应 P4 最后更新时间 · 在 R4 写入精确到秒时间</div>
                   </div>
                   <label class="ios-switch"><input type="checkbox" id="utEnabled" /><span class="ios-slider"></span></label>
                 </div>
@@ -5030,7 +5432,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <div class="ut-meta-row">
                       <div style="display:flex;align-items:center;gap:6px;">
                         <span class="pill-sep">格位</span>
-                        <input type="text" class="cell-badge-input" id="utCellInput" value="S4" placeholder="S4" />
+                        <input type="text" class="cell-badge-input" id="utCellInput" value="R4" placeholder="R4" />
                       </div>
                       <div class="mini-seg" id="utTimingSeg">
                         <button type="button" class="mini-seg-btn" data-val="paste">粘贴完数据后写</button>
@@ -5052,10 +5454,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
                 <div class="accordion-body tall" id="spAccordion">
                   <div class="quick-preset-bar" id="presetQuickAddBar">
-                    <button type="button" class="ai-style-chip" data-qcell="F2" data-qact="value" data-qval="全部模版(不含CS)" data-qlabel="筛选模版">+ F2 筛选模版</button>
-                    <button type="button" class="ai-style-chip" data-qcell="H4" data-qact="value" data-qval="空" data-qlabel="筛选短链">+ H4 筛选短链</button>
-                    <button type="button" class="ai-style-chip" data-qcell="I4" data-qact="clear" data-qval="" data-qlabel="减去短链">+ I4 减去短链</button>
-                    <button type="button" class="ai-style-chip" data-qcell="D4:E4" data-qact="clear" data-qval="" data-qlabel="清空范围">+ D4:E4 清空</button>
+                    <button type="button" class="ai-style-chip" data-qcell="D5" data-qact="clear" data-qval="" data-qlabel="整周周报">+ D5 整周周报(空)</button>
+                    <button type="button" class="ai-style-chip" data-qcell="L3" data-qact="value" data-qval="慕杰组" data-qlabel="需要标记的团队">+ L3 标记团队</button>
+                    <button type="button" class="ai-style-chip" data-qcell="Y3" data-qact="value" data-qval="排除所有模板" data-qlabel="排除模板">+ Y3 排除模板</button>
+                    <button type="button" class="ai-style-chip" data-qcell="Y4" data-qact="value" data-qval="减去短链" data-qlabel="减去短链">+ Y4 减去短链</button>
+                    <button type="button" class="ai-style-chip" data-qcell="Y5" data-qact="value" data-qval="当前筛选暗号" data-qlabel="筛选暗号">+ Y5 筛选暗号</button>
+                    <button type="button" class="ai-style-chip" data-qcell="AA2" data-qact="value" data-qval="备用,备用2,CS暗号" data-qlabel="排除暗号">+ AA2 排除暗号</button>
+                    <button type="button" class="ai-style-chip" data-qcell="AA5" data-qact="value" data-qval="全部在职组" data-qlabel="在职组范围">+ AA5 在职组范围</button>
                     <button type="button" class="ai-style-chip accent" data-qcell="" data-qact="now" data-qval="" data-qlabel="当前时间">+ 当前时间格</button>
                     <button type="button" class="ai-style-chip accent" data-qcell="" data-qact="formula" data-qval="=COUNTA(D8:D100)" data-qlabel="统计公式">+ 公式格(=)</button>
                     <button type="button" class="ai-style-chip accent" data-qcell="" data-qact="value" data-qval="" data-qlabel="自定义内容">+ 空白自定义</button>
@@ -5063,7 +5468,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   <div id="summaryPresetsList"></div>
                 </div>
               </div>
-              <div class="section-footer" id="spFooterTip">通过左上角名称框精准定位 D2 / D4 / E4 / L3 / L4 及 S4 更新时间（采用原生 Win32 Unicode 写入绝不乱码）</div>
+              <div class="section-footer" id="spFooterTip">通过左上角名称框精准定位 D3 / D4 / E4 / D5 / L3 / Y3 / Y4 / Y5 / AA2 / AA5 及 R4 更新时间（采用原生 Win32 Unicode 写入绝不乱码）</div>
             </div>
 
             <div class="section-wrap">
@@ -5362,6 +5767,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="bento-col">
             <div class="section-wrap">
               <div class="section-head">
+                <span>账号同步（可选）</span>
+              </div>
+              <div class="ios-group">
+                <div class="ios-row clickable" id="moreAcctRow">
+                  <div class="sf-badge sf-indigo">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                  </div>
+                  <div class="row-main">
+                    <div class="row-title" id="moreAcctTitle">未登录（当前直接按本地默认使用）</div>
+                    <div class="row-sub" id="moreAcctSub">登录后在其他电脑登录同一账号，设置、Luya 账号及 AI 话术习惯自动同步</div>
+                  </div>
+                  <div style="display:flex;gap:6px;flex-shrink:0;">
+                    <button type="button" class="mini-pill active" id="moreAcctActionBtn">登录/注册</button>
+                    <button type="button" class="mini-pill" id="moreAcctSyncBtn" style="display:none;">同步</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="section-wrap">
+              <div class="section-head">
                 <span>智能设置</span>
               </div>
               <div class="ios-group">
@@ -5390,9 +5816,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
                 <div class="ios-row compact-sep">
                   <div class="row-main">
-                    <div class="row-title" style="font-size:12.5px;">总结偏好</div>
+                    <div class="row-title" style="font-size:12.5px;">话术偏好</div>
                     <div class="rule-input-box" style="margin-top:5px;">
-                      <input type="text" id="aiCustomPrompt" placeholder="例如：每次总结都重点对比各组完成率与增量榜单" />
+                      <input type="text" id="aiCustomPrompt" placeholder="例如：每次总结都重点对比各组完成率与增量榜单（登录账号后跨电脑自动同步）" />
                     </div>
                   </div>
                 </div>
@@ -5733,6 +6159,54 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- 1.5 跨电脑账号登录与云端端到端同步弹窗（可选） -->
+  <div class="modal-mask" id="accountModalMask">
+    <div class="card-modal" style="width:min(460px,94vw);">
+      <div class="modal-head">
+        <div class="modal-title">账号与跨电脑同步（可选）</div>
+        <button class="mini-pill" id="acctCloseBtn" type="button">关闭</button>
+      </div>
+      <div class="modal-scroll">
+        <div style="font-size:12.5px;color:var(--sub);line-height:1.55;background:var(--fill-2);border:0.5px solid var(--sep);border-radius:12px;padding:9px 11px;">
+          <strong style="color:var(--text);">说明：</strong>
+          登录属于<strong>可选功能</strong>，不登录也可以直接按默认设置使用本软件；若在一台电脑登录后配置了排期、格位、Luya 账号、AI 话术与个人习惯，换另一台电脑登录同一账号，所有内容将自动加密同步过来。
+        </div>
+
+        <div id="acctLoggedBox" class="acct-status-card" style="display:none;">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+            <div>
+              <div style="font-size:12px;color:var(--sub);">当前已登录同步账号</div>
+              <div style="font-size:16px;font-weight:700;color:var(--text);" id="acctCurUser">—</div>
+            </div>
+            <span class="ver-pill" style="background:rgba(40,205,65,0.14);color:var(--green);">已开启端到端同步</span>
+          </div>
+          <div style="font-size:12px;color:var(--sub);" id="acctRevText">云端版本 #0</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">
+            <button type="button" class="pill-action-btn primary" id="acctSyncNowBtn" style="flex:1;">立即双向同步</button>
+            <button type="button" class="pill-action-btn" id="acctSwitchBtn">切换账号</button>
+            <button type="button" class="pill-action-btn" id="acctLogoutBtn" style="color:var(--red);">退出并恢复默认</button>
+          </div>
+        </div>
+
+        <div id="acctFormBox" style="display:flex;flex-direction:column;gap:9px;">
+          <div style="font-size:12px;color:var(--sub);">输入账号与密码即可登录；若该账号首次使用，将自动创建云端保险库并上传当前设置。</div>
+          <div class="rule-input-box">
+            <input type="text" id="acctNameInput" maxlength="24" placeholder="同步账号名（2-24位字母、数字、中文或下划线）" autocomplete="username" />
+          </div>
+          <div class="rule-input-box" style="display:flex;align-items:center;gap:6px;">
+            <input type="password" id="acctPassInput" maxlength="64" placeholder="同步密码（至少4位，换电脑时请记牢此密码）" autocomplete="current-password" style="flex:1;" />
+            <button type="button" class="eye-btn" id="toggleAcctPassEye" title="显示或隐藏密码">显示</button>
+          </div>
+          <div id="acctMsgBox" style="font-size:12px;color:var(--red);min-height:16px;"></div>
+          <div style="display:flex;gap:8px;">
+            <button type="button" class="pill-action-btn primary" id="acctLoginSubmitBtn" style="flex:1;">登录 / 注册并同步</button>
+            <button type="button" class="pill-action-btn" id="acctKeepGuestBtn">暂不登录(用默认)</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- 2. 多人撞车避让提示与自动排队弹窗 -->
   <div class="modal-mask" id="lockWaitModalMask">
     <div class="card-modal" style="width:min(440px,92vw);">
@@ -5793,8 +6267,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <div class="modal-scroll">
         <div style="font-size:12px;color:var(--sub);">仅限管理员本人进入，请验证身份信息。</div>
-        <input type="password" id="adminPasscodeInput" class="small-input" style="padding:8px 11px;font-size:13px;" autocomplete="new-password" placeholder="请输入管理员姓名" />
-        <input type="password" id="adminPasswordInput" class="small-input" style="padding:8px 11px;font-size:13px;" autocomplete="new-password" placeholder="请输入管理员密码" />
+        <div class="admin-input-wrap">
+          <input type="password" id="adminPasscodeInput" autocomplete="new-password" placeholder="请输入管理员姓名" />
+          <button type="button" class="admin-eye-btn" id="toggleAdminPasscodeEye" title="显示或隐藏管理员姓名" aria-label="显示或隐藏管理员姓名">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <div class="admin-input-wrap">
+          <input type="password" id="adminPasswordInput" autocomplete="new-password" placeholder="请输入管理员密码" />
+          <button type="button" class="admin-eye-btn" id="toggleAdminPasswordEye" title="显示或隐藏管理员密码" aria-label="显示或隐藏管理员密码">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
       </div>
       <div class="modal-foot">
         <button type="button" class="pill-action-btn primary" id="adminLoginBtn">解锁总管后台</button>
@@ -5994,11 +6478,16 @@ const SVG_CHEVRON = `<svg class="chevron-svg" viewBox="0 0 24 24" fill="none" st
 const WEEK_SHORT = ["一", "二", "三", "四", "五", "六", "日"];
 const WEEK_FULL = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 const DEFAULT_SUMMARY_PRESETS = [
-  { enabled: true, sheet: "数据汇总", cell: "D2", label: "查询日期", action: "today", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "" },
+  { enabled: true, sheet: "数据汇总", cell: "D3", label: "查询日期", action: "today", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "" },
   { enabled: true, sheet: "数据汇总", cell: "D4", label: "日期范围起始", action: "clear", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "" },
   { enabled: true, sheet: "数据汇总", cell: "E4", label: "日期范围结束", action: "clear", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "" },
-  { enabled: true, sheet: "数据汇总", cell: "L3", label: "参与计算小组", action: "value", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "宋磊组,娄慧珍组,江峰组,刘全泉组,潘立浩组,李俊鑫组,慕杰组" },
-  { enabled: true, sheet: "数据汇总", cell: "L4", label: "需要标记的团队", action: "value", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "慕杰组" },
+  { enabled: true, sheet: "数据汇总", cell: "D5", label: "整周周报", action: "clear", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "" },
+  { enabled: true, sheet: "数据汇总", cell: "L3", label: "需要标记的团队", action: "value", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "慕杰组" },
+  { enabled: true, sheet: "数据汇总", cell: "Y3", label: "排除模板", action: "value", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "排除所有模板" },
+  { enabled: true, sheet: "数据汇总", cell: "Y4", label: "减去短链", action: "value", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "减去短链" },
+  { enabled: true, sheet: "数据汇总", cell: "Y5", label: "筛选暗号", action: "value", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "当前筛选暗号" },
+  { enabled: true, sheet: "数据汇总", cell: "AA2", label: "排除暗号", action: "value", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "备用,备用2,CS暗号" },
+  { enabled: true, sheet: "数据汇总", cell: "AA5", label: "在职组范围", action: "value", date_fmt: "YYYY年M月D日", time_fmt: "full", day_offset: 0, cutoff_enabled: false, cutoff_hm: "09:00", before_cutoff_offset: -1, only_after_paste: false, value: "全部在职组" },
 ];
 
 let cfg = {};
@@ -6030,6 +6519,8 @@ let avatarPresets = [];
 let selectedAvatarUrl = "";
 let syncSettingsState = {};
 let adminToken = sessionStorage.getItem("sheetmate_admin_tok") || "";
+let cloudAccountState = { logged_in: false, account: "", rev: 0, last_synced_ts: 0, last_sync_str: "" };
+let _acctForceFormMode = false;
 let adminDashData = null;
 let adminActiveTab = "stats";
 let adminStatMemberId = "";
@@ -6060,6 +6551,41 @@ function safeAvatarUrl(rawUrl) {
 function safeExternalHttpUrl(rawUrl) {
   const s = String(rawUrl || "").trim();
   return /^https?:\/\/[^\s"'<>]+$/i.test(s) ? s : "";
+}
+function safeQrSvgMarkup(rawSvg) {
+  const fallback = "<span style='font-size:12px;color:#64748B;'>暂未生成二维码</span>";
+  const s = String(rawSvg || "").trim();
+  if (!s || !/^<svg[\s>]/i.test(s)) return fallback;
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(s, "image/svg+xml");
+    if (!doc || doc.querySelector("parsererror")) return fallback;
+    const root = doc.documentElement;
+    if (!root || String(root.nodeName).toLowerCase() !== "svg") return fallback;
+    const allowedTags = new Set(["svg", "g", "rect", "path", "circle", "polygon", "defs", "clippath", "title"]);
+    const allowedAttrs = new Set(["xmlns", "viewbox", "width", "height", "fill", "stroke", "stroke-width", "d", "x", "y", "rx", "ry", "cx", "cy", "r", "points", "id", "class", "transform", "shape-rendering", "fill-rule", "clip-rule"]);
+    const cleanNode = (el) => {
+      const tag = String(el.nodeName || "").toLowerCase();
+      if (!allowedTags.has(tag)) {
+        el.remove();
+        return;
+      }
+      for (const attr of Array.from(el.attributes || [])) {
+        const an = String(attr.name || "").toLowerCase();
+        const av = String(attr.value || "");
+        if (!allowedAttrs.has(an) || /javascript:|vbscript:|data:|expression\(/i.test(av)) {
+          el.removeAttribute(attr.name);
+        }
+      }
+      for (const ch of Array.from(el.children || [])) {
+        cleanNode(ch);
+      }
+    };
+    cleanNode(root);
+    return new XMLSerializer().serializeToString(root);
+  } catch (_e) {
+    return fallback;
+  }
 }
 function formatSafeMarkdown(raw) {
   const safeLines = cleanText(raw).split(/\r?\n/);
@@ -6279,9 +6805,9 @@ function ensureSummaryPresetsStruct() {
 }
 function ensureUpdateTimeStruct() {
   if (!cfg.update_time_cell || typeof cfg.update_time_cell !== "object") {
-    cfg.update_time_cell = { enabled: true, cell: "S4", only_after_paste: true };
+    cfg.update_time_cell = { enabled: true, cell: "R4", only_after_paste: true };
   }
-  if (!String(cfg.update_time_cell.cell || "").trim()) cfg.update_time_cell.cell = "S4";
+  if (!String(cfg.update_time_cell.cell || "").trim()) cfg.update_time_cell.cell = "R4";
   if (cfg.update_time_cell.enabled === undefined) cfg.update_time_cell.enabled = true;
   if (cfg.update_time_cell.only_after_paste === undefined) cfg.update_time_cell.only_after_paste = true;
   return cfg.update_time_cell;
@@ -6293,7 +6819,7 @@ function formatNowFullTimestampLocal() {
 function renderUpdateTimeControls() {
   const ut = ensureUpdateTimeStruct();
   const enabled = ut.enabled !== false;
-  const cell = String(ut.cell || "S4").trim().toUpperCase() || "S4";
+  const cell = String(ut.cell || "R4").trim().toUpperCase() || "R4";
   const pasteOnly = ut.only_after_paste !== false;
   $("utEnabled").checked = enabled;
   $("utConfigBox").style.display = enabled ? "block" : "none";
@@ -6306,10 +6832,11 @@ function renderUpdateTimeControls() {
 }
 function ensureAiStruct() {
   if (!cfg.ai_assistant || typeof cfg.ai_assistant !== "object") {
-    cfg.ai_assistant = { enabled: true, auto_diagnose: true, auto_heal: true, auto_attach_summary: false, attach_style: "brief", custom_summary_prompt: "", focus_team: "" };
+    cfg.ai_assistant = { enabled: true, auto_diagnose: true, auto_heal: true, auto_attach_summary: false, attach_style: "brief", custom_summary_prompt: "", custom_phrases: [], focus_team: "" };
   }
   if (cfg.ai_assistant.auto_heal === undefined) cfg.ai_assistant.auto_heal = true;
   if (cfg.ai_assistant.focus_team === undefined) cfg.ai_assistant.focus_team = "";
+  if (!Array.isArray(cfg.ai_assistant.custom_phrases)) cfg.ai_assistant.custom_phrases = [];
   return cfg.ai_assistant;
 }
 
@@ -6714,6 +7241,138 @@ function renderAiControls() {
   $("aiAutoDiagnose").checked = ai.auto_diagnose !== false;
   $("aiAutoHeal").checked = ai.auto_heal !== false;
   $("aiCustomPrompt").value = ai.custom_summary_prompt || "";
+  renderAiCustomPhrases();
+}
+
+function renderAiCustomPhrases() {
+  const wrap = $("aiCustomPhrasesWrap");
+  const bar = $("aiCustomPhrasesBar");
+  if (!wrap || !bar) return;
+  const ai = ensureAiStruct();
+  const list = Array.isArray(ai.custom_phrases)
+    ? ai.custom_phrases.map((x) => String(x || "").trim()).filter(Boolean)
+    : [];
+  bar.innerHTML = "";
+  if (!list.length) {
+    wrap.style.display = "none";
+    return;
+  }
+  wrap.style.display = "flex";
+  list.forEach((phrase, idx) => {
+    const chip = document.createElement("div");
+    chip.className = "phrase-chip";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "phrase-chip-btn";
+    btn.title = phrase;
+    btn.textContent = phrase;
+    btn.onclick = () => sendAiSummary("custom", phrase);
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "phrase-del";
+    del.title = "删除这条常用话术";
+    del.textContent = "\u00D7";
+    del.onclick = () => {
+      ensureAiStruct().custom_phrases.splice(idx, 1);
+      renderAiCustomPhrases();
+      scheduleSave(true);
+    };
+    chip.appendChild(btn);
+    chip.appendChild(del);
+    bar.appendChild(chip);
+  });
+}
+
+function saveCurrentAiPhrase() {
+  const inp = $("aiChatInput");
+  if (!inp) return;
+  const text = inp.value.trim();
+  if (!text) {
+    showToast("请先在输入框写一句常用话术，再点「存话术」");
+    inp.focus();
+    return;
+  }
+  const clipped = text.slice(0, 120);
+  const ai = ensureAiStruct();
+  const list = Array.isArray(ai.custom_phrases) ? ai.custom_phrases.slice() : [];
+  if (list.includes(clipped)) {
+    showToast("这条常用话术已经保存过了");
+    return;
+  }
+  list.unshift(clipped);
+  ai.custom_phrases = list.slice(0, 16);
+  renderAiCustomPhrases();
+  scheduleSave(true);
+  showToast("已保存为常用话术，登录账号后可跨电脑同步");
+}
+
+function updateAccountSyncUI(st) {
+  const s = st && typeof st === "object" ? st : cloudAccountState;
+  cloudAccountState = {
+    logged_in: Boolean(s.logged_in),
+    account: String(s.account || ""),
+    rev: Number(s.rev || 0),
+    last_synced_ts: Number(s.last_synced_ts || 0),
+    last_sync_str: String(s.last_sync_str || ""),
+  };
+  const logged = cloudAccountState.logged_in && Boolean(cloudAccountState.account);
+  if ($("acctNavDot")) $("acctNavDot").classList.toggle("online", logged);
+  if ($("acctNavLabel")) $("acctNavLabel").textContent = logged ? cloudAccountState.account : "未登录(默认)";
+  if ($("moreAcctTitle")) {
+    $("moreAcctTitle").textContent = logged ? `已登录账号：${cloudAccountState.account}` : "未登录（当前直接按本地默认使用）";
+  }
+  if ($("moreAcctSub")) {
+    $("moreAcctSub").textContent = logged
+      ? `云端版本 #${cloudAccountState.rev || 1}${cloudAccountState.last_sync_str ? (" · 最近同步 " + cloudAccountState.last_sync_str) : ""}（设置、Luya 账号及 AI 话术习惯跨电脑自动同步）`
+      : "登录后在其他电脑登录同一账号，设置、Luya 账号及 AI 话术习惯自动同步";
+  }
+  if ($("moreAcctActionBtn")) $("moreAcctActionBtn").textContent = logged ? "账号管理" : "登录/注册";
+  if ($("moreAcctSyncBtn")) $("moreAcctSyncBtn").style.display = logged ? "inline-flex" : "none";
+  if ($("acctCurUser")) $("acctCurUser").textContent = cloudAccountState.account || "—";
+  if ($("acctRevText")) {
+    $("acctRevText").textContent = `云端版本 #${cloudAccountState.rev || 1}${cloudAccountState.last_sync_str ? (" · 最近同步 " + cloudAccountState.last_sync_str) : ""}`;
+  }
+  if ($("acctLoggedBox") && $("acctFormBox")) {
+    const showLogged = logged && !_acctForceFormMode;
+    $("acctLoggedBox").style.display = showLogged ? "flex" : "none";
+    $("acctFormBox").style.display = showLogged ? "none" : "flex";
+  }
+}
+
+function openAccountModal() {
+  _acctForceFormMode = false;
+  if ($("acctMsgBox")) $("acctMsgBox").textContent = "";
+  if ($("acctPassInput")) $("acctPassInput").value = "";
+  updateAccountSyncUI(cloudAccountState);
+  if ($("accountModalMask")) $("accountModalMask").classList.add("show");
+  if (!cloudAccountState.logged_in && $("acctNameInput")) {
+    setTimeout(() => $("acctNameInput").focus(), 40);
+  }
+}
+
+function applyAccountSyncResponse(res, fallbackMsg = "") {
+  if (!res || typeof res !== "object") return;
+  if (res.config) cfg = res.config;
+  if (Array.isArray(res.timetable)) latestTimetable = res.timetable;
+  if (res.ai_meta) {
+    aiStyles = Array.isArray(res.ai_meta.styles) ? res.ai_meta.styles : aiStyles;
+    aiCandidateTeams = Array.isArray(res.ai_meta.candidate_teams) ? res.ai_meta.candidate_teams : aiCandidateTeams;
+    if (Array.isArray(res.ai_meta.history)) {
+      cachedChatHistory = res.ai_meta.history;
+      renderAiChatFeed(cachedChatHistory);
+    }
+    if (res.ai_meta.data_brief) applyDataBriefUI(res.ai_meta.data_brief);
+  }
+  if (res.profile) {
+    memberProfile = res.profile;
+    updateMemberTopChip(res.profile);
+  }
+  if (res.cloud_account) updateAccountSyncUI(res.cloud_account);
+  if (cfg) {
+    renderConfig();
+    renderTimetable(latestTimetable, true);
+  }
+  if (res.message || fallbackMsg) showToast(res.message || fallbackMsg);
 }
 
 function renderDingtalkDatePanel() {
@@ -7132,15 +7791,35 @@ function _isPointOverrideEmpty(ov) {
   );
 }
 
-function renderTimetable(tt) {
+let lastTimetableSig = "";
+function renderTimetable(tt, forceRebuild = false) {
   if (Array.isArray(tt)) latestTimetable = tt;
   const list = $("timetableList");
-  list.innerHTML = "";
   const dayOk = isRunDayAllowedLocal(cfg);
   $("ttSummaryText").textContent = `共 ${latestTimetable.length} 轮${dayOk ? " · 今日运行" : " · 今日休眠"}`;
 
   const hasOv = Boolean(cfg.point_overrides && Object.keys(cfg.point_overrides).length > 0);
   $("resetAllPointsBtn").style.display = hasOv ? "inline-flex" : "none";
+
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const enabledTargetCount = getEnabledTargetsLocal().length;
+  const nextPt = dayOk ? latestTimetable.find((it) => it && it.min > nowMin) : null;
+  const ttSig = JSON.stringify({
+    len: latestTimetable.length,
+    dayOk,
+    tcnt: enabledTargetCount,
+    next: nextPt ? nextPt.time : "",
+    dayMode: cfg.day_mode || "daily",
+    cdays: cfg.custom_days || [],
+    ov: cfg.point_overrides || {},
+    items: latestTimetable.map((it) => [it.time, it.do_dingtalk, it.do_capture, it.do_silent, it.sheet_offset_effective, it.msg_preview]),
+  });
+  if (!forceRebuild && ttSig === lastTimetableSig) {
+    return;
+  }
+  lastTimetableSig = ttSig;
+  list.innerHTML = "";
 
   if (!latestTimetable.length) {
     const empty = document.createElement("div");
@@ -7150,12 +7829,10 @@ function renderTimetable(tt) {
     return;
   }
 
-  const now = new Date();
-  const nowMin = now.getHours() * 60 + now.getMinutes();
   const hasAnyFutureDay = (cfg.day_mode || "daily") !== "custom" || (Array.isArray(cfg.custom_days) && cfg.custom_days.length > 0);
-  const hasLaterToday = dayOk && latestTimetable.some((it) => it.min > nowMin);
-  const enabledTargetCount = getEnabledTargetsLocal().length;
+  const hasLaterToday = dayOk && Boolean(nextPt);
   let nextMarked = false;
+  const frag = document.createDocumentFragment();
 
   latestTimetable.forEach((item, idx) => {
     const row = document.createElement("div");
@@ -7275,8 +7952,9 @@ function renderTimetable(tt) {
     row.appendChild(badges);
     row.appendChild(rightCtrl);
     row.onclick = () => openPointModal(item);
-    list.appendChild(row);
+    frag.appendChild(row);
   });
+  list.appendChild(frag);
 }
 
 function _applyOvToLiveTimetable(hm, ovObj) {
@@ -7432,7 +8110,7 @@ function renderHomeCellChips(sp, ut, curHm) {
   wrap.innerHTML = "";
   const active = (sp.items || []).filter((it) => it && it.enabled !== false && String(it.cell || "").trim());
   const cards = [];
-  for (const it of active.slice(0, 7)) {
+  for (const it of active.slice(0, 14)) {
     const act = it.action || "value";
     let kind = "固定值";
     let val = it.value || "(空)";
@@ -7456,7 +8134,7 @@ function renderHomeCellChips(sp, ut, curHm) {
   }
   if (ut && ut.enabled !== false) {
     cards.push({
-      addr: `${ut.cell || "S4"} (最后更新)`,
+      addr: `${ut.cell || "R4"} (最后更新)`,
       kind: ut.only_after_paste === false ? "每次" : "贴数后",
       val: formatNowFullTimestampLocal(),
     });
@@ -7494,14 +8172,24 @@ function renderHomeCellChips(sp, ut, curHm) {
   }
 }
 
+let lastBriefSig = "";
+let lastPermsSig = "";
+let lastStepUiSig = "";
+function _setTextIfDiff(id, val) {
+  const el = $(id);
+  if (el && el.textContent !== val) el.textContent = val;
+}
 function applyDataBriefUI(brief) {
   if (!brief || typeof brief !== "object") return;
+  const sig = `${brief.archive_count || 0}|${brief.reg_val || ""}|${brief.reg_sub || ""}|${brief.top_val || ""}|${brief.top_sub || ""}`;
+  if (sig === lastBriefSig) return;
+  lastBriefSig = sig;
   const cnt = Number(brief.archive_count || 0);
-  if ($("hdrArchivePill")) $("hdrArchivePill").textContent = `数据档案 ${cnt} 轮`;
-  if ($("kpiRegVal") && brief.reg_val) $("kpiRegVal").textContent = brief.reg_val;
-  if ($("kpiRegSub") && brief.reg_sub) $("kpiRegSub").textContent = brief.reg_sub;
-  if ($("kpiTopVal") && brief.top_val) $("kpiTopVal").textContent = brief.top_val;
-  if ($("kpiTopSub") && brief.top_sub) $("kpiTopSub").textContent = brief.top_sub;
+  _setTextIfDiff("hdrArchivePill", `数据档案 ${cnt} 轮`);
+  if (brief.reg_val) _setTextIfDiff("kpiRegVal", brief.reg_val);
+  if (brief.reg_sub) _setTextIfDiff("kpiRegSub", brief.reg_sub);
+  if (brief.top_val) _setTextIfDiff("kpiTopVal", brief.top_val);
+  if (brief.top_sub) _setTextIfDiff("kpiTopSub", brief.top_sub);
 }
 
 function updateSummaries() {
@@ -7554,17 +8242,18 @@ function updateSummaries() {
   const sp = ensureSummaryPresetsStruct();
   const ut = ensureUpdateTimeStruct();
   renderHomeCellChips(sp, ut, curHm);
-  const utSuffix = ut.enabled !== false ? ` · ${ut.cell || "S4"}时间` : "";
+  const utCellLbl = ut.cell || "R4";
+  const utSuffix = ut.enabled !== false ? ` · ${utCellLbl}时间` : "";
   const spActive = sp.items.filter((it) => it && it.enabled !== false && String(it.cell || "").trim());
   if (sp.enabled === false) {
-    $("sumPresetsVal").textContent = ut.enabled !== false ? `仅写 ${ut.cell || "S4"}` : "已关闭";
-    $("sumPresetsSub").textContent = ut.enabled !== false ? `最后更新时间 -> ${ut.cell || "S4"}` : "截图前暂不校准";
+    $("sumPresetsVal").textContent = ut.enabled !== false ? `仅写 ${utCellLbl}` : "已关闭";
+    $("sumPresetsSub").textContent = ut.enabled !== false ? `最后更新时间 -> ${utCellLbl}` : "截图前暂不校准";
   } else {
     $("sumPresetsVal").textContent = `已启用 ${spActive.length} 项${utSuffix}`;
-    const d2 = spActive.find((x) => x.cell === "D2" && x.action === "today");
-    if (d2) {
-      const r2 = resolvePresetDayOffsetLocal(d2, curHm);
-      $("sumPresetsSub").textContent = `D2:${formatShiftedDateLocal(d2.date_fmt || "YYYY年M月D日", r2.off)} (${r2.src})`;
+    const d3 = spActive.find((x) => (x.cell === "D3" || x.cell === "D2") && x.action === "today");
+    if (d3) {
+      const r2 = resolvePresetDayOffsetLocal(d3, curHm);
+      $("sumPresetsSub").textContent = `${d3.cell}:${formatShiftedDateLocal(d3.date_fmt || "YYYY年M月D日", r2.off)} (${r2.src})`;
     } else {
       $("sumPresetsSub").textContent = spActive.length ? spActive.slice(0, 5).map((it) => it.cell).join("/") : "无启用格位";
     }
@@ -7640,7 +8329,7 @@ function collectConfigFromDOM() {
   cfg.summary_presets.enabled = $("spEnabled").checked;
   const ut = ensureUpdateTimeStruct();
   ut.enabled = $("utEnabled").checked;
-  ut.cell = $("utCellInput").value.replace(/\s+/g, "").toUpperCase() || "S4";
+  ut.cell = $("utCellInput").value.replace(/\s+/g, "").toUpperCase() || "R4";
   cfg.dt_suffix = $("dtSuffix").value.trim();
   cfg.wps_url = $("wpsUrl").value.trim();
   cfg.luya_user = $("luyaUser").value.trim();
@@ -7659,10 +8348,20 @@ function collectConfigFromDOM() {
   return cfg;
 }
 
-function scheduleSave(immediate = false) {
-  updateSummaries();
-  clearTimeout(saveTimer);
-  const runSave = async () => {
+let configDirty = false;
+let saveInFlight = false;
+let savePendingResync = false;
+let saveReqSeq = 0;
+
+async function _commitConfigSave(showSavedToast = false) {
+  if (saveInFlight) {
+    savePendingResync = true;
+    return;
+  }
+  saveInFlight = true;
+  configDirty = false;
+  const mySeq = ++saveReqSeq;
+  try {
     const data = collectConfigFromDOM();
     if (previewMemberUid && adminToken) {
       const r = await api("/api/admin/member", "POST", { user_id: previewMemberUid, config: data }, { "X-Admin-Token": adminToken });
@@ -7670,12 +8369,15 @@ function scheduleSave(immediate = false) {
       return;
     }
     const res = await api("/api/config", "POST", data);
+    if (savePendingResync || mySeq !== saveReqSeq) {
+      return;
+    }
     if (res && res.ok === false && res.config) {
       cfg = res.config;
       renderConfig();
       if (Array.isArray(res.timetable)) {
         latestTimetable = res.timetable;
-        renderTimetable(res.timetable);
+        renderTimetable(res.timetable, true);
       }
       showToast(res.message || "权限受限，已自动还原");
       return;
@@ -7683,17 +8385,44 @@ function scheduleSave(immediate = false) {
     if (res && res.ai_meta) {
       aiStyles = Array.isArray(res.ai_meta.styles) ? res.ai_meta.styles : aiStyles;
       aiCandidateTeams = Array.isArray(res.ai_meta.candidate_teams) ? res.ai_meta.candidate_teams : aiCandidateTeams;
-      renderAiControls();
     }
     if (res && Array.isArray(res.timetable)) {
       latestTimetable = res.timetable;
       renderTimetable(res.timetable);
-      updateSummaries();
     }
-    if (immediate) showToast("设置已保存");
-  };
-  if (immediate) runSave();
-  else saveTimer = setTimeout(runSave, 350);
+    if (showSavedToast) showToast("设置已保存");
+  } finally {
+    saveInFlight = false;
+    if (savePendingResync) {
+      savePendingResync = false;
+      setTimeout(() => { _commitConfigSave(false); }, 0);
+    }
+  }
+}
+
+function scheduleSave(immediate = false) {
+  configDirty = true;
+  updateSummaries();
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    _commitConfigSave(Boolean(immediate));
+  }, immediate ? 90 : 280);
+}
+
+async function flushPendingSave() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  if (configDirty || savePendingResync || saveInFlight) {
+    while (saveInFlight) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    if (configDirty || savePendingResync) {
+      await _commitConfigSave(false);
+    }
+  }
 }
 
 function formatCountdown(nextTs, serverNow) {
@@ -7703,6 +8432,42 @@ function formatCountdown(nextTs, serverNow) {
   const m = Math.floor(diff / 60);
   const s = diff % 60;
   return m > 0 ? `${m}分${s}秒后` : `${s}秒后`;
+}
+
+let lastMiniLogSig = "";
+function _createLogRowEl(item) {
+  const row = document.createElement("div");
+  row.className = "log-line";
+  const dot = document.createElement("span");
+  dot.className = `log-dot ${item.level || "info"}`;
+  const t = document.createElement("span");
+  t.className = "log-time";
+  t.textContent = item.time;
+  const msg = document.createElement("span");
+  msg.className = `log-msg ${item.level || "info"}`;
+  msg.textContent = cleanText(item.text) || item.text;
+  row.appendChild(dot);
+  row.appendChild(t);
+  row.appendChild(msg);
+  return row;
+}
+
+function _renderHomeMiniLogs() {
+  const miniBox = $("homeMiniLogs");
+  if (!miniBox) return;
+  const tail = allLogItems.slice(-7);
+  const sig = tail.map((x) => `${x.id}|${x.time}`).join(",");
+  if (sig === lastMiniLogSig && tail.length) return;
+  lastMiniLogSig = sig;
+  if (!tail.length) {
+    miniBox.innerHTML = `<div style="color:var(--sub);text-align:center;padding:18px 0;">运行启动后，这里会实时滚播关键步骤与数据归档记录</div>`;
+    return;
+  }
+  miniBox.innerHTML = "";
+  const mf = document.createDocumentFragment();
+  for (const it of tail) mf.appendChild(_createLogRowEl(it));
+  miniBox.appendChild(mf);
+  miniBox.scrollTop = miniBox.scrollHeight;
 }
 
 function renderLogs() {
@@ -7715,65 +8480,42 @@ function renderLogs() {
     emp.id = "logEmpty";
     emp.textContent = logFilterErrOnly ? "当前无异常或警告日志" : "暂无运行日志";
     box.appendChild(emp);
-    return;
+  } else {
+    const frag = document.createDocumentFragment();
+    for (const item of filtered) frag.appendChild(_createLogRowEl(item));
+    box.appendChild(frag);
+    if (autoScroll) scrollToLogBottom(false);
   }
-  const frag = document.createDocumentFragment();
-  for (const item of filtered) {
-    const row = document.createElement("div");
-    row.className = "log-line";
-    const dot = document.createElement("span");
-    dot.className = `log-dot ${item.level || "info"}`;
-    const t = document.createElement("span");
-    t.className = "log-time";
-    t.textContent = item.time;
-    const msg = document.createElement("span");
-    msg.className = `log-msg ${item.level || "info"}`;
-    msg.textContent = cleanText(item.text) || item.text;
-    row.appendChild(dot);
-    row.appendChild(t);
-    row.appendChild(msg);
-    frag.appendChild(row);
-  }
-  box.appendChild(frag);
-  if (autoScroll) scrollToLogBottom(false);
-
-  const miniBox = $("homeMiniLogs");
-  if (miniBox) {
-    const tail = allLogItems.slice(-7);
-    if (!tail.length) {
-      miniBox.innerHTML = `<div style="color:var(--sub);text-align:center;padding:18px 0;">运行启动后，这里会实时滚播关键步骤与数据归档记录</div>`;
-    } else {
-      miniBox.innerHTML = "";
-      const mf = document.createDocumentFragment();
-      for (const it of tail) {
-        const r = document.createElement("div");
-        r.className = "log-line";
-        const d = document.createElement("span");
-        d.className = `log-dot ${it.level || "info"}`;
-        const tm = document.createElement("span");
-        tm.className = "log-time";
-        tm.textContent = it.time;
-        const mg = document.createElement("span");
-        mg.className = `log-msg ${it.level || "info"}`;
-        mg.textContent = cleanText(it.text) || it.text;
-        r.appendChild(d);
-        r.appendChild(tm);
-        r.appendChild(mg);
-        mf.appendChild(r);
-      }
-      miniBox.appendChild(mf);
-      miniBox.scrollTop = miniBox.scrollHeight;
-    }
-  }
+  lastMiniLogSig = "";
+  _renderHomeMiniLogs();
 }
 
 function appendLogLines(items) {
   if (!items || !items.length) return;
+  const prevLen = allLogItems.length;
   for (const it of items) {
     allLogItems.push(it);
   }
-  if (allLogItems.length > 500) allLogItems = allLogItems.slice(-500);
-  renderLogs();
+  if (allLogItems.length > 500 || prevLen === 0 || $("logEmpty")) {
+    if (allLogItems.length > 500) allLogItems = allLogItems.slice(-500);
+    renderLogs();
+    return;
+  }
+  const box = $("logBox");
+  if (box) {
+    const frag = document.createDocumentFragment();
+    let added = 0;
+    for (const it of items) {
+      if (logFilterErrOnly && it.level !== "err" && it.level !== "warn") continue;
+      frag.appendChild(_createLogRowEl(it));
+      added++;
+    }
+    if (added > 0) {
+      box.appendChild(frag);
+      if (autoScroll) scrollToLogBottom(false);
+    }
+  }
+  _renderHomeMiniLogs();
 }
 
 let lastAiPanelSig = "";
@@ -7922,11 +8664,7 @@ async function sendAiSummary(styleId, rawPrompt) {
   $("aiSendBtn").disabled = true;
   renderAiChatFeed(cachedChatHistory, label);
   try {
-    if (saveTimer) {
-      clearTimeout(saveTimer);
-      saveTimer = null;
-      await api("/api/config", "POST", collectConfigFromDOM());
-    }
+    await flushPendingSave();
     const res = await api("/api/ai-summary", "POST", { style_id: styleId, prompt: promptText, action: "send" });
     if (res && res.updated_config) {
       cfg = res.updated_config;
@@ -8107,6 +8845,7 @@ async function pollState() {
       memberProfile = st.member_profile;
       updateMemberTopChip(st.member_profile);
     }
+    if (st.cloud_account) updateAccountSyncUI(st.cloud_account);
     if (st.sync_settings) syncSettingsState = st.sync_settings;
     if (!previewMemberUid && st.permissions) {
       applyPermissionsUI(st.permissions);
@@ -8116,9 +8855,23 @@ async function pollState() {
       if (fresh && fresh.config) {
         cfg = fresh.config;
         latestTimetable = Array.isArray(fresh.timetable) ? fresh.timetable : latestTimetable;
+        if (fresh.ai_meta) {
+          aiStyles = Array.isArray(fresh.ai_meta.styles) ? fresh.ai_meta.styles : aiStyles;
+          aiCandidateTeams = Array.isArray(fresh.ai_meta.candidate_teams) ? fresh.ai_meta.candidate_teams : aiCandidateTeams;
+          if (Array.isArray(fresh.ai_meta.history)) {
+            cachedChatHistory = fresh.ai_meta.history;
+            renderAiChatFeed(cachedChatHistory);
+          }
+          if (fresh.ai_meta.data_brief) applyDataBriefUI(fresh.ai_meta.data_brief);
+        }
+        if (fresh.profile) {
+          memberProfile = fresh.profile;
+          updateMemberTopChip(fresh.profile);
+        }
+        if (fresh.cloud_account) updateAccountSyncUI(fresh.cloud_account);
         renderConfig();
-        renderTimetable(latestTimetable);
-        showToast("已同步最新团队标准配置");
+        renderTimetable(latestTimetable, true);
+        showToast("已同步最新云端账号或团队设置");
       }
     }
     updateTeamLockBanner(st.lock_status, st.queue_status, st.member_profile);
@@ -8151,13 +8904,6 @@ function bindEvents() {
   for (const btn of $("tabbar").querySelectorAll(".tab-btn")) {
     btn.onclick = () => switchTab(btn.dataset.tab);
   }
-  for (const el of document.querySelectorAll(".cc-tile, .mini-stat-card")) {
-    el.addEventListener("mousemove", (ev) => {
-      const r = el.getBoundingClientRect();
-      el.style.setProperty("--mx", `${ev.clientX - r.left}px`);
-      el.style.setProperty("--my", `${ev.clientY - r.top}px`);
-    });
-  }
   for (const el of document.querySelectorAll("[data-jump]")) {
     el.onclick = () => switchTab(el.dataset.jump);
   }
@@ -8183,6 +8929,9 @@ function bindEvents() {
   }
   for (const b of document.querySelectorAll("#aiQuickQaBar [data-ai-q]")) {
     b.onclick = () => sendAiSummary("custom", b.dataset.aiQ || b.textContent);
+  }
+  if ($("saveAiPhraseBtn")) {
+    $("saveAiPhraseBtn").onclick = saveCurrentAiPhrase;
   }
   for (const qb of document.querySelectorAll("#presetQuickAddBar [data-qcell]")) {
     qb.onclick = () => {
@@ -8429,7 +9178,7 @@ function bindEvents() {
   };
   $("utCellInput").onblur = () => {
     const ut = ensureUpdateTimeStruct();
-    ut.cell = (ut.cell || "S4").toUpperCase();
+    ut.cell = (ut.cell || "R4").toUpperCase();
     renderUpdateTimeControls();
   };
   for (const b of $("utTimingSeg").querySelectorAll(".mini-seg-btn")) {
@@ -8640,27 +9389,39 @@ function bindEvents() {
   };
 
   $("btnNow").onclick = async () => {
-    await api("/api/config", "POST", collectConfigFromDOM());
-    const r = await api("/api/run-now", "POST");
-    if (!r.ok && r.locked) {
-      openLockWaitModal(r.locked_by, "full");
-      return;
+    $("btnNow").disabled = true;
+    showToast("正在启动全流程任务…");
+    try {
+      await flushPendingSave();
+      const r = await api("/api/run-now", "POST");
+      if (!r.ok && r.locked) {
+        openLockWaitModal(r.locked_by, "full");
+        return;
+      }
+      if (r && r.message) showToast(r.message);
+      pollState();
+    } finally {
+      if (!lastBusyState) $("btnNow").disabled = false;
     }
-    showToast(r.message);
-    pollState();
   };
   $("btnCapture").onclick = async () => {
-    await api("/api/config", "POST", collectConfigFromDOM());
-    const r = await api("/api/run-capture", "POST");
-    if (!r.ok && r.locked) {
-      openLockWaitModal(r.locked_by, "capture");
-      return;
+    $("btnCapture").disabled = true;
+    showToast("正在启动仅截图发送…");
+    try {
+      await flushPendingSave();
+      const r = await api("/api/run-capture", "POST");
+      if (!r.ok && r.locked) {
+        openLockWaitModal(r.locked_by, "capture");
+        return;
+      }
+      if (r && r.message) showToast(r.message);
+      pollState();
+    } finally {
+      if (!lastBusyState) $("btnCapture").disabled = false;
     }
-    showToast(r.message);
-    pollState();
   };
   $("btnSchedule").onclick = async () => {
-    await api("/api/config", "POST", collectConfigFromDOM());
+    await flushPendingSave();
     const r = await api("/api/schedule", "POST");
     if (!r.ok) { await iosAlert("无法开启计划", r.message); return; }
     showToast(r.message);
@@ -8773,17 +9534,30 @@ function bindEvents() {
   bindTeamCollabAndAdminEvents();
 }
 
+let _lastMemberChipName = "";
+let _lastMemberAvatarSrc = "";
 function updateMemberTopChip(prof) {
   if (!prof) return;
   if ($("memberMiniName")) {
     const nick = String(prof.nickname || "").trim();
-    $("memberMiniName").textContent = nick || (prof.initialized ? "小伙伴" : "设置昵称");
+    const disp = nick || (prof.initialized ? "小伙伴" : "设置昵称");
+    if (disp !== _lastMemberChipName) {
+      _lastMemberChipName = disp;
+      $("memberMiniName").textContent = disp;
+    }
   }
-  if ($("memberMiniAvatar")) $("memberMiniAvatar").src = safeAvatarUrl(prof.avatar);
+  const avUrl = safeAvatarUrl(prof.avatar);
+  if ($("memberMiniAvatar") && avUrl !== _lastMemberAvatarSrc) {
+    _lastMemberAvatarSrc = avUrl;
+    $("memberMiniAvatar").src = avUrl;
+  }
 }
 
 function applyPermissionsUI(perms) {
   const p = perms && typeof perms === "object" ? perms : {};
+  const sig = `${Boolean(lastBusyState)}|${p.can_run !== false}|${p.can_use_ai !== false}`;
+  if (sig === lastPermsSig) return;
+  lastPermsSig = sig;
   if ($("btnNow")) $("btnNow").disabled = Boolean(lastBusyState || p.can_run === false);
   if ($("btnCapture")) $("btnCapture").disabled = Boolean(lastBusyState || p.can_run === false);
   if ($("aiSendBtn")) $("aiSendBtn").disabled = (p.can_use_ai === false);
@@ -8933,8 +9707,12 @@ function openAdminEntry() {
   } else {
     $("adminPasscodeInput").value = "";
     $("adminPasswordInput").value = "";
+    $("adminPasscodeInput").type = "password";
+    $("adminPasswordInput").type = "password";
+    if ($("toggleAdminPasscodeEye")) $("toggleAdminPasscodeEye").innerHTML = SVG_EYE;
+    if ($("toggleAdminPasswordEye")) $("toggleAdminPasswordEye").innerHTML = SVG_EYE;
     $("adminAuthMask").classList.add("show");
-    setTimeout(() => $("adminPasscodeInput").focus(), 60);
+    setTimeout(() => $("adminPasscodeInput").focus(), 40);
   }
 }
 
@@ -9385,6 +10163,105 @@ function bindTeamCollabAndAdminEvents() {
     $("profileModalMask").classList.remove("show");
   };
   $("memberProfileBtn").onclick = openProfileModal;
+  if ($("cloudAccountBtn")) $("cloudAccountBtn").onclick = openAccountModal;
+  if ($("moreAcctRow")) {
+    $("moreAcctRow").onclick = (ev) => {
+      if (ev.target && ev.target.closest("#moreAcctSyncBtn")) return;
+      openAccountModal();
+    };
+  }
+  if ($("moreAcctActionBtn")) $("moreAcctActionBtn").onclick = (ev) => { ev.stopPropagation(); openAccountModal(); };
+  if ($("acctCloseBtn")) $("acctCloseBtn").onclick = () => $("accountModalMask").classList.remove("show");
+  if ($("acctKeepGuestBtn")) $("acctKeepGuestBtn").onclick = () => $("accountModalMask").classList.remove("show");
+  if ($("accountModalMask")) {
+    $("accountModalMask").addEventListener("click", (ev) => {
+      if (ev.target === $("accountModalMask")) $("accountModalMask").classList.remove("show");
+    });
+  }
+  if ($("toggleAcctPassEye") && $("acctPassInput")) {
+    $("toggleAcctPassEye").onclick = () => {
+      const hidden = $("acctPassInput").type === "password";
+      $("acctPassInput").type = hidden ? "text" : "password";
+      $("toggleAcctPassEye").textContent = hidden ? "隐藏" : "显示";
+    };
+  }
+  if ($("acctSwitchBtn")) {
+    $("acctSwitchBtn").onclick = () => {
+      _acctForceFormMode = true;
+      if ($("acctMsgBox")) $("acctMsgBox").textContent = "";
+      updateAccountSyncUI(cloudAccountState);
+      if ($("acctNameInput")) { $("acctNameInput").value = ""; $("acctNameInput").focus(); }
+      if ($("acctPassInput")) $("acctPassInput").value = "";
+    };
+  }
+  const submitAccountLogin = async () => {
+    const acct = $("acctNameInput") ? $("acctNameInput").value.trim() : "";
+    const pw = $("acctPassInput") ? $("acctPassInput").value : "";
+    if ($("acctMsgBox")) $("acctMsgBox").textContent = "";
+    if (!acct || acct.length < 2) {
+      if ($("acctMsgBox")) $("acctMsgBox").textContent = "请输入至少 2 位账号名";
+      if ($("acctNameInput")) $("acctNameInput").focus();
+      return;
+    }
+    if (!pw || pw.length < 4) {
+      if ($("acctMsgBox")) $("acctMsgBox").textContent = "请输入至少 4 位同步密码";
+      if ($("acctPassInput")) $("acctPassInput").focus();
+      return;
+    }
+    const btn = $("acctLoginSubmitBtn");
+    const oldTxt = btn ? btn.textContent : "";
+    if (btn) { btn.disabled = true; btn.textContent = "正在验证同步..."; }
+    try {
+      const res = await api("/api/account/login", "POST", { account: acct, password: pw }, null, 15000);
+      if (res && res.ok) {
+        _acctForceFormMode = false;
+        if ($("acctPassInput")) $("acctPassInput").value = "";
+        applyAccountSyncResponse(res, "登录并同步成功");
+        $("accountModalMask").classList.remove("show");
+      } else {
+        const msg = (res && res.message) || "账号或密码不正确";
+        if ($("acctMsgBox")) $("acctMsgBox").textContent = msg;
+        showToast(msg);
+      }
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = oldTxt || "登录 / 注册并同步"; }
+    }
+  };
+  if ($("acctLoginSubmitBtn")) $("acctLoginSubmitBtn").onclick = submitAccountLogin;
+  if ($("acctPassInput")) {
+    $("acctPassInput").addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); submitAccountLogin(); }
+    });
+  }
+  const triggerAccountSync = async () => {
+    if ($("moreAcctSyncBtn")) $("moreAcctSyncBtn").disabled = true;
+    if ($("acctSyncNowBtn")) $("acctSyncNowBtn").disabled = true;
+    try {
+      const res = await api("/api/account/sync", "POST", { direction: "auto" }, null, 15000);
+      if (res && res.ok) {
+        applyAccountSyncResponse(res, "云端同步完成");
+      } else {
+        showToast((res && res.message) || "同步失败，请稍后重试");
+      }
+    } finally {
+      if ($("moreAcctSyncBtn")) $("moreAcctSyncBtn").disabled = false;
+      if ($("acctSyncNowBtn")) $("acctSyncNowBtn").disabled = false;
+    }
+  };
+  if ($("moreAcctSyncBtn")) $("moreAcctSyncBtn").onclick = (ev) => { ev.stopPropagation(); triggerAccountSync(); };
+  if ($("acctSyncNowBtn")) $("acctSyncNowBtn").onclick = triggerAccountSync;
+  if ($("acctLogoutBtn")) {
+    $("acctLogoutBtn").onclick = async () => {
+      const res = await api("/api/account/logout", "POST", {}, null, 8000);
+      if (res && res.ok) {
+        _acctForceFormMode = false;
+        applyAccountSyncResponse(res, "已退出同步账号并恢复默认本地模式");
+        $("accountModalMask").classList.remove("show");
+      } else {
+        showToast((res && res.message) || "退出失败");
+      }
+    };
+  }
   $("profileCloseBtn").onclick = closeProfileModalSmart;
   $("profileModalMask").addEventListener("click", (ev) => {
     if (ev.target === $("profileModalMask")) closeProfileModalSmart();
@@ -9447,7 +10324,7 @@ function bindTeamCollabAndAdminEvents() {
       $("mobilePinInput").value = info.remote_password || "";
     }
     if ($("mobileQrBox")) {
-      $("mobileQrBox").innerHTML = info.qr_svg || "<span style='font-size:12px;color:#64748B;'>暂未生成二维码</span>";
+      $("mobileQrBox").innerHTML = safeQrSvgMarkup(info.qr_svg);
     }
     if ($("cloudRelayStatusBadge") && $("mobileCloudRelayTip")) {
       if (!info.local_nick) {
@@ -9642,15 +10519,32 @@ function bindTeamCollabAndAdminEvents() {
       openAdminEntry();
     }
   });
+  const bindAdminEye = (btnId, inpId) => {
+    const eb = $(btnId);
+    const ip = $(inpId);
+    if (!eb || !ip) return;
+    eb.innerHTML = SVG_EYE;
+    eb.onclick = () => {
+      const show = ip.type === "password";
+      ip.type = show ? "text" : "password";
+      eb.innerHTML = show ? SVG_EYE_OFF : SVG_EYE;
+    };
+  };
+  bindAdminEye("toggleAdminPasscodeEye", "adminPasscodeInput");
+  bindAdminEye("toggleAdminPasswordEye", "adminPasswordInput");
   $("adminAuthCloseBtn").onclick = () => {
     $("adminPasscodeInput").value = "";
     $("adminPasswordInput").value = "";
+    $("adminPasscodeInput").type = "password";
+    $("adminPasswordInput").type = "password";
+    if ($("toggleAdminPasscodeEye")) $("toggleAdminPasscodeEye").innerHTML = SVG_EYE;
+    if ($("toggleAdminPasswordEye")) $("toggleAdminPasswordEye").innerHTML = SVG_EYE;
     $("adminAuthMask").classList.remove("show");
   };
   $("adminLoginBtn").onclick = async () => {
     const r = await api("/api/admin/login", "POST", {
-      passcode: $("adminPasscodeInput").value,
-      password: $("adminPasswordInput").value,
+      passcode: $("adminPasscodeInput").value.trim(),
+      password: $("adminPasswordInput").value.trim(),
     });
     if (!r || !r.ok) {
       showToast((r && r.message) || "管理员姓名或密码不正确");
@@ -9658,6 +10552,8 @@ function bindTeamCollabAndAdminEvents() {
     }
     $("adminPasscodeInput").value = "";
     $("adminPasswordInput").value = "";
+    $("adminPasscodeInput").type = "password";
+    $("adminPasswordInput").type = "password";
     adminToken = r.admin_token;
     sessionStorage.setItem("sheetmate_admin_tok", adminToken);
     $("adminAuthMask").classList.remove("show");
@@ -9838,100 +10734,19 @@ function setCatMascotMood(mood, durationMs = 0) {
 function initMascotLifeEngine() {
   const btn = $("catMascotBtn");
   const svg = $("catMascotSvg");
-  const pupL = $("catPupilL");
-  const pupR = $("catPupilR");
   if (!btn || !svg) return;
 
-  let startTs = performance.now();
-  let boost = 0;
-  const stepMotion = (now) => {
-    if (document.hidden) {
-      requestAnimationFrame(stepMotion);
-      return;
-    }
-    const t = (now - startTs) * 0.001;
-    // 多组互质频率三角波叠加，保证小猫悬浮/微倾轨迹无限不循环
-    const dx = Math.sin(t * 0.73) * 1.65 + Math.sin(t * 1.91) * 0.75;
-    const dy = Math.sin(t * 1.13) * 2.15 + Math.cos(t * 2.67) * 0.85 - boost * 4.2;
-    const rot = Math.sin(t * 0.59) * 3.8 + Math.sin(t * 1.79) * 1.7;
-    const sc = 1 + Math.sin(t * 1.37) * 0.024 + boost * 0.09;
-    boost *= 0.9;
-    svg.style.transform = `translate3d(${dx.toFixed(2)}px, ${dy.toFixed(2)}px, 0) rotate(${rot.toFixed(2)}deg) scale(${sc.toFixed(3)})`;
-    requestAnimationFrame(stepMotion);
-  };
-  requestAnimationFrame(stepMotion);
-
-  // 随机单次/双击眨眼与左右抖耳
-  const scheduleBlink = () => {
-    const waitMs = 2100 + Math.random() * 4200;
-    setTimeout(() => {
-      btn.classList.add("is-blinking");
-      setTimeout(() => {
-        btn.classList.remove("is-blinking");
-        if (Math.random() < 0.28) {
-          setTimeout(() => {
-            btn.classList.add("is-blinking");
-            setTimeout(() => btn.classList.remove("is-blinking"), 95);
-          }, 130);
-        }
-      }, 115);
-      scheduleBlink();
-    }, waitMs);
-  };
-  scheduleBlink();
-
-  const scheduleTwitch = () => {
-    const waitMs = 2800 + Math.random() * 4800;
-    setTimeout(() => {
-      const cls = Math.random() < 0.5 ? "twitch-l" : "twitch-r";
-      btn.classList.add(cls);
-      setTimeout(() => btn.classList.remove(cls), 360);
-      scheduleTwitch();
-    }, waitMs);
-  };
-  scheduleTwitch();
-
-  const moodList = ["happy", "curious", "wink", "cheer", "think", "love", "cool", "sleepy"];
-  const scheduleMoodShift = () => {
-    const waitMs = 5500 + Math.random() * 7500;
-    setTimeout(() => {
-      const nxt = moodList[Math.floor(Math.random() * moodList.length)];
-      setCatMascotMood(nxt, 3600 + Math.random() * 2400);
-      scheduleMoodShift();
-    }, waitMs);
-  };
-  scheduleMoodShift();
-
-  // 瞳孔跟随光标方向
-  window.addEventListener("mousemove", (ev) => {
-    if (!pupL || !pupR) return;
-    const rect = btn.getBoundingClientRect();
-    if (!rect.width) return;
-    const cx = rect.left + rect.width * 0.5;
-    const cy = rect.top + rect.height * 0.5;
-    const angle = Math.atan2(ev.clientY - cy, ev.clientX - cx);
-    const dist = Math.min(1, Math.hypot(ev.clientX - cx, ev.clientY - cy) / 260);
-    const ox = Math.cos(angle) * 1.45 * dist;
-    const oy = Math.sin(angle) * 1.25 * dist;
-    pupL.setAttribute("cx", (17.8 + ox).toFixed(2));
-    pupL.setAttribute("cy", (26.2 + oy).toFixed(2));
-    pupR.setAttribute("cx", (30.2 + ox).toFixed(2));
-    pupR.setAttribute("cy", (26.2 + oy).toFixed(2));
-  }, { passive: true });
-
   btn.onclick = () => {
-    boost = 1.0;
     const cls = Math.random() < 0.5 ? "twitch-l" : "twitch-r";
     btn.classList.add(cls);
-    setTimeout(() => btn.classList.remove(cls), 380);
+    setTimeout(() => btn.classList.remove(cls), 260);
     const altMoods = ["cheer", "love", "wink", "cool"];
-    setCatMascotMood(altMoods[Math.floor(Math.random() * altMoods.length)], 4500);
+    setCatMascotMood(altMoods[Math.floor(Math.random() * altMoods.length)], 3200);
     loadStartupGreeting(true);
   };
   if ($("aiGreetingNextBtn")) {
     $("aiGreetingNextBtn").onclick = () => {
-      boost = 0.85;
-      setCatMascotMood("love", 4200);
+      setCatMascotMood("love", 3200);
       loadStartupGreeting(true);
     };
   }
@@ -9996,12 +10811,19 @@ async function loadStartupGreeting(force = false) {
     memberProfile = data.profile;
     updateMemberTopChip(data.profile);
   }
+  if (data.cloud_account) updateAccountSyncUI(data.cloud_account);
   if (Array.isArray(data.presets)) avatarPresets = data.presets;
   if (data.sync_settings) syncSettingsState = data.sync_settings;
   renderConfig();
   renderTimetable(latestTimetable);
   await pollState();
-  setInterval(pollState, 900);
+  const scheduleNextPoll = () => {
+    setTimeout(async () => {
+      if (!document.hidden) await pollState();
+      scheduleNextPoll();
+    }, lastBusyState ? 800 : 1200);
+  };
+  scheduleNextPoll();
   setTimeout(() => loadStartupGreeting(false), 350);
   if (memberProfile && !memberProfile.initialized) {
     setTimeout(() => openProfileModal(), 500);
@@ -10118,8 +10940,13 @@ def _make_handler(ctrl, token):
                     "config": ctrl.get_public_config(),
                     "timetable": ctrl.get_timetable(),
                     "ai_meta": ctrl.get_ai_meta(),
+                    "cloud_account": ctrl.get_account_status_payload(),
                     **(ctrl.get_profile_payload() if hasattr(ctrl, "get_profile_payload") else {}),
                 })
+                return
+
+            if parsed.path == "/api/account/status":
+                self._send_json({"ok": True, "cloud_account": ctrl.get_account_status_payload()})
                 return
 
             if parsed.path == "/api/ai-greeting":
@@ -10287,6 +11114,21 @@ def _make_handler(ctrl, token):
                 self._send_json(ctrl.update_profile_payload(body))
                 return
 
+            if parsed.path == "/api/account/login":
+                body = self._read_json()
+                c_ip = str(self.client_address[0] if self.client_address else "local")
+                self._send_json(ctrl.account_login_payload(body, client_id=c_ip))
+                return
+
+            if parsed.path == "/api/account/sync":
+                body = self._read_json()
+                self._send_json(ctrl.account_sync_payload(body))
+                return
+
+            if parsed.path == "/api/account/logout":
+                self._send_json(ctrl.account_logout_payload())
+                return
+
             if parsed.path == "/api/sync-config":
                 atok = self.headers.get("X-Admin-Token") or ""
                 if not ctrl.admin_is_authed(atok):
@@ -10447,6 +11289,21 @@ def show_settings_window(app):
             pass
         try:
             app.request_stop()
+        except Exception:
+            pass
+        try:
+            if getattr(ctrl, "_holds_team_lock", False) and getattr(ctrl, "hub", None) is not None:
+                ctrl.hub.release_run_lock()
+        except Exception:
+            pass
+        try:
+            if hasattr(ctrl, "flush_account_vault_sync"):
+                ctrl.flush_account_vault_sync()
+        except Exception:
+            pass
+        try:
+            if getattr(ctrl, "hub", None) is not None and hasattr(ctrl.hub, "stop_center_server"):
+                ctrl.hub.stop_center_server()
         except Exception:
             pass
         try:
