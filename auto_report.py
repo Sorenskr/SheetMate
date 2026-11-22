@@ -304,9 +304,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.9.1"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.9.0","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.9.1","url":"新版exe的下载直链"}
 DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
 GEMINI_MODEL_CANDIDATES = (
     "gemini-flash-latest",
@@ -324,6 +324,8 @@ _stop_requested = False
 _pause_requested = False
 _waiting_recovery = False
 _recovery_choice = None
+_auto_confirmed_recovery_titles = set()
+_dt_logged_in_user_cache = {"name": "", "ts": 0.0}
 _runtime_callback = None
 _spotlight_callback = None
 _latest_round_spotlight = None
@@ -746,6 +748,7 @@ def reset_stop():
         _waiting_recovery = False
         _recovery_choice = None
         _last_diagnosed_detail = None
+        _auto_confirmed_recovery_titles.clear()
         _runtime_prompt = _default_running_prompt()
         _runtime_cond.notify_all()
     _notify_runtime_state()
@@ -2765,13 +2768,68 @@ def _verified_targets_file():
     return app_dir() / "dt_verified_targets.json"
 
 
+_DT_GENERIC_ALIAS_WORDS = {
+    "我", "我自己", "本人", "我本人", "自己", "我的", "我的钉钉",
+    "发群", "发群里", "发到群", "发到群里", "群", "群里", "大群", "默认群",
+    "大家", "所有人", "全员", "文件小助手", "同事", "好友",
+}
+
+_DT_CHAT_NOISE_PHRASES = (
+    "就是我", "里的那个", "发给我", "跑一下", "不要", "不用",
+    "怎么", "为什么", "收到", "好的", "哈哈哈", "聊天记录", "包含:", "条相关",
+)
+
+
+def _is_chat_sentence_noise(text):
+    s = str(text or "").strip()
+    if not s:
+        return True
+    if len(s) > 26:
+        return True
+    if any(p in s for p in _DT_CHAT_NOISE_PHRASES):
+        return True
+    if any(ch in s for ch in ("？", "?", "！", "!", "。", "，", "\n", "\r")):
+        return True
+    has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in s)
+    if has_cjk and s.count(" ") >= 2 and not (len(s) <= 20 and s.endswith(("群", "组", "部", "中心", "团队", "公司", "助手"))):
+        return True
+    return False
+
+
+def _is_valid_verified_dingtalk_target(alias_name, confirmed_dt_name):
+    a = str(alias_name or "").strip()
+    c = str(confirmed_dt_name or "").strip()
+    if not a or not c or a == c:
+        return False
+    a_clean = re.sub(r"^[「\"'『\s]+|[」\"'』\s]+$", "", a)
+    if a_clean in _DT_GENERIC_ALIAS_WORDS or len(a_clean) > 24:
+        return False
+    if _is_chat_sentence_noise(a_clean) or _is_chat_sentence_noise(c):
+        return False
+    return True
+
+
 def _load_verified_dingtalk_targets():
     p = _verified_targets_file()
     if p.exists():
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(d, dict):
-                return {str(k): str(v) for k, v in d.items() if k and v}
+                cleaned = {}
+                removed_bad = False
+                for k, v in d.items():
+                    ks = str(k or "").strip()
+                    vs = str(v or "").strip()
+                    if _is_valid_verified_dingtalk_target(ks, vs):
+                        cleaned[ks] = vs
+                    else:
+                        removed_bad = True
+                if removed_bad:
+                    try:
+                        p.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
+                return cleaned
         except Exception:
             pass
     return {}
@@ -2780,7 +2838,7 @@ def _load_verified_dingtalk_targets():
 def _save_verified_dingtalk_target(alias_name, confirmed_dt_name):
     a = str(alias_name or "").strip()
     c = str(confirmed_dt_name or "").strip()
-    if not a or not c or a == c:
+    if not _is_valid_verified_dingtalk_target(a, c):
         return
     try:
         cur = _load_verified_dingtalk_targets()
@@ -2846,29 +2904,177 @@ def collect_known_people_and_groups(cfg=None, extra_roster=None):
     return {"people": people, "groups": groups, "all": people + [g for g in groups if g not in seen_p]}
 
 
+_DEFAULT_RANDOM_NICKNAMES = (
+    "数据捕手", "冲榜小火箭", "稳健操盘手", "早八满绩王", "战报指挥官",
+    "丝滑传送门", "零失误选手", "金牌统计官", "高效摸鱼侠", "发群先锋官",
+    "汇总小管家", "晴空逐浪者", "神速快捷键", "表格魔法师", "夜航守表人",
+    "全能多面手", "多多猫头鹰", "奶糖小柴犬", "团团大熊猫", "蜜桃小橘猫",
+    "草莓垂耳兔", "机灵小赤狐", "佛系卡皮巴拉", "冰川小企鹅",
+)
+
+
+def is_likely_real_person_name(name):
+    """判断名称是否更像真实员工姓名（排除未命名编号、纯数字/符号及随机趣味昵称）。"""
+    s = str(name or "").strip()
+    if not s or len(s) < 2 or len(s) > 20:
+        return False
+    if s.startswith(("未命名", "成员-", "成员·", "成员 ")):
+        return False
+    if s.casefold() in {"me", "self", "admin", "root", "user", "test", "guest", "未设置", "我自己", "本人", "自己", "管理员", "超级管理员", "测试", "默认"}:
+        return False
+    alnum = "".join(ch for ch in s if ch.isalnum())
+    if not alnum or alnum.isdigit():
+        return False
+    nick_pool = set(_DEFAULT_RANDOM_NICKNAMES)
+    try:
+        import team_hub  # type: ignore[import-not-found]
+        for x in getattr(team_hub, "RANDOM_NICKNAMES", ()):
+            if x:
+                nick_pool.add(str(x).strip())
+        for av in getattr(team_hub, "PRESET_AVATARS", ()):
+            if isinstance(av, dict) and av.get("name"):
+                nick_pool.add(str(av["name"]).strip())
+    except Exception:
+        pass
+    for rn in nick_pool:
+        if s == rn or (s.startswith(rn) and s[len(rn):].isdigit()):
+            return False
+    if _is_chat_sentence_noise(s):
+        return False
+    return True
+
+
+def detect_dingtalk_logged_in_user_name(use_cache=True):
+    """非侵入式只读探测当前电脑已登录钉钉的本人姓名（严禁抢焦点，带 10 分钟缓存）。"""
+    global _dt_logged_in_user_cache
+    now_t = time.monotonic()
+    if use_cache and (now_t - float(_dt_logged_in_user_cache.get("ts") or 0.0)) < 600.0:
+        cached = str(_dt_logged_in_user_cache.get("name") or "")
+        if cached:
+            return cached
+    detected = ""
+    try:
+        import uiautomation as ua  # type: ignore[import-not-found]
+        wins = _enum_dingtalk_im_windows(include_hidden=False)
+        if wins:
+            hwnd = int(wins[0][0])
+            ctl = _safe_control_from_handle(ua, hwnd)
+            if ctl is not None:
+                wr = ctl.BoundingRectangle
+                if wr.right > wr.left and wr.bottom > wr.top:
+                    deadline = time.monotonic() + 0.55
+                    visited = [0]
+                    ui_skip = {"钉钉", "DingTalk", "消息", "文档", "工作台", "通讯录", "日历", "待办", "搜索", "头像", "设置", "更多", "状态", "关闭", "最小化", "最大化", "还原", "协作", "应用中心", "云盘"}
+
+                    def _scan_nav(node, depth):
+                        nonlocal detected
+                        if detected or depth > 7 or visited[0] >= 55 or time.monotonic() > deadline:
+                            return
+                        for ch in node.GetChildren():
+                            visited[0] += 1
+                            if visited[0] > 55 or time.monotonic() > deadline:
+                                return
+                            try:
+                                rr = ch.BoundingRectangle
+                                if rr.right > rr.left and rr.bottom > rr.top:
+                                    if rr.left <= wr.left + 140 and rr.top <= wr.top + 220:
+                                        nm = (ch.Name or "").strip()
+                                        if nm:
+                                            if nm.endswith("的头像") and len(nm) > 3:
+                                                cand = nm[:-3].strip()
+                                                if cand not in ui_skip and is_likely_real_person_name(cand):
+                                                    detected = cand
+                                                    return
+                                            elif nm not in ui_skip and 2 <= len(nm) <= 12 and is_likely_real_person_name(nm):
+                                                ct_n = ch.ControlTypeName
+                                                aid_n = (ch.AutomationId or "").lower()
+                                                if ct_n in ("ButtonControl", "ImageControl", "TextControl") and (
+                                                    any(k in aid_n for k in ("avatar", "user", "profile", "head", "self"))
+                                                    or rr.top <= wr.top + 115
+                                                ):
+                                                    detected = nm
+                                                    return
+                            except Exception:
+                                pass
+                            _scan_nav(ch, depth + 1)
+
+                    _scan_nav(ctl, 0)
+    except Exception:
+        detected = ""
+    if detected:
+        _dt_logged_in_user_cache = {"name": detected, "ts": now_t}
+    return detected
+
+
 def _clean_spoken_target_phrase(raw_t):
     s = str(raw_t or "").strip()
     s = re.sub(r"^[「\"'『\s]+|[」\"'』\s]+$", "", s)
     s = re.sub(r"^(?:钉钉上的?|钉钉里的?|钉钉|给|同事|好友|那位)\s*", "", s)
-    s = re.sub(r"(?:的钉钉|那边|那里|这里|一下|看看|吧|啊|呀|哦)$", "", s).strip()
+    s = re.sub(r"(?:的钉钉|那边|那里|这里|一下|看看|吧|啊|呀|哦|就行|就好|哈|呢)$", "", s).strip()
     return s
 
 
-def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_roster=None, use_ai=True):
-    """模糊理解口语/简称/“我”等称呼，结合花名册与内置 AI 推断并生成高命中率钉钉搜索候选链。"""
+def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_roster=None, use_ai=True, is_local_speaker=True):
+    """模糊理解口语/简称/“我”等称呼，结合花名册、本机钉钉登录身份与内置 AI 生成高命中率搜索候选链。"""
     import difflib
 
     cleaned = _clean_spoken_target_phrase(raw_target)
-    roster = collect_known_people_and_groups(cfg=cfg, extra_roster=extra_roster)
+    norm_cfg = normalize_config(cfg if isinstance(cfg, dict) else {})
+    roster = collect_known_people_and_groups(cfg=norm_cfg, extra_roster=extra_roster)
     verified = _load_verified_dingtalk_targets()
+
+    if cleaned in ("发群", "发群里", "发到群", "发到群里", "群", "群里", "大群", "默认群"):
+        fallback_tgts = get_enabled_dt_targets(norm_cfg)
+        fb_name = fallback_tgts[0] if fallback_tgts else "文件小助手"
+        return {
+            "ok": True,
+            "raw": str(raw_target or ""),
+            "resolved_name": fb_name,
+            "candidates": list(dict.fromkeys(fallback_tgts or ["文件小助手"])),
+            "matched_from_roster": True,
+            "is_self": False,
+            "is_group_default": True,
+            "note": f"已将「{cleaned}」对应为您配置好的发送目标「{'、'.join(fallback_tgts) if fallback_tgts else fb_name}」",
+        }
 
     if cleaned in ("我", "我自己", "本人", "我本人", "我的", "我的钉钉", "自己"):
         sp = str(speaker_name or "").strip()
-        if sp and not sp.startswith("未命名"):
-            cleaned = sp
+        sp_real = sp if is_likely_real_person_name(sp) else ""
+        remark_real = ""
+        for mem in (extra_roster or []):
+            if isinstance(mem, dict):
+                n1 = str(mem.get("nickname") or "").strip()
+                n2 = str(mem.get("display_name") or "").strip()
+                if sp and sp in (n1, n2):
+                    rmk = str(mem.get("remark") or "").strip()
+                    if is_likely_real_person_name(rmk):
+                        remark_real = rmk
+                    break
+
+        if is_local_speaker:
+            dt_self = detect_dingtalk_logged_in_user_name()
+            cands = [x for x in dict.fromkeys([sp_real, remark_real, dt_self, "文件小助手"]) if x]
+            best_self = cands[0]
+            if sp_real or remark_real or dt_self:
+                note_txt = f"已识别「我」为当前用户「{best_self}」（搜不到本人会话将自动发至「文件小助手」）"
+            else:
+                note_txt = "已识别「我」为当前本机操作人，已自动定位您的钉钉「文件小助手」私聊"
+            return {
+                "ok": True,
+                "raw": str(raw_target or ""),
+                "resolved_name": best_self,
+                "candidates": cands,
+                "matched_from_roster": bool(sp_real or remark_real or dt_self),
+                "is_self": True,
+                "note": note_txt,
+            }
+
+        remote_real = sp_real or remark_real
+        if remote_real:
+            cleaned = remote_real
             is_self = True
         else:
-            fallback_tgts = get_enabled_dt_targets(normalize_config(cfg if isinstance(cfg, dict) else {}))
+            fallback_tgts = get_enabled_dt_targets(norm_cfg)
             fb_name = fallback_tgts[0] if fallback_tgts else "文件小助手"
             return {
                 "ok": True,
@@ -2877,13 +3083,13 @@ def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_r
                 "candidates": [fb_name],
                 "matched_from_roster": False,
                 "is_self": True,
-                "note": f"您尚未设置个人昵称，暂已为您发往当前默认会话「{fb_name}」",
+                "note": f"远程发话人「{sp or '未命名'}」暂未设置真实姓名，暂已为您发往默认会话「{fb_name}」",
             }
     else:
         is_self = False
 
     if not cleaned:
-        fallback_tgts = get_enabled_dt_targets(normalize_config(cfg if isinstance(cfg, dict) else {}))
+        fallback_tgts = get_enabled_dt_targets(norm_cfg)
         fb_name = fallback_tgts[0] if fallback_tgts else "文件小助手"
         return {
             "ok": True,
@@ -2908,27 +3114,38 @@ def resolve_smart_dingtalk_target(raw_target, cfg=None, speaker_name="", extra_r
             "note": f"已按历史确认记忆将「{cleaned}」识别为「{best}」",
         }
 
-    want_group = any(k in str(raw_target or "") for k in ("群", "组", "部门", "部"))
-    pool_order = (roster["groups"] + roster["people"]) if want_group else (roster["people"] + roster["groups"])
+    want_group = (not is_self) and any(k in str(raw_target or "") for k in ("群", "组", "部门", "部"))
+    if is_self:
+        pool_order = [p for p in roster["people"] if not any(p.endswith(s) for s in ("组", "群", "部门", "部", "中心", "团队"))]
+    elif want_group:
+        pool_order = roster["groups"] + roster["people"]
+    else:
+        pool_order = roster["people"] + roster["groups"]
 
     scored = []
     q_low = cleaned.casefold()
     for cand in pool_order:
         c_low = cand.casefold()
+        cand_is_grp = any(cand.endswith(s) for s in ("组", "群", "部门", "部", "中心", "团队"))
         score = 0.0
         if q_low == c_low:
             score = 1.0
         elif q_low in c_low or c_low in q_low:
             ratio = min(len(q_low), len(c_low)) / max(1, len(c_low))
             score = 0.80 + 0.16 * ratio
-            if want_group and any(cand.endswith(s) for s in ("组", "群")):
+            if want_group and cand_is_grp:
                 score += 0.04
-            elif not want_group and not any(cand.endswith(s) for s in ("组", "群")):
+            elif not want_group and not cand_is_grp:
                 score += 0.04
+            elif not want_group and cand_is_grp:
+                # 个人姓名（如“娄慧珍”）不得因子串包含被误改写成小组大群（如“娄慧珍组”）
+                score = min(score, 0.58)
         else:
             seq_r = difflib.SequenceMatcher(None, q_low, c_low).ratio()
             overlap = sum(1 for ch in set(q_low) if ch in c_low)
             score = max(seq_r, overlap / max(1, len(set(q_low))) * 0.72)
+            if not want_group and cand_is_grp:
+                score = min(score, 0.58)
         if score >= 0.52:
             scored.append((score, cand))
     scored.sort(key=lambda x: -x[0])
@@ -3045,7 +3262,7 @@ def parse_natural_date_spec(raw):
     return {"explicit": False, "mode": "offset", "day_offset": 0, "label": "当前默认日期"}
 
 
-def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=None):
+def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=None, is_local_speaker=True):
     """识别即时单次执行指令（例如“要看昨天的数据发给我，跑一下发给钉钉小王”），返回不污染默认配置的临时运行方案。"""
     raw = str(user_text or "").strip()
     if not raw or check_ai_security_and_creator_guardrail(raw):
@@ -3059,16 +3276,29 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
     ):
         return {"handled": False}
 
+    # 先剔除否定意图（如“发给我不要发群”），避免将“发群”误提取成目标
+    scan_text = re.sub(
+        r"(?:不要|不用|别|不是|勿|切勿)\s*(?:发给|发送到|发到|投递给|私发给?|传给|推给|发)\s*[^，。,.;；!\n？?\s]{1,16}",
+        " ",
+        raw,
+    )
     raw_targets = []
-    for m in re.finditer(r"(?:发给|发送到|发到|投递给|私发给?)\s*([^，。,.;；!\n？?]{1,28})", raw):
+    if re.search(r"(?:发给|发送到|发到|投递给|私发给?|传给|推给)\s*(?:我自己|我本人|本人|我的钉钉|自己|我)(?![\u4e00-\u9fffA-Za-z0-9])", scan_text) or re.search(
+        r"(?:给我发|私发我|发我)(?:看看|一份|吧|一下|哈|呢|就行|就好|(?![\u4e00-\u9fffA-Za-z0-9]))",
+        scan_text,
+    ):
+        raw_targets.append("我")
+    for m in re.finditer(r"(?:发给|发送到|发到|投递给|私发给?|传给|推给)\s*([^，。,.;；!\n？?]{1,24})", scan_text):
         seg = m.group(1).strip()
-        seg = re.split(r"(?:并|然后|同时|再把|也发|并且)", seg)[0].strip()
+        seg = re.split(r"(?:\s+|并|然后|同时|再把|也发|并且|不要|不用|别|不是|就行|就好|看看|一下)", seg)[0].strip()
         for part in re.split(r"[、,，和与及]+", seg):
-            p = part.strip()
+            p = _clean_spoken_target_phrase(part)
+            if p in ("我", "我自己", "本人", "我本人", "我的", "我的钉钉", "自己"):
+                p = "我"
             if p and p not in raw_targets:
                 raw_targets.append(p)
-    if any(k in raw for k in ("给我发", "发我看看", "发我一份")) and "我" not in raw_targets:
-        raw_targets.insert(0, "我")
+    if not raw_targets and re.search(r"(?:发到?群里?|发大群|投递到群)", scan_text):
+        raw_targets.append("发群")
 
     has_run_verb = any(k in raw for k in ("跑一下", "跑个", "跑程序", "自动运行", "立即运行", "马上运行", "马上跑", "抓最新", "抓取数据", "更新表格", "重新跑", "重跑"))
     if not raw_targets and not has_run_verb:
@@ -3083,12 +3313,19 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
     search_cand_map = {}
     for rt in raw_targets:
         r_obj = resolve_smart_dingtalk_target(
-            rt, cfg=run_cfg, speaker_name=speaker_name, extra_roster=extra_roster, use_ai=True
+            rt, cfg=run_cfg, speaker_name=speaker_name, extra_roster=extra_roster, use_ai=True, is_local_speaker=is_local_speaker
         )
-        r_name = r_obj["resolved_name"]
-        if r_name not in resolved_list:
-            resolved_list.append(r_name)
-        search_cand_map[r_name] = r_obj.get("candidates") or [r_name]
+        if r_obj.get("is_group_default"):
+            grp_list = [x for x in (r_obj.get("candidates") or []) if x] or [r_obj["resolved_name"]]
+            for g_nm in grp_list:
+                if g_nm not in resolved_list:
+                    resolved_list.append(g_nm)
+                search_cand_map[g_nm] = [g_nm]
+        else:
+            r_name = r_obj["resolved_name"]
+            if r_name not in resolved_list:
+                resolved_list.append(r_name)
+            search_cand_map[r_name] = r_obj.get("candidates") or [r_name]
         if r_obj.get("note"):
             res_notes.append(r_obj["note"])
 
@@ -3112,6 +3349,8 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
     run_cfg["dt_targets"] = [{"name": t, "enabled": True} for t in resolved_list]
     run_cfg["dt_search"] = resolved_list[0]
     run_cfg["_smart_target_candidates"] = search_cand_map
+    if any(rt == "我" for rt in raw_targets) and is_local_speaker and resolved_list:
+        run_cfg["_resolve_self_for_search"] = resolved_list[0]
 
     if date_spec.get("explicit"):
         sp = run_cfg.setdefault("summary_presets", {})
@@ -4193,10 +4432,29 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
 
 
 def wait_for_recovery(title, detail, hint="", actions=None, timeout_sec=900, error_detail=None):
-    """遇到可恢复阻塞时挂起当前步骤并弹窗引导用户解决，返回用户选择的恢复动作 ID。"""
+    """遇到可恢复阻塞时处理选择：除必须人工登录外默认自动选确定继续，同一阻塞二次出现时再停下人工干预。"""
     global _waiting_recovery, _recovery_choice, _runtime_prompt
     check_stop()
     act_list = [dict(a) for a in (actions or [{"id": "retry", "label": "重试当前步", "style": "primary"}])]
+    title_str = str(title or "需要处理")
+    need_human_login = any(k in title_str for k in ("登录", "扫码", "验证码"))
+    auto_ok = True
+    try:
+        auto_ok = bool(load_config().get("auto_confirm_choices", True))
+    except Exception:
+        auto_ok = True
+    if auto_ok and not need_human_login and act_list and title_str not in _auto_confirmed_recovery_titles:
+        auto_act = next(
+            (a for a in act_list if str(a.get("id") or "") in ("retry", "continue", "skip_search", "retry_paste")),
+            act_list[0],
+        )
+        auto_id = str(auto_act.get("id") or "retry")
+        auto_lbl = str(auto_act.get("label") or auto_id)
+        if auto_id != "cancel":
+            _auto_confirmed_recovery_titles.add(title_str)
+            log(f"▶ 已按默认自动确定规则选择「{auto_lbl}」继续执行（无需手动点确认）")
+            sleep_check(0.35)
+            return auto_id
     with _runtime_lock:
         det = error_detail or (_last_diagnosed_detail if _last_diagnosed_detail and _last_diagnosed_detail.get("code") in str(title or "") else None)
         if det is None:
@@ -4796,7 +5054,8 @@ DEFAULT_CONFIG = {
     "wps_url": WPS_URL,          # 金山文档在线表格地址
     "enable_capture": True,      # 跑完后在 WPS 选区复制为图片
     "enable_dingtalk": False,    # 复制后发到钉钉会话
-    "dt_auto_send": False,       # 默认先不自动发；开启后才自动按 Enter 发送
+    "dt_auto_send": True,        # 默认确认直接按 Enter 发送；关闭则只贴入待发
+    "auto_confirm_choices": True, # 默认对非登录类确认选择自动点击确定继续
     "dt_clear_before_send": True,  # 粘贴前先清空聊天输入框原有残留内容
     "dt_paste_delay_sec": 3,     # 打开/切入会话后等待几秒再粘贴图片，防止加载期漏贴
     "dt_silent_send": True,      # 发送前自动勾选「设为静音」（静音发送）
@@ -4953,6 +5212,7 @@ def normalize_config(cfg):
     out["open_wps_after_run"] = bool(out.get("open_wps_after_run", False))
     out["prevent_sleep"] = bool(out.get("prevent_sleep", True))
     out["save_shot_history"] = bool(out.get("save_shot_history", True))
+    out["auto_confirm_choices"] = bool(out.get("auto_confirm_choices", True))
     out["dt_minimize_after_send"] = bool(out.get("dt_minimize_after_send", True))
     try:
         p_del = out.get("dt_paste_delay_sec", 3)
@@ -8501,22 +8761,27 @@ def _collect_dingtalk_search_rows(doc_list, check_stop_fn=None):
         if not placed:
             rows.append([cy, [(k, nm, rr)]])
 
+    all_section_heads = []
+    for lbl, r in good_heads:
+        all_section_heads.append((r.top, True, lbl, r))
+    for lbl, r in noise_heads:
+        all_section_heads.append((r.top, False, lbl, r))
+    all_section_heads.sort(key=lambda x: x[0])
+
     out_rows = []
     for cy, row_items in rows:
         row_items.sort(key=lambda x: x[2].left)
-        if any(0 < (cy - hr.top) < 160 and abs(hr.left - row_items[0][2].left) < 280 for _, hr in noise_heads if
-               not any(gr.top > hr.top and gr.top < cy for _, gr in good_heads)):
+        nearest_head_above = None
+        for h_top, is_good, h_lbl, hr in all_section_heads:
+            if h_top < cy and abs(hr.left - row_items[0][2].left) < 340:
+                nearest_head_above = (is_good, h_lbl)
+        if nearest_head_above is not None and not nearest_head_above[0]:
             continue
         title = " ".join(nm for _k, nm, _r in row_items[:4]).strip()
-        if not title or len(title) > 80:
+        if not title or len(title) > 80 or _is_chat_sentence_noise(title):
             continue
         best_item = max(row_items, key=lambda x: x[2].right - x[2].left)
-        sec = ""
-        nearest_d = 9999
-        for g_lbl, g_r in good_heads:
-            if 0 < cy - g_r.top < 260 and (cy - g_r.top) < nearest_d:
-                nearest_d = cy - g_r.top
-                sec = g_lbl
+        sec = nearest_head_above[1] if (nearest_head_above and nearest_head_above[0]) else ""
         out_rows.append({"title": title, "section": sec, "ctrl": best_item[0], "rect": best_item[2]})
 
     return {"empty_result": bool(empty_flag and not out_rows), "rows": out_rows}
@@ -8560,10 +8825,14 @@ def _ai_pick_best_search_row(target_name, candidates, rows, cfg=None):
                     sc = max(sc, difflib.SequenceMatcher(None, cn, r_base_norm or r_norm).ratio() * 72.0)
         if sec in ("联系人", "群组", "常用"):
             sc += 18.0
+            if any(k in r_title for k in ("我自己", "（自己）", "(自己)")):
+                sc += 35.0
         elif sec in ("文档", "云文档", "钉钉文档", "聊天记录", "待办", "邮件", "网络查找", "搜索网络"):
-            sc -= 50.0
+            sc -= 60.0
         elif sec == "功能" and "助手" not in str(target_name or ""):
             sc -= 28.0
+        if _is_chat_sentence_noise(r_title):
+            sc -= 85.0
         if re.search(r"\.(?:xlsx?|docx?|pptx?|pdf|csv|txt|png|jpe?g|zip)$", r_title.strip(), re.I):
             sc -= 40.0
         scored.append((sc, idx, row))
@@ -9440,9 +9709,9 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                     elif recover_interactive and not resumed_by_user:
                         fg0 = int(user32.GetForegroundWindow() or 0)
                         if fg0 and fg0 == d_hwnd0 and get_user_idle_seconds() < 2.0:
-                            act_res = _pause_for_dingtalk_interruption("检测到您当前正在使用钉钉窗口")
-                            if act_res == "skipped":
-                                return "skipped"
+                            log("  检测到您刚使用过钉钉，已自动默认继续执行（无需手动点击确认）…")
+                            sleep_check(0.6)
+                            resumed_by_user = True
                             continue
                         elif fg0 and d_hwnd0 and fg0 != d_hwnd0:
                             try:
@@ -9508,6 +9777,15 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                                 _force_front()
                                 awakened_once = True
                                 _, ding_pid, _ = _sleep_watch_ding(0.42, expected_pid=ding_pid, fg_locked=False)
+                                if cfg.get("_resolve_self_for_search") == search_name and not auto_heal_used.get("_self_probed"):
+                                    auto_heal_used["_self_probed"] = True
+                                    dt_live_self = detect_dingtalk_logged_in_user_name(use_cache=False)
+                                    if dt_live_self and dt_live_self not in set_cands:
+                                        if search_name == "文件小助手":
+                                            set_cands = [dt_live_self] + list(set_cands)
+                                            log(f"  💡 已自动识别当前登录钉钉为「{dt_live_self}」，优先搜索本人会话（搜不到自动回退文件小助手）")
+                                        else:
+                                            set_cands = list(set_cands) + [dt_live_self]
                                 if _link_box() is not None:
                                     _close_link_box()
                                 _open_global_search()
@@ -9572,7 +9850,8 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                                             cy = int((br.top + br.bottom) / 2)
                                             ua.Click(cx, cy, waitTime=0.28)
                                             if _wait_search_closed(loops=8, step=0.2):
-                                                _save_verified_dingtalk_target(search_name, best_row.get("title", ""))
+                                                if str(best_row.get("section") or "") in ("联系人", "群组", "常用"):
+                                                    _save_verified_dingtalk_target(search_name, best_row.get("title", ""))
                                                 log(f"  ✅ AI 已识别并确认钉钉目标：「{search_name}」→「{best_row.get('title', search_name)}」")
                                                 chat_ready = True
                                                 break
@@ -9774,11 +10053,13 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                                     if tops:
                                         modal = _safe_control_from_handle(ua, tops[0][0])
                                         if modal is not None:
-                                            btn = modal.ButtonControl(searchDepth=12, Name="转为图片")
-                                            if btn.Exists(1.5):
-                                                btn.Click()
-                                                converted = True
-                                                sleep_check(0.5)
+                                            for btn_lbl in ("转为图片", "确定", "是", "发送", "继续", "好"):
+                                                btn = modal.ButtonControl(searchDepth=12, Name=btn_lbl)
+                                                if btn.Exists(0.35):
+                                                    btn.Click()
+                                                    converted = True
+                                                    sleep_check(0.5)
+                                                    break
                                         break
                                 sleep_check(0.35)
                                 after_patch = _capture_dt_input_patch(r_img) if before_patch is not None else None
@@ -11073,11 +11354,6 @@ def _show_settings_window_legacy():
         return cfg
 
     def reset_defaults():
-        ok = messagebox.askyesno(
-            "恢复默认设置",
-            "确定要把所有设置恢复成默认吗？\n\n你之前设置的运行日期、白天/晚上时段、间隔、钉钉会话和后缀都会被还原，此操作不可撤销。")
-        if not ok:
-            return
         import copy
         default = copy.deepcopy(DEFAULT_CONFIG)
         cfg.clear()
@@ -11225,13 +11501,6 @@ def _show_settings_window_legacy():
         if not plan_cfg:
             return
         collect_and_save()
-        confirm = messagebox.askyesno(
-            "确认开始",
-            f"运行方式：{'每天' if plan_cfg['day_mode']=='daily' else '仅工作日'}\n"
-            f"白天 {plan_cfg['day_start']}~{plan_cfg['day_end']}，每{plan_cfg['day_interval']}分钟\n"
-            f"晚上 {plan_cfg['night_start']}~{plan_cfg['night_end']}，每{plan_cfg['night_interval']}分钟\n\n开始吗？")
-        if not confirm:
-            return
         schedule_running = True
         stop_flag = False
         btn_schedule.text = "运行中..."
@@ -11306,9 +11575,8 @@ def _show_settings_window_legacy():
 
     def on_click_stop():
         nonlocal stop_flag
-        if messagebox.askyesno("确认", "要停止计划任务吗？"):
-            stop_flag = True
-            request_stop()
+        stop_flag = True
+        request_stop()
     btn_stop.command = on_click_stop
 
     def _check_update():
@@ -11318,9 +11586,8 @@ def _show_settings_window_legacy():
 
             def ask():
                 try:
-                    if messagebox.askyesno("发现新版本", f"检测到新版本 v{ver}，是否前往下载？"):
-                        import webbrowser
-                        webbrowser.open(url)
+                    import webbrowser
+                    webbrowser.open(url)
                 except Exception:
                     pass
             root.after(0, ask)

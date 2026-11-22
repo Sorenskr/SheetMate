@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.9.0 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.9.1 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -883,6 +883,7 @@ class _SheetMateController:
         display_user = clean_prompt or (styles.get(sid, {}).get("name") and f"请按【{styles[sid]['name']}】帮我总结当前数据") or "总结当前数据"
 
         eff_speaker = str(speaker_name or "").strip()
+        is_local_speaker = (source_device != "mobile")
         roster = []
         if self.hub is not None:
             try:
@@ -890,6 +891,13 @@ class _SheetMateController:
                     eff_speaker = str((self.hub.get_profile() or {}).get("nickname") or "").strip()
                 if hasattr(self.hub, "get_member_roster_names"):
                     roster = self.hub.get_member_roster_names()
+                if source_device == "mobile":
+                    if not eff_speaker:
+                        is_local_speaker = True
+                    else:
+                        matched_mem = self.hub.find_member_by_nickname(eff_speaker)
+                        if isinstance(matched_mem, dict) and matched_mem.get("is_local"):
+                            is_local_speaker = True
             except Exception:
                 pass
         if source_device == "mobile" and clean_prompt:
@@ -904,6 +912,7 @@ class _SheetMateController:
                 cfg_snap,
                 speaker_name=eff_speaker,
                 extra_roster=roster,
+                is_local_speaker=is_local_speaker,
             )
             if (clean_prompt and hasattr(self.app, "try_handle_ai_on_demand_task"))
             else {"handled": False}
@@ -2032,8 +2041,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/png" href="/icon.png?v=2.9.0" />
-<link rel="shortcut icon" href="/favicon.ico?v=2.9.0" />
+<link rel="icon" type="image/png" href="/icon.png?v=2.9.1" />
+<link rel="shortcut icon" href="/favicon.ico?v=2.9.1" />
 <style>
   :root {
     --bg: #EAF0F8;
@@ -4409,9 +4418,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.9.0" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.9.1" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.9.0</span>
+          <span class="ver-pill" id="verBadge">v2.9.1</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -8401,13 +8410,12 @@ function bindEvents() {
     updateSummaries();
   };
   $("resetPresetsBtn").onclick = async () => {
-    const ok = await iosAlert("恢复汇总表默认校准规则", "将恢复为：D2 自动日期、清空 D4/E4、L3 设为 7 个计算小组、L4 设为慕杰组。", { okText: "恢复默认", cancelText: "取消" });
-    if (!ok) return;
     cfg.summary_presets = { enabled: true, items: JSON.parse(JSON.stringify(DEFAULT_SUMMARY_PRESETS)) };
     $("spEnabled").checked = true;
     $("spAccordion").classList.add("open");
     renderSummaryPresets();
     scheduleSave(true);
+    showToast("已恢复汇总表默认校准规则");
   };
   $("checkDingBtn").onclick = async () => {
     $("dingCheckVal").textContent = "检测中…";
@@ -8422,10 +8430,9 @@ function bindEvents() {
     showToast(r.message || "已尝试打开文件夹");
   };
   $("resetAllPointsBtn").onclick = async () => {
-    const ok = await iosAlert("重置全部单点设置", "将清空排期表中所有时间节点的单独覆盖，恢复跟随全局规则。", { okText: "全部重置", cancelText: "取消", danger: true });
-    if (!ok) return;
     cfg.point_overrides = {};
     scheduleSave(true);
+    showToast("已重置全部单点设置");
   };
   $("addSuffixRuleBtn").onclick = () => {
     if (!Array.isArray(cfg.suffix_rules)) cfg.suffix_rules = [];
@@ -8693,8 +8700,6 @@ function bindEvents() {
   };
 
   $("resetBtn").onclick = async () => {
-    const ok = await iosAlert("恢复默认设置", "当前时段、执行间隔、预设校准与钉钉群设置将重置为默认值。", { okText: "恢复默认", cancelText: "取消", danger: true });
-    if (!ok) return;
     const res = await api("/api/reset", "POST");
     cfg = res.config;
     latestTimetable = Array.isArray(res.timetable) ? res.timetable : [];
@@ -8706,8 +8711,7 @@ function bindEvents() {
   $("updateBtn").onclick = async () => {
     const safeU = safeExternalHttpUrl(updateUrl);
     if (!safeU) return;
-    const ok = await iosAlert("发现新版本", "检测到新版 SheetMate，是否前往 GitHub 下载？", { okText: "立即前往", cancelText: "稍后" });
-    if (ok) window.open(safeU, "_blank", "noopener,noreferrer");
+    window.open(safeU, "_blank", "noopener,noreferrer");
   };
 
   let closeBeaconSent = false;

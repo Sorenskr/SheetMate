@@ -1,6 +1,6 @@
-# 暗号表助手（SheetMate）v2.9.0
+# 暗号表助手（SheetMate）v2.9.1
 
-[![最新版本](https://img.shields.io/badge/Release-v2.9.0-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
+[![最新版本](https://img.shields.io/badge/Release-v2.9.1-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![运行平台](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-34C759?style=flat-square&logo=windows)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![云端远程入口](https://img.shields.io/badge/Cloud%20Web-点击打开远程控制台-5856D6?style=flat-square&logo=googlechrome)](https://sorenskr.github.io/SheetMate/)
 
@@ -20,7 +20,11 @@
 
 ---
 
-## ✨ v2.9.0 核心功能一览
+## ✨ v2.9.1 核心功能一览
+
+- **智能语音指令精准识人与默认自动确认**
+  - 在钉钉发消息指令中准确理解 **「我 / 发给我」**（自动匹配本机钉钉实名会话或文件小助手，绝不把系统随机趣味昵称拿去钉钉乱搜），识别 **「发群 / 发群里」** 自动对应已启用的默认群聊，自动剔除聊天记录文本干扰并清洗错误记忆。
+  - 默认自动按 Enter 发送并跳过非登录类的繁琐二次确认弹窗，全流程畅通直发。
 
 - **全自动抓数写表 & 自定义格位**
   - 自动登录后台拉取三份源数据，自动规范格式并精准写入 WPS 金山在线汇总表，同步自动清理多余旧标签页。
