@@ -799,18 +799,23 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div class="m-shell">
   <header class="m-header">
     <div class="m-brand">
-      <div class="m-cat-ico">
-        <svg viewBox="0 0 48 48" width="32" height="32" fill="none">
-          <path d="M10 19L8 7l11 7h10l11-7-2 12v10a13 13 0 01-26 0V19z" fill="#4F46E5" stroke="#BAE6FD" stroke-width="1.3"/>
-          <rect x="11" y="19" width="26" height="18" rx="8" fill="#0F172A"/>
-          <circle cx="18" cy="26.5" r="2.6" fill="#38BDF8"/>
-          <circle cx="30" cy="26.5" r="2.6" fill="#38BDF8"/>
-          <path d="M20.5 32 Q24 35 27.5 32" stroke="#F8FAFC" stroke-width="1.7" stroke-linecap="round"/>
+      <div class="m-cat-ico" style="background:linear-gradient(135deg,#58CC02,#2EAD00);box-shadow:0 6px 16px rgba(88,204,2,0.28);">
+        <svg viewBox="0 0 96 96" width="32" height="32" fill="none">
+          <path d="M24 31 L20 15 L36 25 Z" fill="#89E219"/>
+          <path d="M72 31 L76 15 L60 25 Z" fill="#89E219"/>
+          <ellipse cx="48" cy="54" rx="29" ry="27" fill="#58CC02"/>
+          <circle cx="36" cy="46" r="13" fill="#FFFFFF"/>
+          <circle cx="60" cy="46" r="13" fill="#FFFFFF"/>
+          <circle cx="37.5" cy="46.5" r="7" fill="#1E293B"/>
+          <circle cx="58.5" cy="46.5" r="7" fill="#1E293B"/>
+          <circle cx="35" cy="43.5" r="2.6" fill="#FFFFFF"/>
+          <circle cx="56" cy="43.5" r="2.6" fill="#FFFFFF"/>
+          <path d="M42 53 Q48 50 54 53 Q50 62 48 62 Q46 62 42 53 Z" fill="#FFB800"/>
         </svg>
       </div>
       <div style="min-width:0;">
         <div class="m-title">暗号表助手 · 全球远程智能协同站</div>
-        <div class="m-sub" id="mHeaderSub">输入唯一名字与访问密码，随时随地安全同步电脑小猫</div>
+        <div class="m-sub" id="mHeaderSub">输入唯一名字与访问密码，随时随地安全同步电脑伙伴</div>
       </div>
     </div>
     <button type="button" class="m-pill" id="mSwitchUserBtn" style="display:none;">退出/切换</button>
@@ -819,25 +824,25 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="m-login-wrap" id="mLoginGate">
     <div class="m-card">
       <div class="m-intro-box">
-        <div class="m-intro-title">关于本远程沟通站（由 Soren Drake 设计）</div>
+        <div class="m-intro-title">远程连线说明（Soren Drake 设计）</div>
         <div>
-          无论您或同事身处公司、家中还是出差在外，只需输入目标电脑在「暗号表助手」里设置的<strong>唯一名字</strong>和<strong>访问密码</strong>，就能安全加密连接电脑上的专属智能小猫伙伴——随时对话查数、一句话指挥电脑自动跑表，或把指定日期报表直接静默发给钉钉指定对象，所有对话与进度都在电脑端实时同步！
+          输入目标电脑在「暗号表助手」里设好的<strong>唯一名字</strong>与<strong>访问密码</strong>，就能加密连接电脑上的专属智能伙伴——随时对话查数、遥控跑表或静默发钉钉，聊天记录两端实时同步。
         </div>
       </div>
 
-      <div class="m-label">1. 目标电脑的唯一名字（必填 · 全局不可重名）</div>
+      <div class="m-label">1. 目标电脑唯一名字</div>
       <input type="text" class="m-input" id="mLoginNameInput" placeholder="输入在电脑端【设置昵称】里起好的名字" autocomplete="username" />
 
-      <div class="m-label">2. 远程访问密码（必填 · 自己与他人访问均需验证）</div>
-      <input type="password" class="m-input" id="mLoginPinInput" placeholder="请输入访问密码（当前默认 Qq@112233）" autocomplete="current-password" />
+      <div class="m-label">2. 远程访问密码</div>
+      <input type="password" class="m-input" id="mLoginPinInput" placeholder="请输入远程访问密码" autocomplete="current-password" />
 
-      <details id="mBaseDetails" style="font-size:12px;color:var(--sub);">
-        <summary style="cursor:pointer;">高级：手动指定内网直连网址（外地/跨网访问无需填写，自动端到端加密连线）</summary>
-        <input type="text" class="m-input" id="mServerBaseInput" style="margin-top:8px;font-size:13px;" placeholder="同 Wi-Fi 下一般自动连接或留空" />
+      <details id="mBaseDetails" style="font-size:11.5px;color:var(--sub);">
+        <summary style="cursor:pointer;">同 Wi-Fi 备用设置（外地跨网无需填写）</summary>
+        <input type="text" class="m-input" id="mServerBaseInput" style="margin-top:8px;font-size:13px;" placeholder="局域网内网网址（选填，留空自动加密连线）" />
       </details>
 
       <div id="mLoginErr" style="font-size:12.5px;color:var(--red);display:none;line-height:1.45;"></div>
-      <button type="button" class="m-btn-primary" id="mLoginSubmitBtn">密码验证并连接电脑</button>
+      <button type="button" class="m-btn-primary" id="mLoginSubmitBtn">验证并连接电脑</button>
     </div>
   </div>
 
@@ -1355,7 +1360,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       return;
     }
     if (!pin) {
-      showLoginView("请输入访问密码（默认 Qq@112233）");
+      showLoginView("请输入远程访问密码");
       return;
     }
     const btn = $("mLoginSubmitBtn");
@@ -1612,7 +1617,7 @@ class MobileBridgeManager:
                         "locked": True,
                         "message": f"密码连续输错过多，已锁定 {int(AUTH_LOCKOUT_SEC)} 秒后再试",
                     }
-                return {"ok": False, "message": "访问密码不正确，请核对后重试（默认密码 Qq@112233）"}
+                return {"ok": False, "message": "访问密码不正确，请核对电脑端设置的远程密码后重试"}
             self._auth_fail_tracker.pop(client_id, None)
         return self.ctrl.verify_mobile_member_login(nick)
 

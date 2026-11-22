@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.8.0 多端协同控制中心界面、动态昼夜光效与全球加密远程调度后端。"""
+"""SheetMate v2.8.1 多端协同控制中心界面、动态昼夜光效与全球加密远程调度后端。"""
 
 import copy
 import ctypes
@@ -4315,7 +4315,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     color: var(--text-2);
   }
   .avatar-preset-opt.active { border-color: var(--blue); background: var(--pill-blue); color: var(--blue); font-weight: 700; }
-  .avatar-preset-opt img { width: 38px; height: 38px; border-radius: 50%; }
+  .avatar-preset-opt img { width: 44px; height: 44px; border-radius: 14px; }
 
   .collab-collapse { border: 0.5px solid var(--sep); border-radius: 12px; padding: 10px 12px; background: var(--fill-2); }
   .collab-collapse summary { cursor: pointer; font-size: 12.5px; font-weight: 700; color: var(--blue); }
@@ -4395,9 +4395,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.8.0" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.8.1" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.8.0</span>
+          <span class="ver-pill" id="verBadge">v2.8.1</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -4760,7 +4760,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
               <div class="remote-guide-strip" id="remoteGuideStrip">
                 <div style="flex:1;min-width:0;">
-                  <strong>全球加密远程对话入口：</strong>出门在外打开 <code>https://sorenskr.github.io/SheetMate/</code>，输入本机唯一昵称 + 访问密码（默认 <code>Qq@112233</code>）即可随时随地与电脑 AI 对话、指挥跑表及实时同步记录。
+                  <strong>全球加密远程沟通：</strong>出门用手机或异地电脑打开 <code>https://sorenskr.github.io/SheetMate/</code>，输入本机唯一昵称与远程密码即可跨网对话和指挥跑表。
                 </div>
                 <div style="display:flex;gap:5px;flex-shrink:0;">
                   <button type="button" class="mini-pill active" id="copyGithubGuideBtn">复制网址</button>
@@ -5562,26 +5562,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <!-- 0. 全球远程网址、密码与实时同步扫码弹窗 -->
   <div class="modal-mask" id="mobileBridgeModalMask">
-    <div class="card-modal" style="width:min(700px,95vw);">
+    <div class="card-modal" style="width:min(680px,95vw);">
       <div class="modal-head">
-        <div class="modal-title">全球远程控制网站与安全密码 · 实时同步</div>
+        <div class="modal-title">全球远程控制网站与安全密码</div>
         <button class="mini-pill" id="mobileModalCloseBtn" type="button">关闭</button>
       </div>
       <div class="modal-scroll">
         <div style="font-size:12.5px;color:var(--sub);line-height:1.55;background:var(--fill-2);border:0.5px solid var(--sep);border-radius:12px;padding:9px 11px;">
-          <strong style="color:var(--text);">在哪里远程与本机沟通：</strong>
-          无论在公司还是外地，用手机或另一台电脑打开下方的 <strong>GitHub 全球永久网址</strong>，输入您在右上角【设置昵称】里定好的<strong>唯一名字</strong>，并验证<strong>访问密码（自己访问或他人访问都需要输入，当前默认 Qq@112233）</strong>，即可跨网络端到端加密聊天、远程下达跑表与发钉钉指令，本机消息列表也会实时双向同步。
+          <strong style="color:var(--text);">出门怎么远程用电脑助手：</strong>
+          手机或另一台电脑打开下方网站，输入您在右上角设好的<strong>唯一名字</strong>和<strong>访问密码</strong>，即可端到端加密聊天、查数及遥控跑表发钉钉，消息双向实时同步。
         </div>
-        <div style="display:grid;grid-template-columns:208px 1fr;gap:14px;align-items:start;">
-          <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:16px;padding:10px;display:flex;flex-direction:column;align-items:center;gap:7px;">
-            <div id="mobileQrBox" style="width:186px;height:186px;display:flex;align-items:center;justify-content:center;border-radius:10px;overflow:hidden;background:#FFFFFF;"></div>
-            <div style="font-size:11px;color:var(--sub);text-align:center;" id="mobileQrCaption">手机扫码打开 GitHub 全球远程网址</div>
-            <button type="button" class="mini-pill" id="toggleQrModeBtn">切到同 Wi-Fi 二维码</button>
+        <div style="display:grid;grid-template-columns:196px 1fr;gap:14px;align-items:start;">
+          <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:16px;padding:10px;display:flex;flex-direction:column;align-items:center;gap:6px;">
+            <div id="mobileQrBox" style="width:174px;height:174px;display:flex;align-items:center;justify-content:center;border-radius:10px;overflow:hidden;background:#FFFFFF;"></div>
+            <div style="font-size:11px;color:var(--sub);text-align:center;" id="mobileQrCaption">手机扫码直接打开远程网站</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:10px;">
             <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:13px;padding:10px;display:flex;flex-direction:column;gap:6px;">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
-                <span style="font-size:12px;font-weight:700;">1. GitHub 全球永久网址（随时随地跨网直达）</span>
+                <span style="font-size:12px;font-weight:700;">1. 全球永久网址（随时随地跨网直达）</span>
                 <span class="ver-pill" id="cloudRelayStatusBadge" style="background:rgba(40,205,65,0.14);color:var(--green);">加密待命</span>
               </div>
               <div style="display:flex;gap:6px;align-items:center;">
@@ -5589,32 +5588,35 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <button type="button" class="mini-pill active" id="copyMobileGithubBtn">复制</button>
                 <button type="button" class="mini-pill" id="openMobileGithubBtn">打开</button>
               </div>
-              <div style="font-size:11px;color:var(--sub);" id="mobileCloudRelayTip">已在后台启用端到端加密云中继（建议先在右上角设置好本机唯一昵称）。</div>
+              <div style="font-size:11px;color:var(--sub);" id="mobileCloudRelayTip">电脑联网状态下自动开启加密远程待命。</div>
             </div>
             <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:13px;padding:10px;display:flex;flex-direction:column;gap:6px;">
-              <div style="font-size:12px;font-weight:700;">2. 远程访问密码（必填 · 自己与他人都须输入密码）</div>
+              <div style="font-size:12px;font-weight:700;">2. 远程访问密码（必填 · 自己与他人均须校验）</div>
               <div style="display:flex;gap:6px;align-items:center;">
-                <input type="text" id="mobilePinInput" class="small-input" style="flex:1;" placeholder="输入非空远程访问密码（默认 Qq@112233）" />
+                <input type="password" id="mobilePinInput" class="small-input" style="flex:1;" placeholder="输入非空远程访问密码" />
+                <button type="button" class="eye-btn" id="toggleMobilePinEyeBtn" title="显示/隐藏访问密码" style="flex-shrink:0;">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                </button>
                 <button type="button" class="pill-action-btn primary" id="saveMobilePinBtn" style="padding:5px 12px;font-size:12px;">保存密码</button>
               </div>
-              <div style="font-size:11px;color:var(--sub);" id="mobilePinHint">当前密码将持久化保存在本机，并同时用于网页鉴权与跨网端到端加密密钥派生。</div>
+              <div style="font-size:11px;color:var(--sub);" id="mobilePinHint">已默认圆点遮盖显示；保存后即时生效并参与跨网端到端加密。</div>
             </div>
-            <div style="background:var(--fill-2);border:0.5px solid var(--sep);border-radius:13px;padding:10px;display:flex;flex-direction:column;gap:6px;">
-              <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
-                <span style="font-size:12px;font-weight:700;">3. 同 Wi-Fi 局域网直连 / 临时外网隧道</span>
-                <button type="button" class="mini-pill" id="toggleMobileTunnelBtn">开启临时隧道</button>
+            <details class="collab-collapse">
+              <summary>备用：同 Wi-Fi 局域网直连（一般无需使用）</summary>
+              <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">
+                <div style="display:flex;gap:6px;align-items:center;">
+                  <input type="text" id="mobileLanUrlInput" class="small-input" style="flex:1;" readonly />
+                  <button type="button" class="mini-pill" id="copyMobileLanBtn">复制</button>
+                  <button type="button" class="mini-pill" id="openMobileWebBtn">预览</button>
+                </div>
+                <div style="display:flex;gap:6px;align-items:center;">
+                  <input type="text" id="mobilePublicUrlInput" class="small-input" style="flex:1;" readonly placeholder="可选：点击右侧开启临时公网通道" />
+                  <button type="button" class="mini-pill" id="toggleMobileTunnelBtn">开启临时隧道</button>
+                  <button type="button" class="mini-pill" id="copyMobilePublicBtn" style="display:none;">复制</button>
+                </div>
+                <div style="font-size:11px;color:var(--sub);" id="mobileTunnelStatusTip">通常直接访问上方全球永久网址即可，无需启用隧道。</div>
               </div>
-              <div style="display:flex;gap:6px;align-items:center;">
-                <input type="text" id="mobileLanUrlInput" class="small-input" style="flex:1;" readonly />
-                <button type="button" class="mini-pill" id="copyMobileLanBtn">复制</button>
-                <button type="button" class="mini-pill" id="openMobileWebBtn">预览</button>
-              </div>
-              <div style="display:flex;gap:6px;align-items:center;">
-                <input type="text" id="mobilePublicUrlInput" class="small-input" style="flex:1;" readonly placeholder="如需直连临时公网隧道可点击上方按钮开启" />
-                <button type="button" class="mini-pill" id="copyMobilePublicBtn" style="display:none;">复制</button>
-              </div>
-              <div style="font-size:11px;color:var(--sub);" id="mobileTunnelStatusTip">通常使用第 1 项 GitHub 永久网址即可跨网沟通，无需每次复制新网址。</div>
-            </div>
+            </details>
           </div>
         </div>
       </div>
@@ -5652,26 +5654,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
         </div>
         <div>
-          <div style="font-size:12px;font-weight:700;color:var(--sub);margin-bottom:7px;">或直接挑一个推荐头像：</div>
+          <div style="font-size:12px;font-weight:700;color:var(--sub);margin-bottom:7px;">或直接挑一只可爱小动物头像：</div>
           <div class="avatar-preset-grid" id="avatarPresetsGrid"></div>
         </div>
-        <details class="collab-collapse">
-          <summary>多人防撞联机配置（可选 · 连同一网络或异地云端枢纽）</summary>
-          <div style="display:flex;flex-direction:column;gap:8px;margin-top:9px;font-size:12px;">
-            <div class="mini-seg" id="clientSyncModeSeg">
-              <button type="button" class="mini-seg-btn active" data-val="local_or_shared">共享盘/本机</button>
-              <button type="button" class="mini-seg-btn" data-val="http_hub">联机地址(Hub URL)</button>
-              <button type="button" class="mini-seg-btn" data-val="gist_cloud">云端协作枢纽</button>
-            </div>
-            <input type="text" id="clientSharedDir" class="small-input" placeholder="共享文件夹路径（例如 \\192.168.1.10\share）" />
-            <input type="text" id="clientHubUrl" class="small-input" placeholder="团队共享的联机网址（例如 http://192.168.x.x:18790 或公网地址）" />
-            <div style="display:flex;gap:6px;">
-              <input type="text" id="clientGistId" class="small-input" style="flex:1;" placeholder="云端协作空间 ID" />
-              <input type="password" id="clientGistToken" class="small-input" style="flex:1;" placeholder="云端访问口令（可选）" />
-            </div>
-            <button type="button" class="pill-action-btn" id="clientSaveSyncBtn" style="align-self:flex-start;">保存并立即联机测试</button>
-          </div>
-        </details>
+        <div style="font-size:12px;line-height:1.5;color:var(--green);background:rgba(40,205,65,0.10);border:0.5px solid rgba(40,205,65,0.28);border-radius:12px;padding:9px 11px;">
+          <strong>已开启免配置自动联网防撞保护：</strong>只要电脑正常连接网络，系统会自动识别团队唯一名字并在跑表时错峰排队，无需手工填写任何网络或共享盘设置。
+        </div>
       </div>
       <div class="modal-foot">
         <button type="button" class="pill-action-btn primary" id="profileSaveBtn">保存名字与头像</button>
@@ -8624,14 +8612,6 @@ async function openProfileModal() {
     grid.appendChild(item);
   }
 
-  const sc = syncSettingsState || {};
-  for (const b of $("clientSyncModeSeg").querySelectorAll(".mini-seg-btn")) {
-    b.classList.toggle("active", b.dataset.val === (sc.mode || "local_or_shared"));
-  }
-  $("clientSharedDir").value = sc.shared_dir || "";
-  $("clientHubUrl").value = sc.hub_url || "";
-  $("clientGistId").value = sc.gist_id || "";
-  $("clientGistToken").value = sc.gist_token || "";
   $("profileModalMask").classList.add("show");
 }
 
@@ -9111,23 +9091,6 @@ function bindTeamCollabAndAdminEvents() {
     for (const ch of $("avatarPresetsGrid").querySelectorAll(".avatar-preset-opt")) ch.classList.remove("active");
     showToast("已导入自定义头像");
   };
-  for (const b of $("clientSyncModeSeg").querySelectorAll(".mini-seg-btn")) {
-    b.onclick = () => {
-      for (const x of $("clientSyncModeSeg").querySelectorAll(".mini-seg-btn")) x.classList.remove("active");
-      b.classList.add("active");
-    };
-  }
-  $("clientSaveSyncBtn").onclick = async () => {
-    const activeB = $("clientSyncModeSeg").querySelector(".mini-seg-btn.active");
-    const r = await api("/api/sync-config", "POST", {
-      mode: activeB ? activeB.dataset.val : "local_or_shared",
-      shared_dir: $("clientSharedDir").value.trim(),
-      hub_url: $("clientHubUrl").value.trim(),
-      gist_id: $("clientGistId").value.trim(),
-      gist_token: $("clientGistToken").value.trim(),
-    });
-    showToast(r.message || "已保存联机配置");
-  };
   $("profileSaveBtn").onclick = async () => {
     const nick = $("profileNicknameInput").value.trim();
     const r = await api("/api/profile", "POST", {
@@ -9149,11 +9112,8 @@ function bindTeamCollabAndAdminEvents() {
 
   // 全球远程控制网站扫码、端到端加密云中继与密码设置
   let mobileTunnelPollTimer = null;
-  let mobileQrMode = "github";
-  let lastMobileInfo = null;
   const renderMobileBridgeModal = (info) => {
     if (!info) return;
-    lastMobileInfo = info;
     const ghUrl = info.github_pages_url || "https://sorenskr.github.io/SheetMate/";
     const lanList = Array.isArray(info.lan_urls) ? info.lan_urls : [];
     const pub = info.public_url || "";
@@ -9162,33 +9122,22 @@ function bindTeamCollabAndAdminEvents() {
     if ($("mobilePublicUrlInput")) $("mobilePublicUrlInput").value = pub;
     if ($("copyMobilePublicBtn")) $("copyMobilePublicBtn").style.display = pub ? "inline-flex" : "none";
     if ($("mobilePinInput") && document.activeElement !== $("mobilePinInput")) {
-      $("mobilePinInput").value = info.remote_password || "Qq@112233";
+      $("mobilePinInput").value = info.remote_password || "";
     }
     if ($("mobileQrBox")) {
-      const svgMarkup = mobileQrMode === "lan"
-        ? (info.qr_local_svg || info.qr_svg || "")
-        : (info.qr_svg || "");
-      $("mobileQrBox").innerHTML = svgMarkup || "<span style='font-size:12px;color:#64748B;'>暂未生成二维码</span>";
-    }
-    if ($("mobileQrCaption")) {
-      $("mobileQrCaption").textContent = mobileQrMode === "lan"
-        ? (pub ? "当前扫码直连临时外网隧道" : "当前扫码直连同 Wi-Fi 局域网网页")
-        : "手机扫码打开 GitHub 全球远程网址";
-    }
-    if ($("toggleQrModeBtn")) {
-      $("toggleQrModeBtn").textContent = mobileQrMode === "lan" ? "切回全球网址二维码" : "切到同 Wi-Fi 二维码";
+      $("mobileQrBox").innerHTML = info.qr_svg || "<span style='font-size:12px;color:#64748B;'>暂未生成二维码</span>";
     }
     if ($("cloudRelayStatusBadge") && $("mobileCloudRelayTip")) {
       if (!info.local_nick) {
         $("cloudRelayStatusBadge").textContent = "待设昵称";
         $("cloudRelayStatusBadge").style.color = "var(--orange)";
         $("cloudRelayStatusBadge").style.background = "rgba(255,159,10,0.14)";
-        $("mobileCloudRelayTip").textContent = "请先在右上角【设置昵称】起好唯一名字，全球远程中继将立即自动上线。";
+        $("mobileCloudRelayTip").textContent = "请先在右上角起好唯一名字，全球远程中继将立即自动上线。";
       } else if (info.cloud_relay_connected) {
         $("cloudRelayStatusBadge").textContent = "云端已连通";
         $("cloudRelayStatusBadge").style.color = "var(--green)";
         $("cloudRelayStatusBadge").style.background = "rgba(40,205,65,0.14)";
-        $("mobileCloudRelayTip").textContent = `已实时连线！远端打开 GitHub 网址输入「${info.local_nick}」与密码即可加密控制。`;
+        $("mobileCloudRelayTip").textContent = `已实时连线！远端打开网站输入「${info.local_nick}」与密码即可加密控制。`;
       } else {
         $("cloudRelayStatusBadge").textContent = "连线中";
         $("cloudRelayStatusBadge").style.color = "var(--blue)";
@@ -9203,7 +9152,7 @@ function bindTeamCollabAndAdminEvents() {
     if ($("mobileTunnelStatusTip")) {
       $("mobileTunnelStatusTip").textContent = pub
         ? `临时隧道已打通：${pub}`
-        : (info.tunnel_error || (info.tunnel_running ? "正在建立临时外网隧道，请稍等 2~5 秒…" : "通常使用第 1 项 GitHub 永久网址即可跨网沟通，无需每次复制新网址。"));
+        : (info.tunnel_error || (info.tunnel_running ? "正在建立临时外网隧道，请稍等 2~5 秒…" : "通常直接访问上方全球永久网址即可，无需启用隧道。"));
     }
     if (info.tunnel_running && !pub) {
       clearTimeout(mobileTunnelPollTimer);
@@ -9228,14 +9177,14 @@ function bindTeamCollabAndAdminEvents() {
     $("copyGithubGuideBtn").onclick = async () => {
       try {
         await navigator.clipboard.writeText("https://sorenskr.github.io/SheetMate/");
-        showToast("已复制全球远程网址，打开后请输入唯一昵称与密码 Qq@112233");
+        showToast("已复制全球远程网址，打开后输入本机唯一昵称与远程密码即可连接");
       } catch (_e) {}
     };
   }
-  if ($("toggleQrModeBtn")) {
-    $("toggleQrModeBtn").onclick = () => {
-      mobileQrMode = (mobileQrMode === "github") ? "lan" : "github";
-      if (lastMobileInfo) renderMobileBridgeModal(lastMobileInfo);
+  if ($("toggleMobilePinEyeBtn") && $("mobilePinInput")) {
+    $("toggleMobilePinEyeBtn").onclick = () => {
+      const inp = $("mobilePinInput");
+      inp.type = inp.type === "password" ? "text" : "password";
     };
   }
   if ($("copyMobileGithubBtn")) {
