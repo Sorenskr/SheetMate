@@ -10,6 +10,7 @@
 """
 
 import base64
+import copy
 from datetime import datetime, timedelta
 import hashlib
 import hmac
@@ -375,6 +376,39 @@ def safe_read_json_body(rfile, headers, max_bytes=MAX_HUB_BODY_BYTES):
         return json.loads(raw.decode("utf-8"))
     except Exception:
         return {}
+
+
+_SENSITIVE_CFG_KEYS = frozenset({"luya_pass", "api_key", "gist_token", "hub_secret"})
+
+
+def redact_sensitive_config(obj):
+    """递归深拷贝配置或成员快照并剥离密码与 API 密钥，防止云端与反馈载荷泄密。"""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in _SENSITIVE_CFG_KEYS:
+                out[k] = ""
+            else:
+                out[k] = redact_sensitive_config(v)
+        return out
+    if isinstance(obj, list):
+        return [redact_sensitive_config(x) for x in obj]
+    return copy.deepcopy(obj)
+
+
+def _prune_fail_tracker(tracker, now, max_entries=256):
+    """清理过期的登录失败锁记录并限制追踪字典上限，防止恶意枚举导致内存泄漏。"""
+    expired = [
+        k for k, v in tracker.items()
+        if (v.get("until", 0.0) > 0.0 and v["until"] <= now)
+        or (now - float(v.get("last_ts", now))) > 3600.0
+    ]
+    for k in expired:
+        tracker.pop(k, None)
+    if len(tracker) > max_entries:
+        oldest = sorted(tracker.items(), key=lambda it: float(it[1].get("last_ts", 0.0)))[: len(tracker) - max_entries]
+        for k, _ in oldest:
+            tracker.pop(k, None)
 
 
 def _sha256_secret(val):
@@ -960,7 +994,13 @@ class TeamHubManager:
             if isinstance(remote.get("queue"), list):
                 self._state["queue"] = remote["queue"]
             if isinstance(remote.get("global_logic"), dict):
-                self._state["global_logic"] = remote["global_logic"]
+                old_gl = self._state.get("global_logic") if isinstance(self._state.get("global_logic"), dict) else {}
+                new_gl = copy.deepcopy(remote["global_logic"])
+                old_ai = old_gl.get("global_ai_api") if isinstance(old_gl.get("global_ai_api"), dict) else {}
+                new_ai = new_gl.get("global_ai_api") if isinstance(new_gl.get("global_ai_api"), dict) else {}
+                if not new_ai.get("api_key") and old_ai.get("api_key"):
+                    new_gl.setdefault("global_ai_api", {})["api_key"] = old_ai["api_key"]
+                self._state["global_logic"] = new_gl
             if isinstance(remote.get("members"), dict):
                 mems = self._state.setdefault("members", {})
                 for uid, rmem in remote["members"].items():
@@ -968,6 +1008,10 @@ class TeamHubManager:
                         continue
                     old_m = mems.get(uid) if isinstance(mems.get(uid), dict) else {}
                     merged_m = {**old_m, **rmem}
+                    old_ov = old_m.get("ai_api_override") if isinstance(old_m.get("ai_api_override"), dict) else {}
+                    new_ov = merged_m.get("ai_api_override") if isinstance(merged_m.get("ai_api_override"), dict) else {}
+                    if not new_ov.get("api_key") and old_ov.get("api_key"):
+                        merged_m["ai_api_override"] = {**new_ov, "api_key": old_ov["api_key"]}
                     if merged_m.get("avatar"):
                         merged_m["avatar"] = sanitize_avatar_url(upgrade_legacy_avatar(merged_m.get("avatar")))
                     mems[uid] = merged_m
@@ -1053,7 +1097,7 @@ class TeamHubManager:
                     for uid, mem in (payload_data.get("members") or {}).items():
                         if not isinstance(mem, dict):
                             continue
-                        slim_members[uid] = {
+                        slim_m = {
                             k: mem.get(k)
                             for k in (
                                 "user_id", "member_code", "nickname", "display_name",
@@ -1064,16 +1108,21 @@ class TeamHubManager:
                             )
                             if k in mem
                         }
+                        if "ai_api_override" in slim_m:
+                            slim_m["ai_api_override"] = redact_sensitive_config(slim_m["ai_api_override"])
+                        if "pending_remote_config" in slim_m:
+                            slim_m["pending_remote_config"] = redact_sensitive_config(slim_m["pending_remote_config"])
+                        slim_members[uid] = slim_m
                     compact_obj = {
                         "compact": True,
                         "lock": payload_data.get("lock"),
                         "queue": payload_data.get("queue"),
-                        "global_logic": payload_data.get("global_logic"),
+                        "global_logic": redact_sensitive_config(payload_data.get("global_logic")),
                         "members": slim_members,
                         "runs": (payload_data.get("runs") or [])[-15:],
                         "errors": (payload_data.get("errors") or [])[-12:],
                         "ai_chats": (payload_data.get("ai_chats") or [])[-12:],
-                        "feedbacks": (payload_data.get("feedbacks") or [])[-12:],
+                        "feedbacks": redact_sensitive_config((payload_data.get("feedbacks") or [])[-12:]),
                     }
                     pkt = _auto_cloud_pack(compact_obj)
                     req = urllib.request.Request(
@@ -1395,9 +1444,18 @@ class TeamHubManager:
             pending = mem.get("pending_remote_config")
             if isinstance(pending, dict):
                 mem["pending_remote_config"] = None
-                mem["config"] = pending
+                restored = copy.deepcopy(pending)
+                if isinstance(cur_cfg, dict):
+                    if not restored.get("luya_pass") and cur_cfg.get("luya_pass"):
+                        restored["luya_pass"] = cur_cfg["luya_pass"]
+                    cur_ai = cur_cfg.get("ai_assistant")
+                    res_ai = restored.get("ai_assistant")
+                    if isinstance(cur_ai, dict) and isinstance(res_ai, dict):
+                        if not res_ai.get("api_key") and cur_ai.get("api_key"):
+                            res_ai["api_key"] = cur_ai["api_key"]
+                mem["config"] = restored
                 self._save_state_local_and_push()
-                return pending
+                return restored
             return None
 
     def resolve_ai_api_for_me(self):
@@ -1560,7 +1618,7 @@ class TeamHubManager:
                 "content": txt[:1500],
                 "status": "pending",
                 "admin_reply": "",
-                "config_snapshot": cfg if isinstance(cfg, dict) else (mem.get("config") or {}),
+                "config_snapshot": redact_sensitive_config(cfg if isinstance(cfg, dict) else (mem.get("config") or {})),
                 "last_error": error_detail if isinstance(error_detail, dict) else mem.get("last_error"),
             }
             fbs = self._state.setdefault("feedbacks", [])
@@ -1655,6 +1713,8 @@ class TeamHubManager:
     def verify_admin(self, passcode, password, client_id="local"):
         with self._lock:
             now = time.time()
+            if len(self._admin_fail_tracker) > 64:
+                _prune_fail_tracker(self._admin_fail_tracker, now)
             rec = self._admin_fail_tracker.get(client_id) or {"cnt": 0, "until": 0.0}
             if rec.get("until", 0.0) > now:
                 wait_s = max(1, int(rec["until"] - now))
@@ -1668,7 +1728,8 @@ class TeamHubManager:
             if not ok:
                 cnt = int(rec.get("cnt", 0)) + 1
                 until = (now + ADMIN_LOCKOUT_SEC) if cnt >= ADMIN_MAX_FAILS else 0.0
-                self._admin_fail_tracker[client_id] = {"cnt": cnt, "until": until}
+                self._admin_fail_tracker[client_id] = {"cnt": cnt, "until": until, "last_ts": now}
+                _prune_fail_tracker(self._admin_fail_tracker, now)
                 if cnt >= ADMIN_MAX_FAILS:
                     return {
                         "ok": False,
@@ -1896,10 +1957,9 @@ class TeamHubManager:
     def _detect_lan_ips(self):
         ips = []
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
             if ip and ip != "127.0.0.1":
                 ips.append(ip)
         except Exception:

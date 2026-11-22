@@ -21,6 +21,7 @@ import io
 import socket
 import threading
 import urllib.request
+import urllib.parse
 import urllib.error
 import ctypes
 from ctypes import wintypes
@@ -294,9 +295,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.8.6"
+APP_VERSION = "2.8.7"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.8.6","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.8.7","url":"新版exe的下载直链"}
 DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
 GEMINI_MODEL_CANDIDATES = (
     "gemini-flash-latest",
@@ -334,21 +335,35 @@ class DingTalkInterrupted(RuntimeError):
     """发送钉钉过程中检测到用户关闭、最小化或主动切走窗口时抛出的可恢复中断异常。"""
 
 
-def get_user_idle_seconds():
-    """读取用户最后一次键鼠输入距今的秒数（失败时返回较大值以免误判忙碌）。"""
-    if os.name != "nt":
-        return 999.0
-    try:
-        class _LASTINPUTINFO(ctypes.Structure):
-            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
 
+
+_WIN32_IDLE_APIS = None
+
+
+def _get_win32_idle_apis():
+    global _WIN32_IDLE_APIS
+    if _WIN32_IDLE_APIS is None and os.name == "nt":
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
         user32.GetLastInputInfo.restype = wintypes.BOOL
         kernel32.GetTickCount.argtypes = []
         kernel32.GetTickCount.restype = wintypes.DWORD
+        _WIN32_IDLE_APIS = (user32, kernel32)
+    return _WIN32_IDLE_APIS
 
+
+def get_user_idle_seconds():
+    """读取用户最后一次键鼠输入距今的秒数（复用 Win32 API 句柄，失败时返回较大值以免误判忙碌）。"""
+    if os.name != "nt":
+        return 999.0
+    try:
+        apis = _get_win32_idle_apis()
+        if not apis:
+            return 999.0
+        user32, kernel32 = apis
         lii = _LASTINPUTINFO()
         lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
         if not user32.GetLastInputInfo(ctypes.byref(lii)):
@@ -1487,12 +1502,32 @@ def get_candidate_teams(cfg=None):
 AI_SUMMARY_STYLES = build_ai_summary_styles("")
 
 
+def _validate_safe_http_url(raw_url, require_https=False):
+    """校验外部请求或更新 URL 必须为安全 HTTP(S) 地址，阻断 file://、控制字符与云元数据内网地址。"""
+    u = str(raw_url or "").strip()
+    if not u or any(ch in u for ch in ("\r", "\n", "\x00")):
+        return None
+    try:
+        p = urllib.parse.urlparse(u)
+    except Exception:
+        return None
+    allowed_schemes = ("https",) if require_https else ("http", "https")
+    if p.scheme.lower() not in allowed_schemes or not p.netloc:
+        return None
+    host = (p.hostname or "").strip().lower()
+    if not host or host == "169.254.169.254" or host.startswith("169.254."):
+        return None
+    return u
+
+
 def _call_openai_compat_generate(api_base, api_key, model_name, sys_prompt, contents, temperature=0.4, max_tokens=900, timeout_sec=24):
     """OpenAI 兼容格式通用调度器（支持多模态图片与纯文本，对外彻底隐藏底层供应商信息）。"""
     base = str(api_base or "").strip().rstrip("/")
     if not base:
         return {"ok": False, "source": "no_base", "model": "", "error": "未填兼容接口地址"}
     url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+    if not _validate_safe_http_url(url, require_https=False):
+        return {"ok": False, "source": "invalid_url", "model": "", "error": "接口地址协议不安全或格式无效"}
     key = str(api_key or "").strip()
     if not key:
         return {"ok": False, "source": "no_key", "model": "", "error": "接口密钥未配置"}
@@ -1609,7 +1644,7 @@ def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens
 
     models_to_try = []
     for m in (pref_m, *GEMINI_MODEL_CANDIDATES):
-        clean_m = m.replace("models/", "").strip()
+        clean_m = re.sub(r"[^A-Za-z0-9._\-]", "", m.replace("models/", "").strip())
         if clean_m and clean_m not in models_to_try:
             models_to_try.append(clean_m)
     if max_models is not None and int(max_models) > 0:
@@ -1624,6 +1659,8 @@ def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens
     ssl_ctx = ssl.create_default_context()
     last_err = ""
     base_host = api_base or "https://generativelanguage.googleapis.com"
+    if not _validate_safe_http_url(base_host, require_https=False):
+        return {"ok": False, "source": "invalid_url", "model": "", "error": "接口地址协议不安全或格式无效"}
 
     for model_name in models_to_try:
         url = f"{base_host}/v1beta/models/{model_name}:generateContent?key={api_key}"
@@ -2570,8 +2607,8 @@ def _local_smart_chat_fallback(cfg_norm, user_prompt, arch_ctx, api_err="", hist
     )
 
 
-def collect_report_context_for_ai(include_prev_shot=False, extra_img_path=None):
-    """采集本地最新汇总表截图（及可选上轮对比图）和桌面最新明细 TSV 摘要供 AI 总结。"""
+def collect_report_context_for_ai(include_prev_shot=False, extra_img_path=None, encode_images=True):
+    """采集本地最新汇总表截图（及可选上轮对比图）和桌面最新明细 TSV 摘要供 AI 总结；仅查元数据时可跳过编码。"""
     cand_imgs = []
     if extra_img_path is not None and Path(extra_img_path).exists():
         cand_imgs.append(Path(extra_img_path))
@@ -2614,7 +2651,7 @@ def collect_report_context_for_ai(include_prev_shot=False, extra_img_path=None):
     want_n = 2 if include_prev_shot else 1
     for p, mtime in picked_imgs[:want_n]:
         try:
-            b64 = _encode_image_b64_scaled(p, max_dim=3072)
+            b64 = _encode_image_b64_scaled(p, max_dim=3072) if encode_images else ""
             images_out.append({
                 "name": p.name,
                 "path": str(p),
@@ -4203,8 +4240,9 @@ def fetch_remote_version():
         with urllib.request.urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode("utf-8"))
         ver, url = data.get("version"), data.get("url")
-        if ver and url:
-            return ver, url
+        safe_u = _validate_safe_http_url(url, require_https=True)
+        if ver and safe_u:
+            return ver, safe_u
     except Exception:
         pass
     return None
@@ -5762,7 +5800,7 @@ def check_wps_logged_in(page):
             el = page.query_selector(sel)
             if el and el.is_visible():
                 return True
-        except:
+        except Exception:
             pass
     for frame in page.frames:
         for sel in check_selectors:
@@ -5770,14 +5808,14 @@ def check_wps_logged_in(page):
                 el = frame.query_selector(sel)
                 if el and el.is_visible():
                     return True
-            except:
+            except Exception:
                 pass
     return False
 
 
 def click_in_all_frames(page, button_text, max_wait=20):
-    for i in range(max_wait):
-        time.sleep(1)
+    for _i in range(max_wait):
+        sleep_check(1)
         for sel in [
             f"button:has-text('{button_text}')",
             f"text='{button_text}'",
@@ -5787,7 +5825,7 @@ def click_in_all_frames(page, button_text, max_wait=20):
                 page.click(sel, timeout=800)
                 log(f"  点了「{button_text}」")
                 return True
-            except:
+            except Exception:
                 pass
         for frame in page.frames:
             for sel in [f"button:has-text('{button_text}')", f"text='{button_text}'"]:
@@ -5795,7 +5833,7 @@ def click_in_all_frames(page, button_text, max_wait=20):
                     frame.click(sel, timeout=500)
                     log(f"  点了「{button_text}」")
                     return True
-                except:
+                except Exception:
                     pass
     return False
 

@@ -9,6 +9,7 @@
 
 import base64
 from collections import deque
+import functools
 import hashlib
 import hmac
 from http import HTTPStatus
@@ -74,10 +75,9 @@ class CloudRelayCrypto:
         s = unicodedata.normalize("NFKC", str(name or ""))
         return "".join(ch for ch in s if not ch.isspace()).casefold()
 
-    @classmethod
-    def derive_room_and_key(cls, nickname, password):
-        nk = cls.normalize_nick_key(nickname)
-        pw = str(password or "")
+    @staticmethod
+    @functools.lru_cache(maxsize=16)
+    def _derive_cached(nk, pw):
         room_mac = hmac.new(
             b"SheetMate-Room-v28",
             f"{nk}::{pw}".encode("utf-8"),
@@ -96,6 +96,12 @@ class CloudRelayCrypto:
             "down_topic": f"sm28_d_{room_mac}",
             "master_key": master_key,
         }
+
+    @classmethod
+    def derive_room_and_key(cls, nickname, password):
+        nk = cls.normalize_nick_key(nickname)
+        pw = str(password or "")
+        return dict(cls._derive_cached(nk, pw))
 
     @staticmethod
     def _keystream(master_key, nonce, length):
@@ -460,8 +466,8 @@ def _build_qr_matrix(text):
     return best_grid
 
 
-def generate_qr_svg(url_text, box_px=200):
-    """纯离线生成清晰可扫描的 SVG 二维码。"""
+@functools.lru_cache(maxsize=16)
+def _build_qr_svg_cached(url_text, box_px):
     mat = _build_qr_matrix(url_text)
     n = len(mat)
     quiet = 3
@@ -485,6 +491,11 @@ def generate_qr_svg(url_text, box_px=200):
         f'<path d="{d_str}" fill="#0F172A"/>'
         f'</svg>'
     )
+
+
+def generate_qr_svg(url_text, box_px=200):
+    """纯离线生成清晰可扫描的 SVG 二维码（按 URL 与尺寸 LRU 缓存）。"""
+    return _build_qr_svg_cached(str(url_text or ""), int(box_px or 200))
 
 
 # ==================== 手机/跨网远程伴侣 Web 应用模板 ====================
@@ -1494,10 +1505,9 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
 def _detect_lan_ipv4_list():
     ips = []
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip0 = s.getsockname()[0]
-        s.close()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip0 = s.getsockname()[0]
         if ip0 and not ip0.startswith(("127.", "169.254.")):
             ips.append(ip0)
     except Exception:
@@ -1531,6 +1541,7 @@ class MobileBridgeManager:
         self._relay_stop = threading.Event()
         self._relay_thread = None
         self._relay_push_thread = None
+        self._nonce_lock = threading.Lock()
         self._relay_seen_nonces = deque(maxlen=250)
         self._relay_last_active_ts = 0.0
         self._relay_last_pushed_seq = -1
@@ -1603,9 +1614,25 @@ class MobileBridgeManager:
             pass
         return ""
 
+    @staticmethod
+    def _prune_fail_tracker(tracker, now, max_entries=256):
+        expired = [
+            k for k, v in tracker.items()
+            if (v.get("until", 0.0) > 0.0 and v["until"] <= now)
+            or (now - float(v.get("last_ts", now))) > 3600.0
+        ]
+        for k in expired:
+            tracker.pop(k, None)
+        if len(tracker) > max_entries:
+            oldest = sorted(tracker.items(), key=lambda it: float(it[1].get("last_ts", 0.0)))[: len(tracker) - max_entries]
+            for k, _ in oldest:
+                tracker.pop(k, None)
+
     def verify_pin_and_login(self, nick, pin, client_id="local"):
         now = time.time()
         with self._lock:
+            if len(self._auth_fail_tracker) > 64:
+                self._prune_fail_tracker(self._auth_fail_tracker, now)
             rec = self._auth_fail_tracker.get(client_id) or {"cnt": 0, "until": 0.0}
             if rec.get("until", 0.0) > now:
                 wait_s = max(1, int(rec["until"] - now))
@@ -1615,7 +1642,8 @@ class MobileBridgeManager:
             if not got_pin or not hmac.compare_digest(got_pin, want_pin):
                 cnt = int(rec.get("cnt", 0)) + 1
                 until = (now + AUTH_LOCKOUT_SEC) if cnt >= AUTH_MAX_FAILS else 0.0
-                self._auth_fail_tracker[client_id] = {"cnt": cnt, "until": until}
+                self._auth_fail_tracker[client_id] = {"cnt": cnt, "until": until, "last_ts": now}
+                self._prune_fail_tracker(self._auth_fail_tracker, now)
                 if cnt >= AUTH_MAX_FAILS:
                     return {
                         "ok": False,
@@ -1641,6 +1669,11 @@ class MobileBridgeManager:
                     self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Mobile-Token")
                     self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
+                def _send_security_headers(self):
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("X-Frame-Options", "DENY")
+                    self.send_header("Referrer-Policy", "no-referrer")
+
                 def do_OPTIONS(self):
                     self.send_response(HTTPStatus.NO_CONTENT)
                     self._cors()
@@ -1650,6 +1683,7 @@ class MobileBridgeManager:
                     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
                     self.send_response(code)
                     self._cors()
+                    self._send_security_headers()
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Cache-Control", "no-store")
                     self.send_header("Content-Length", str(len(data)))
@@ -1675,6 +1709,7 @@ class MobileBridgeManager:
                         body = MOBILE_HTML_TEMPLATE.encode("utf-8")
                         self.send_response(HTTPStatus.OK)
                         self._cors()
+                        self._send_security_headers()
                         self.send_header("Content-Type", "text/html; charset=utf-8")
                         self.send_header("Cache-Control", "no-store")
                         self.send_header("Content-Length", str(len(body)))
@@ -1929,7 +1964,8 @@ class MobileBridgeManager:
                             continue
                         if ev.get("event") != "message":
                             continue
-                        obj = CloudRelayCrypto.decrypt_packet(master_key, ev.get("message", ""), seen_nonces=self._relay_seen_nonces)
+                        with self._nonce_lock:
+                            obj = CloudRelayCrypto.decrypt_packet(master_key, ev.get("message", ""), seen_nonces=self._relay_seen_nonces)
                         if obj is not None:
                             threading.Thread(
                                 target=self._handle_relay_command,
@@ -2083,31 +2119,39 @@ class MobileBridgeManager:
             self.start()
         with self._lock:
             port = self._port
-            lan_urls = [f"http://{ip}:{port}" for ip in _detect_lan_ipv4_list()] if port else []
+            running = self._server is not None
+            tunnel_running = bool(self._tunnel_running)
             pub = self._public_url
-            qr_github_svg = generate_qr_svg(GITHUB_PAGES_URL, box_px=192)
-            local_target = pub or (lan_urls[0] if lan_urls else "")
-            qr_local_svg = generate_qr_svg(local_target, box_px=192) if local_target else ""
-            return {
-                "ok": True,
-                "running": self._server is not None,
-                "port": port,
-                "lan_urls": lan_urls,
-                "tunnel_running": bool(self._tunnel_running),
-                "public_url": pub,
-                "tunnel_error": self._tunnel_error,
-                "github_pages_url": GITHUB_PAGES_URL,
-                "remote_password": self.mobile_pin,
-                "cloud_relay_enabled": bool(self.cloud_relay_enabled),
-                "cloud_relay_connected": bool(self._relay_connected),
-                "cloud_relay_error": self._relay_error,
-                "local_nick": self._get_local_nick(),
-                "qr_target": GITHUB_PAGES_URL,
-                "qr_svg": qr_github_svg,
-                "qr_local_target": local_target,
-                "qr_local_svg": qr_local_svg,
-                "need_pin": True,
-            }
+            tunnel_error = self._tunnel_error
+            remote_pin = self.mobile_pin
+            relay_enabled = bool(self.cloud_relay_enabled)
+            relay_conn = bool(self._relay_connected)
+            relay_err = self._relay_error
+            local_nick = self._get_local_nick()
+        lan_urls = [f"http://{ip}:{port}" for ip in _detect_lan_ipv4_list()] if port else []
+        local_target = pub or (lan_urls[0] if lan_urls else "")
+        qr_github_svg = generate_qr_svg(GITHUB_PAGES_URL, box_px=192)
+        qr_local_svg = generate_qr_svg(local_target, box_px=192) if local_target else ""
+        return {
+            "ok": True,
+            "running": running,
+            "port": port,
+            "lan_urls": lan_urls,
+            "tunnel_running": tunnel_running,
+            "public_url": pub,
+            "tunnel_error": tunnel_error,
+            "github_pages_url": GITHUB_PAGES_URL,
+            "remote_password": remote_pin,
+            "cloud_relay_enabled": relay_enabled,
+            "cloud_relay_connected": relay_conn,
+            "cloud_relay_error": relay_err,
+            "local_nick": local_nick,
+            "qr_target": GITHUB_PAGES_URL,
+            "qr_svg": qr_github_svg,
+            "qr_local_target": local_target,
+            "qr_local_svg": qr_local_svg,
+            "need_pin": True,
+        }
 
 
 def export_static_mobile_web(dest_path):

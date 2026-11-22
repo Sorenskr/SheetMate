@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.8.6 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.8.7 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -1012,7 +1012,7 @@ class _SheetMateController:
         cfg_snap = self.get_config()
         ai_cfg = cfg_snap.get("ai_assistant") if isinstance(cfg_snap.get("ai_assistant"), dict) else {}
         focus_team = str(ai_cfg.get("focus_team") or "").strip()
-        ctx = self.app.collect_report_context_for_ai(include_prev_shot=False) if hasattr(self.app, "collect_report_context_for_ai") else {}
+        ctx = self.app.collect_report_context_for_ai(include_prev_shot=False, encode_images=False) if hasattr(self.app, "collect_report_context_for_ai") else {}
         if hasattr(self.app, "build_ai_summary_styles"):
             styles = self.app.build_ai_summary_styles(focus_team)
         else:
@@ -1308,7 +1308,7 @@ class _SheetMateController:
             return {"ok": False, "message": "协同模块未加载"}
         b = body if isinstance(body, dict) else {}
         if b.get("enable", True):
-            port = int(b.get("port") or 18790)
+            port = max(1024, min(65535, _safe_int(b.get("port"), 18790)))
             res = self.hub.start_center_server(port=port)
             self.hub.admin_update_sync_settings({"server_port": port, "server_autostart": True})
             return res
@@ -2018,8 +2018,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/png" href="/icon.png?v=2.7.0" />
-<link rel="shortcut icon" href="/favicon.ico?v=2.7.0" />
+<link rel="icon" type="image/png" href="/icon.png?v=2.8.7" />
+<link rel="shortcut icon" href="/favicon.ico?v=2.8.7" />
 <style>
   :root {
     --bg: #EAF0F8;
@@ -4395,9 +4395,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.8.6" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.8.7" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.8.6</span>
+          <span class="ver-pill" id="verBadge">v2.8.7</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -5984,6 +5984,10 @@ function safeAvatarUrl(rawUrl) {
     return s;
   }
   return "";
+}
+function safeExternalHttpUrl(rawUrl) {
+  const s = String(rawUrl || "").trim();
+  return /^https?:\/\/[^\s"'<>]+$/i.test(s) ? s : "";
 }
 function formatSafeMarkdown(raw) {
   const safeLines = cleanText(raw).split(/\r?\n/);
@@ -7974,10 +7978,13 @@ async function pollState() {
     appendLogLines(st.logs);
 
     if (st.update_info && st.update_info.url) {
-      updateUrl = st.update_info.url;
-      $("updateBtn").style.display = "flex";
-      $("updateDot").style.display = "block";
-      $("updateBtn").title = `发现新版 v${st.update_info.version}，点击下载`;
+      const safeU = safeExternalHttpUrl(st.update_info.url);
+      if (safeU) {
+        updateUrl = safeU;
+        $("updateBtn").style.display = "flex";
+        $("updateDot").style.display = "block";
+        $("updateBtn").title = `发现新版 v${st.update_info.version}，点击下载`;
+      }
     }
     if (st.data_brief) applyDataBriefUI(st.data_brief);
     if (typeof st.chat_seq === "number" && st.chat_seq !== lastChatSeq && Array.isArray(st.ai_history)) {
@@ -8662,9 +8669,10 @@ function bindEvents() {
   };
 
   $("updateBtn").onclick = async () => {
-    if (!updateUrl) return;
+    const safeU = safeExternalHttpUrl(updateUrl);
+    if (!safeU) return;
     const ok = await iosAlert("发现新版本", "检测到新版 SheetMate，是否前往 GitHub 下载？", { okText: "立即前往", cancelText: "稍后" });
-    if (ok) window.open(updateUrl, "_blank");
+    if (ok) window.open(safeU, "_blank", "noopener,noreferrer");
   };
 
   window.addEventListener("pagehide", () => {
@@ -8850,13 +8858,13 @@ function renderAdminDashboard(d) {
   }
 
   $("adminKpiGrid").innerHTML = [
-    ["总运行次", stats.total_runs || 0],
-    ["成功次", stats.ok_runs || 0],
-    ["失败次", stats.err_runs || 0],
-    ["成功率", `${stats.success_rate || 0}%`],
-    ["均耗时", `${stats.avg_duration_sec || 0}秒`],
-    ["活跃人数", `${stats.active_users_in_range || 0}/${stats.total_registered_members || 0}`],
-  ].map(([lbl, val]) => `<div class="admin-kpi"><div class="admin-kpi-val">${val}</div><div class="admin-kpi-lbl">${lbl}</div></div>`).join("");
+    ["总运行次", Number(stats.total_runs) || 0],
+    ["成功次", Number(stats.ok_runs) || 0],
+    ["失败次", Number(stats.err_runs) || 0],
+    ["成功率", `${Number(stats.success_rate) || 0}%`],
+    ["均耗时", `${Number(stats.avg_duration_sec) || 0}秒`],
+    ["活跃人数", `${Number(stats.active_users_in_range) || 0}/${Number(stats.total_registered_members) || 0}`],
+  ].map(([lbl, val]) => `<div class="admin-kpi"><div class="admin-kpi-val">${escapeHtmlStr(val)}</div><div class="admin-kpi-lbl">${escapeHtmlStr(lbl)}</div></div>`).join("");
 
   // 锁与联机状态
   const lckSt = d.lock_status || {};
@@ -8882,8 +8890,8 @@ function renderAdminDashboard(d) {
     hdr.className = "feed-item";
     hdr.innerHTML = "<strong>成员累计排行</strong>" + pms.map((pm) =>
       `<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;">
-        <span>${escapeHtmlStr(pm.display_name)}${pm.admin_remark ? " [" + escapeHtmlStr(pm.admin_remark) + "]" : ""}</span>
-        <span>总 <strong>${pm.total_runs}</strong> 次（成 ${pm.ok_runs} / 败 ${pm.err_runs}）</span>
+        <span>${escapeHtmlStr(pm.display_name || "未知成员")}${pm.admin_remark ? " [" + escapeHtmlStr(pm.admin_remark) + "]" : ""}</span>
+        <span>总 <strong>${Number(pm.total_runs) || 0}</strong> 次（成 ${Number(pm.ok_runs) || 0} / 败 ${Number(pm.err_runs) || 0}）</span>
       </div>`
     ).join("");
     runsWrap.appendChild(hdr);
@@ -8898,7 +8906,7 @@ function renderAdminDashboard(d) {
     for (const r of rlist.slice(0, 20)) {
       const row = document.createElement("div");
       row.className = "feed-item";
-      row.innerHTML = `<div style="display:flex;justify-content:space-between;"><strong>${escapeHtmlStr(r.member_name)} (${r.mode === "capture_only" ? "仅截图" : "全流程"} · ${r.trigger_type === "schedule" ? "定时" : "手动"})</strong><span style="color:${r.status === "ok" ? "var(--green)" : "var(--red)"}">${r.status === "ok" ? "成功" : (r.err_code || r.status)} · ${r.duration_sec}s</span></div><div style="color:var(--sub);">${escapeHtmlStr(r.ts)}</div>`;
+      row.innerHTML = `<div style="display:flex;justify-content:space-between;"><strong>${escapeHtmlStr(r.member_name || r.display_name || "成员")} (${r.mode === "capture_only" ? "仅截图" : "全流程"} · ${r.trigger_type === "schedule" ? "定时" : "手动"})</strong><span style="color:${r.status === "ok" ? "var(--green)" : "var(--red)"}">${r.status === "ok" ? "成功" : escapeHtmlStr(r.err_code || r.status || "异常")} · ${Number(r.duration_sec) || 0}s</span></div><div style="color:var(--sub);">${escapeHtmlStr(r.ts)}</div>`;
       runsWrap.appendChild(row);
     }
   }
@@ -9043,7 +9051,7 @@ function renderAdminDashboard(d) {
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
         <div style="display:flex;align-items:center;gap:8px;">
           <img src="${safeAvatarUrl(e.avatar)}" style="width:24px;height:24px;border-radius:50%;object-fit:cover;" alt="" />
-          <strong>${escapeHtmlStr(e.member_name)}${e.admin_remark ? " [" + escapeHtmlStr(e.admin_remark) + "]" : ""}</strong>
+          <strong>${escapeHtmlStr(e.display_name || e.member_name || "成员")}${e.admin_remark ? " [" + escapeHtmlStr(e.admin_remark) + "]" : ""}</strong>
           <span class="audit-tag err">${escapeHtmlStr(e.code || "ERR")}</span>
         </div>
         <span style="color:var(--sub);">${escapeHtmlStr(e.ts || "")}</span>
@@ -9059,7 +9067,7 @@ function renderAdminDashboard(d) {
       <div style="display:flex;justify-content:space-between;gap:8px;">
         <div style="display:flex;align-items:center;gap:7px;">
           <img src="${safeAvatarUrl(c.avatar)}" style="width:20px;height:20px;border-radius:50%;object-fit:cover;" alt="" />
-          <strong>${escapeHtmlStr(c.member_name)}${c.admin_remark ? " [" + escapeHtmlStr(c.admin_remark) + "]" : ""} · ${c.role === "user" ? "提问" : "AI 回复"}</strong>
+          <strong>${escapeHtmlStr(c.display_name || c.member_name || "成员")}${c.admin_remark ? " [" + escapeHtmlStr(c.admin_remark) + "]" : ""} · ${c.role === "user" ? "提问" : "AI 回复"}</strong>
         </div>
         <span style="color:var(--sub);">${escapeHtmlStr(c.ts || "")}</span>
       </div>
@@ -9081,14 +9089,14 @@ function renderAdminDashboard(d) {
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
           <div style="display:flex;align-items:center;gap:8px;">
             <img src="${safeAvatarUrl(fb.avatar)}" style="width:28px;height:28px;border-radius:50%;object-fit:cover;" alt="" />
-            <strong>${escapeHtmlStr(fb.member_name)}${fb.admin_remark ? " [" + escapeHtmlStr(fb.admin_remark) + "]" : ""}</strong>
+            <strong>${escapeHtmlStr(fb.display_name || fb.member_name || "成员")}${fb.admin_remark ? " [" + escapeHtmlStr(fb.admin_remark) + "]" : ""}</strong>
             <span class="audit-tag warn">${escapeHtmlStr(fb.category || "反馈")}</span>
             <span class="audit-tag ${fb.status === "resolved" ? "ok" : "warn"}">${fb.status === "resolved" ? "已处理" : "待处理"}</span>
           </div>
           <span style="font-size:11.5px;color:var(--sub);">${escapeHtmlStr(fb.ts || "")}</span>
         </div>
         <div style="font-size:13px;white-space:pre-wrap;">${escapeHtmlStr(fb.content || "")}</div>
-        <div style="font-size:11.5px;color:var(--sub);">附带状态快照：目标群=${escapeHtmlStr((fb.config_brief && fb.config_brief.dt_search) || "-")} · 粘贴等待=${(fb.config_brief && fb.config_brief.dt_paste_delay_sec) || 3}s · 静音发送=${Boolean(fb.config_brief && fb.config_brief.dt_silent_send)} · 自动发=${Boolean(fb.config_brief && fb.config_brief.dt_auto_send)}</div>
+        ${(() => { const cbSnap = fb.config_brief || fb.config_snapshot || {}; return `<div style="font-size:11.5px;color:var(--sub);">附带状态快照：目标群=${escapeHtmlStr(cbSnap.dt_search || "-")} · 粘贴等待=${Number(cbSnap.dt_paste_delay_sec) || 3}s · 静音发送=${Boolean(cbSnap.dt_silent_send)} · 自动发=${Boolean(cbSnap.dt_auto_send)}</div>`; })()}
         <div style="display:flex;gap:6px;align-items:center;">
           <input type="text" class="small-input js-fb-reply" style="flex:1;" value="${escapeHtmlStr(fb.admin_reply || "")}" placeholder="填写处理回复或备注" />
           <button type="button" class="pill-action-btn ok js-fb-done">标为已处理</button>
@@ -9339,8 +9347,8 @@ function bindTeamCollabAndAdminEvents() {
   }
   if ($("openMobileGithubBtn")) {
     $("openMobileGithubBtn").onclick = () => {
-      const v = $("mobileGithubUrlInput").value.trim();
-      if (v) window.open(v, "_blank");
+      const v = safeExternalHttpUrl($("mobileGithubUrlInput").value);
+      if (v) window.open(v, "_blank", "noopener,noreferrer");
     };
   }
   if ($("mobileModalCloseBtn")) {
@@ -9365,8 +9373,8 @@ function bindTeamCollabAndAdminEvents() {
   }
   if ($("openMobileWebBtn")) {
     $("openMobileWebBtn").onclick = () => {
-      const v = $("mobilePublicUrlInput").value.trim() || $("mobileLanUrlInput").value.trim();
-      if (v) window.open(v, "_blank");
+      const v = safeExternalHttpUrl($("mobilePublicUrlInput").value || $("mobileLanUrlInput").value);
+      if (v) window.open(v, "_blank", "noopener,noreferrer");
     };
   }
   if ($("toggleMobileTunnelBtn")) {
@@ -9856,9 +9864,15 @@ def _make_handler(ctrl, token):
             qtok = (qs.get("token") or [""])[0]
             return hmac.compare_digest(hdr, token) or hmac.compare_digest(qtok, token)
 
+        def _send_security_headers(self):
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+
         def _send_json(self, payload, status=HTTPStatus.OK):
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
+            self._send_security_headers()
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(data)))
@@ -9903,6 +9917,7 @@ def _make_handler(ctrl, token):
             if parsed.path == "/":
                 body = HTML_TEMPLATE.replace("__TOKEN_JSON__", json.dumps(token)).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
+                self._send_security_headers()
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
@@ -10092,6 +10107,10 @@ def _make_handler(ctrl, token):
                 return
 
             if parsed.path == "/api/sync-config":
+                atok = self.headers.get("X-Admin-Token") or ""
+                if not ctrl.admin_is_authed(atok):
+                    self._send_json({"ok": False, "auth_required": True, "message": "需要超级管理员验证"}, HTTPStatus.FORBIDDEN)
+                    return
                 body = self._read_json()
                 self._send_json(ctrl.update_sync_config_payload(body))
                 return
