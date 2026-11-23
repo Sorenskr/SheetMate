@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
 """
-暗号表助手 SheetMate 核心自动化引擎（v2.9.3）：
+暗号表助手 SheetMate 核心自动化引擎（v2.9.4）：
 - 自动登录数据后台拉取、格式清洗与 WPS 在线表格自动写入
 - 汇总表自定义格位校准、高清选区截图与多尺度无坐标钉钉静音发群
 - 支持白天/夜间自定义排期、AI 个人习惯持久化记忆与跨电脑云同步扩展
 """
 
+import copy
 import ipaddress
 import os
 import sys
@@ -347,9 +348,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.9.3"
+APP_VERSION = "2.9.4"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.9.3","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.9.4","url":"新版exe的下载直链"}
 DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
 GEMINI_MODEL_CANDIDATES = (
     "gemini-flash-latest",
@@ -368,9 +369,11 @@ _pause_requested = False
 _waiting_recovery = False
 _recovery_choice = None
 _auto_confirmed_recovery_titles = set()
+_auto_confirmed_recovery_counts = {}
 _dt_logged_in_user_cache = {"name": "", "ts": 0.0}
 _runtime_callback = None
 _spotlight_callback = None
+_training_summary_callback = None
 _latest_round_spotlight = None
 _last_diagnosed_detail = None
 _runtime_prompt = {
@@ -604,6 +607,10 @@ def request_resume(action="continue"):
         if _waiting_recovery:
             _recovery_choice = act
             msg = "已收到恢复操作，正在继续当前流程…"
+            try:
+                record_run_trace_event("user_recovery", act)
+            except Exception:
+                pass
         elif _pause_requested:
             _pause_requested = False
             _runtime_prompt = _default_running_prompt()
@@ -792,6 +799,7 @@ def reset_stop():
         _recovery_choice = None
         _last_diagnosed_detail = None
         _auto_confirmed_recovery_titles.clear()
+        _auto_confirmed_recovery_counts.clear()
         _runtime_prompt = _default_running_prompt()
         _runtime_cond.notify_all()
     _notify_runtime_state()
@@ -1133,6 +1141,7 @@ def record_run_journal(cfg, status, mode="full", round_label="", error_detail=No
             "traits": _extract_log_traits(tail),
             "pipeline_cfg": {
                 "dt_paste_delay_sec": c.get("dt_paste_delay_sec", 3),
+                "dt_send_wait_sec": c.get("dt_send_wait_sec", 5),
                 "dt_minimize_after_send": bool(c.get("dt_minimize_after_send", True)),
                 "compose_step_order": pt.get("compose_step_order", "image_text_silent"),
                 "silent_step_order": pt.get("silent_step_order", "uia_first"),
@@ -1441,6 +1450,7 @@ def _safe_ai_cfg_snapshot(cfg):
         "dt_auto_send": c.get("dt_auto_send"),
         "dt_minimize_after_send": c.get("dt_minimize_after_send"),
         "dt_paste_delay_sec": c.get("dt_paste_delay_sec", 3),
+        "dt_send_wait_sec": c.get("dt_send_wait_sec", 5),
         "pipeline_tuning": c.get("pipeline_tuning"),
         "dt_targets_count": len([t for t in (c.get("dt_targets") or []) if t.get("enabled", True)]),
         "dt_time_mode": c.get("dt_time_mode"),
@@ -2816,20 +2826,25 @@ def save_ai_user_memory(mem, notify=True):
 
 
 def export_ai_sync_bundle():
-    """导出可用于跨电脑云同步的个人 AI 记忆、话术偏好及已验证人名纠错映射。"""
+    """导出可用于跨电脑云同步的个人 AI 记忆、话术偏好、运行训练经验及已验证人名纠错映射。"""
     return {
         "ai_user_memory": load_ai_user_memory(),
+        "ai_run_playbook": load_ai_run_playbook(),
         "dt_verified_targets": _load_verified_dingtalk_targets(),
     }
 
 
 def import_ai_sync_bundle(bundle, reset_if_missing=False):
-    """从云端同步包恢复本机 AI 记忆与人名映射，不触发回推避免循环同步。"""
+    """从云端同步包恢复本机 AI 记忆、训练经验与人名映射，不触发回推避免循环同步。"""
     b = bundle if isinstance(bundle, dict) else {}
     if isinstance(b.get("ai_user_memory"), dict):
         save_ai_user_memory(b["ai_user_memory"], notify=False)
     elif reset_if_missing:
         save_ai_user_memory(_default_ai_user_memory(), notify=False)
+    if isinstance(b.get("ai_run_playbook"), dict):
+        save_ai_run_playbook(b["ai_run_playbook"], notify=False)
+    elif reset_if_missing:
+        save_ai_run_playbook(_default_ai_run_playbook(), notify=False)
     vt_in = b.get("dt_verified_targets")
     if isinstance(vt_in, dict):
         clean_vt = {
@@ -2843,6 +2858,495 @@ def import_ai_sync_bundle(bundle, reset_if_missing=False):
         with _AI_MEM_LOCK:
             _atomic_write_json(_verified_targets_file(), {})
     return export_ai_sync_bundle()
+
+
+# ==================== AI 每次运行自训练与问题归纳优化引擎 ====================
+_PLAYBOOK_LOCK = threading.RLock()
+_RUN_TRACE_LOCK = threading.RLock()
+
+DEFAULT_DT_FOCUS_STRATEGIES = (
+    "uia_edit_child",
+    "uia_above_bottombar",
+    "uia_input_wnd_lower",
+    "ratio_bottom_85",
+    "ratio_bottom_89",
+    "ratio_bottom_79",
+)
+DEFAULT_DT_PASTE_METHODS = (
+    "win32_sendinput_ctrl_v",
+    "pywinauto_ctrl_v",
+    "uia_ctrl_v",
+    "context_menu_paste",
+)
+_FOCUS_STRATEGY_CN = {
+    "uia_edit_child": "UIA输入控件精确聚焦",
+    "uia_above_bottombar": "发送底栏正上方安全区聚焦",
+    "uia_input_wnd_lower": "输入容器下半区聚焦",
+    "ratio_bottom_85": "85%底栏高比例聚焦",
+    "ratio_bottom_89": "89%近底栏聚焦",
+    "ratio_bottom_79": "79%中下区兜底聚焦",
+}
+_PASTE_METHOD_CN = {
+    "win32_sendinput_ctrl_v": "Win32硬件扫描码Ctrl+V",
+    "pywinauto_ctrl_v": "pywinauto组合键^v",
+    "uia_ctrl_v": "UIA快捷键Ctrl+V",
+    "context_menu_paste": "输入框右键菜单粘贴",
+}
+
+
+def set_training_summary_callback(fn):
+    global _training_summary_callback
+    _training_summary_callback = fn
+
+
+def _notify_training_summary(obj):
+    cb = _training_summary_callback
+    if cb is not None and isinstance(obj, dict):
+        try:
+            cb(copy.deepcopy(obj))
+        except Exception:
+            pass
+
+
+def _ai_run_playbook_path():
+    return app_dir() / "ai_run_playbook.json"
+
+
+def _new_empty_run_trace(mode="full", round_label=""):
+    return {
+        "mode": str(mode or "full"),
+        "round": str(round_label or ""),
+        "started_at": time.time(),
+        "targets": [],
+        "focus_attempts": [],
+        "paste_attempts": [],
+        "text_methods": [],
+        "silent_attempts": [],
+        "heal_events": [],
+        "user_recoveries": [],
+        "auto_confirms": [],
+        "errors": [],
+    }
+
+
+_RUN_TRAINING_TRACE = _new_empty_run_trace()
+
+
+def reset_run_training_trace(mode="full", round_label=""):
+    """在每轮自动化开始前清空单轮行为轨迹，以便结束后精准复盘提炼经验。"""
+    global _RUN_TRAINING_TRACE
+    with _RUN_TRACE_LOCK:
+        _RUN_TRAINING_TRACE = _new_empty_run_trace(mode=mode, round_label=round_label)
+
+
+def record_run_trace_event(kind, detail="", meta=None):
+    """记录本轮执行中的聚焦策略、粘贴手法、静音选择、自愈与用户操作轨迹。"""
+    k = str(kind or "").strip()
+    if not k:
+        return
+    m = dict(meta) if isinstance(meta, dict) else {}
+    d = str(detail or "").strip()[:180]
+    with _RUN_TRACE_LOCK:
+        tr = _RUN_TRAINING_TRACE
+        if k == "dt_target" and d and d not in tr["targets"]:
+            tr["targets"].append(d)
+        elif k == "focus_ok":
+            tr["focus_attempts"].append({"strategy": d, "ok": True, "meta": m})
+        elif k == "focus_fail":
+            tr["focus_attempts"].append({"strategy": d, "ok": False, "meta": m})
+        elif k == "paste_ok":
+            tr["paste_attempts"].append({"method": d, "ok": True, "focus": str(m.get("focus") or ""), "meta": m})
+        elif k == "paste_fail":
+            tr["paste_attempts"].append({"method": d, "ok": False, "focus": str(m.get("focus") or ""), "reason": str(m.get("reason") or d), "meta": m})
+        elif k == "text_method":
+            tr["text_methods"].append({"method": d, "ok": bool(m.get("ok", True))})
+        elif k == "silent_ok":
+            tr["silent_attempts"].append({"method": d, "ok": True})
+        elif k == "silent_fail":
+            tr["silent_attempts"].append({"method": d, "ok": False, "reason": str(m.get("reason") or "")})
+        elif k == "heal_applied":
+            tr["heal_events"].append({"stage": str(m.get("stage") or ""), "detail": d, "actions": list(m.get("actions") or [])})
+        elif k == "user_recovery":
+            tr["user_recoveries"].append({"choice": d, "ts": time.strftime("%H:%M:%S")})
+        elif k == "auto_confirm":
+            tr["auto_confirms"].append({"detail": d, "attempt": int(m.get("attempt") or 1)})
+        elif k == "error":
+            tr["errors"].append({"code": str(m.get("code") or ""), "detail": d})
+
+
+def get_run_training_trace():
+    with _RUN_TRACE_LOCK:
+        return copy.deepcopy(_RUN_TRAINING_TRACE)
+
+
+def _default_ai_run_playbook():
+    return {
+        "version": 1,
+        "total_runs": 0,
+        "success_runs": 0,
+        "healed_runs": 0,
+        "failed_runs": 0,
+        "streak_ok": 0,
+        "focus_stats": {},
+        "paste_stats": {},
+        "silent_stats": {},
+        "recommended_paste_delay_sec": None,
+        "last_unresolved_issue": None,
+        "problem_lessons": [],
+        "recent_trainings": [],
+    }
+
+
+def _normalize_stat_map(raw_map):
+    out = {}
+    if not isinstance(raw_map, dict):
+        return out
+    for k, v in raw_map.items():
+        ks = str(k or "").strip()[:48]
+        if not ks or not isinstance(v, dict):
+            continue
+        ok_n = max(0, int(v.get("ok") or 0))
+        fail_n = max(0, int(v.get("fail") or 0))
+        out[ks] = {"ok": ok_n, "fail": fail_n}
+    return out
+
+
+def _normalize_ai_run_playbook(raw):
+    base = _default_ai_run_playbook()
+    if not isinstance(raw, dict):
+        return base
+    for k in ("total_runs", "success_runs", "healed_runs", "failed_runs", "streak_ok"):
+        try:
+            base[k] = max(0, int(raw.get(k) or 0))
+        except Exception:
+            base[k] = 0
+    base["focus_stats"] = _normalize_stat_map(raw.get("focus_stats"))
+    base["paste_stats"] = _normalize_stat_map(raw.get("paste_stats"))
+    base["silent_stats"] = _normalize_stat_map(raw.get("silent_stats"))
+    rec_d = raw.get("recommended_paste_delay_sec")
+    if rec_d is not None and not isinstance(rec_d, bool) and str(rec_d).strip() != "":
+        try:
+            base["recommended_paste_delay_sec"] = max(1, min(8, int(rec_d)))
+        except Exception:
+            base["recommended_paste_delay_sec"] = None
+    unres = raw.get("last_unresolved_issue")
+    if isinstance(unres, dict) and (unres.get("problem_summary") or unres.get("err_code")):
+        base["last_unresolved_issue"] = {
+            "ts": str(unres.get("ts") or "")[:24],
+            "err_code": str(unres.get("err_code") or "")[:24],
+            "stage": str(unres.get("stage") or "")[:32],
+            "problem_summary": str(unres.get("problem_summary") or "")[:200],
+            "actions_tried": [str(x)[:40] for x in (unres.get("actions_tried") or [])[:8]],
+        }
+    lessons = raw.get("problem_lessons")
+    if isinstance(lessons, list):
+        clean_l = []
+        for it in lessons[-40:]:
+            if not isinstance(it, dict):
+                continue
+            ps = str(it.get("problem_summary") or "").strip()[:200]
+            if not ps:
+                continue
+            clean_l.append({
+                "key": str(it.get("key") or ps[:40])[:64],
+                "err_code": str(it.get("err_code") or "")[:24],
+                "stage": str(it.get("stage") or "")[:32],
+                "problem_summary": ps,
+                "how_resolved": str(it.get("how_resolved") or "")[:220],
+                "next_run_rule": str(it.get("next_run_rule") or "")[:220],
+                "hit_count": max(1, int(it.get("hit_count") or 1)),
+                "resolved_count": max(0, int(it.get("resolved_count") or 0)),
+                "last_ts": str(it.get("last_ts") or "")[:24],
+            })
+        base["problem_lessons"] = clean_l[-40:]
+    recs = raw.get("recent_trainings")
+    if isinstance(recs, list):
+        clean_r = []
+        for r in recs[-20:]:
+            if not isinstance(r, dict):
+                continue
+            clean_r.append({
+                "ts": str(r.get("ts") or "")[:24],
+                "mode": str(r.get("mode") or "full")[:24],
+                "status": str(r.get("status") or "ok")[:24],
+                "duration_sec": max(0, int(r.get("duration_sec") or 0)),
+                "win_focus": str(r.get("win_focus") or "")[:40],
+                "win_paste": str(r.get("win_paste") or "")[:40],
+                "summary_line": str(r.get("summary_line") or "")[:240],
+            })
+        base["recent_trainings"] = clean_r[-20:]
+    return base
+
+
+def load_ai_run_playbook():
+    """读取本机 AI 每次运行自训练经验库（胜率统计与问题复盘教训）。"""
+    p = _ai_run_playbook_path()
+    with _PLAYBOOK_LOCK:
+        data = None
+        if p.exists():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+        return _normalize_ai_run_playbook(data)
+
+
+def save_ai_run_playbook(pb, notify=True):
+    """线程安全地原子保存 AI 运行训练经验库。"""
+    norm = _normalize_ai_run_playbook(pb)
+    with _PLAYBOOK_LOCK:
+        _atomic_write_json(_ai_run_playbook_path(), norm)
+    if notify:
+        _notify_ai_memory_changed("playbook")
+    return copy.deepcopy(norm)
+
+
+def _rank_playbook_options(default_tuple, stats_map):
+    def_idx = {name: idx for idx, name in enumerate(default_tuple)}
+    base_name = default_tuple[0]
+    bs = (stats_map or {}).get(base_name) or {}
+    base_ok = int(bs.get("ok") or 0)
+    base_fail = int(bs.get("fail") or 0)
+    base_score = (base_ok + 1.5) / (base_ok + base_fail + 3.0)
+
+    def _sort_key(name):
+        st = (stats_map or {}).get(name) or {}
+        ok_n = int(st.get("ok") or 0)
+        fail_n = int(st.get("fail") or 0)
+        score = (ok_n + 1.5) / (ok_n + fail_n + 3.0)
+        # 仅当其它候选具备明确实测胜场 (ok > fail) 且胜率高于首选项时前置，避免单次偶发抖动乱序
+        promoted = 1 if (name != base_name and ok_n >= 1 and ok_n > fail_n and score > base_score + 0.01) else 0
+        return (-promoted, -round(score, 4), def_idx.get(name, 999))
+
+    return sorted(list(default_tuple), key=_sort_key)
+
+
+def get_dt_runtime_strategy_from_playbook(cfg=None):
+    """依据历史成功/失败训练数据动态生成本轮钉钉最优聚焦、粘贴与静音执行顺序。"""
+    pb = load_ai_run_playbook()
+    c = normalize_config(cfg if isinstance(cfg, dict) else {})
+    focus_order = _rank_playbook_options(DEFAULT_DT_FOCUS_STRATEGIES, pb.get("focus_stats"))
+    paste_order = _rank_playbook_options(DEFAULT_DT_PASTE_METHODS, pb.get("paste_stats"))
+
+    try:
+        user_delay = max(0, min(20, int(round(float(c.get("dt_paste_delay_sec", 3) or 3)))))
+    except Exception:
+        user_delay = 3
+    rec_delay = pb.get("recommended_paste_delay_sec")
+    effective_delay = max(user_delay, int(rec_delay)) if (isinstance(rec_delay, int) and user_delay > 0) else user_delay
+
+    pt_cfg = c.get("pipeline_tuning") if isinstance(c.get("pipeline_tuning"), dict) else {}
+    silent_order = str(pt_cfg.get("silent_step_order") or "uia_first")
+    sil_stats = pb.get("silent_stats") or {}
+    uia_ok = int((sil_stats.get("uia") or {}).get("ok") or 0)
+    uia_fail = int((sil_stats.get("uia") or {}).get("fail") or 0)
+    img_ok = int((sil_stats.get("image") or {}).get("ok") or 0)
+    img_fail = int((sil_stats.get("image") or {}).get("fail") or 0)
+    if silent_order == "uia_first" and uia_fail >= 2 and (img_ok + 1.0) / (img_ok + img_fail + 2.0) > (uia_ok + 1.0) / (uia_ok + uia_fail + 2.0):
+        silent_order = "arrow_img_then_uia"
+
+    top_f_cn = _FOCUS_STRATEGY_CN.get(focus_order[0], focus_order[0])
+    top_p_cn = _PASTE_METHOD_CN.get(paste_order[0], paste_order[0])
+    summary = (
+        f"第 {int(pb.get('total_runs') or 0) + 1} 轮训练执行：优先「{top_f_cn}」+「{top_p_cn}」，"
+        f"等待 {effective_delay}s，静音方案「{'图像优先' if silent_order == 'arrow_img_then_uia' else 'UIA优先'}」"
+    )
+    return {
+        "focus_order": focus_order,
+        "paste_order": paste_order,
+        "silent_order": silent_order,
+        "effective_paste_delay_sec": effective_delay,
+        "recent_lessons": list((pb.get("problem_lessons") or [])[-5:]),
+        "summary": summary,
+    }
+
+
+def _upsert_playbook_lesson(pb, err_code, stage, problem_summary, how_resolved, next_run_rule, resolved=False):
+    lessons = list(pb.get("problem_lessons") or [])
+    key = f"{err_code or stage}|{problem_summary[:28]}"
+    now_s = time.strftime("%Y-%m-%d %H:%M:%S")
+    hit = next((x for x in lessons if x.get("key") == key or (err_code and x.get("err_code") == err_code and x.get("stage") == stage)), None)
+    if hit is not None:
+        hit["problem_summary"] = str(problem_summary or hit.get("problem_summary") or "")[:200]
+        if how_resolved:
+            hit["how_resolved"] = str(how_resolved)[:220]
+        if next_run_rule:
+            hit["next_run_rule"] = str(next_run_rule)[:220]
+        hit["hit_count"] = int(hit.get("hit_count") or 1) + 1
+        if resolved:
+            hit["resolved_count"] = int(hit.get("resolved_count") or 0) + 1
+        hit["last_ts"] = now_s
+        lessons = [x for x in lessons if x is not hit] + [hit]
+    else:
+        lessons.append({
+            "key": key[:64],
+            "err_code": str(err_code or "")[:24],
+            "stage": str(stage or "")[:32],
+            "problem_summary": str(problem_summary or "")[:200],
+            "how_resolved": str(how_resolved or "")[:220],
+            "next_run_rule": str(next_run_rule or "")[:220],
+            "hit_count": 1,
+            "resolved_count": 1 if resolved else 0,
+            "last_ts": now_s,
+        })
+    pb["problem_lessons"] = lessons[-40:]
+
+
+def finalize_run_training_summary(cfg, status, mode="full", round_label="", duration_sec=0, error_detail=None):
+    """每次运行结束/异常后自动复盘本次遭遇的问题与解法，持续优化下轮默认策略并推送训练总结。"""
+    trace = get_run_training_trace()
+    pb = load_ai_run_playbook()
+    c = normalize_config(cfg if isinstance(cfg, dict) else {})
+    st_s = str(status or "ok")
+    now_s = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    for fa in trace.get("focus_attempts") or []:
+        s_name = str(fa.get("strategy") or "")
+        if s_name:
+            rec = pb["focus_stats"].setdefault(s_name, {"ok": 0, "fail": 0})
+            rec["ok" if fa.get("ok") else "fail"] += 1
+    for pa in trace.get("paste_attempts") or []:
+        m_name = str(pa.get("method") or "")
+        if m_name:
+            rec = pb["paste_stats"].setdefault(m_name, {"ok": 0, "fail": 0})
+            rec["ok" if pa.get("ok") else "fail"] += 1
+    for sa in trace.get("silent_attempts") or []:
+        m_name = str(sa.get("method") or "")
+        if m_name:
+            rec = pb["silent_stats"].setdefault(m_name, {"ok": 0, "fail": 0})
+            rec["ok" if sa.get("ok") else "fail"] += 1
+
+    pb["total_runs"] += 1
+    win_focus = next((x.get("strategy") for x in reversed(trace.get("focus_attempts") or []) if x.get("ok")), "")
+    win_paste = next((x.get("method") for x in reversed(trace.get("paste_attempts") or []) if x.get("ok")), "")
+    focus_fails = [x for x in (trace.get("focus_attempts") or []) if not x.get("ok")]
+    paste_fails = [x for x in (trace.get("paste_attempts") or []) if not x.get("ok")]
+    heals = trace.get("heal_events") or []
+    user_recs = trace.get("user_recoveries") or []
+    auto_confs = trace.get("auto_confirms") or []
+
+    try:
+        cur_delay = max(1, min(20, int(round(float(c.get("dt_paste_delay_sec", 3) or 3)))))
+    except Exception:
+        cur_delay = 3
+
+    had_timing_paste_fail = any(
+        any(k in str(pf.get("reason") or "") for k in ("未变化", "加载", "focus", "焦点"))
+        for pf in paste_fails
+    )
+    if had_timing_paste_fail and st_s == "ok":
+        prev_rec = pb.get("recommended_paste_delay_sec") or cur_delay
+        pb["recommended_paste_delay_sec"] = min(6, max(cur_delay, int(prev_rec) + 1))
+
+    lesson_msg = ""
+    opt_msg = ""
+    if st_s == "ok":
+        pb["success_runs"] += 1
+        pb["streak_ok"] += 1
+        prev_unres = pb.get("last_unresolved_issue")
+        if isinstance(prev_unres, dict) and (prev_unres.get("problem_summary") or prev_unres.get("err_code")):
+            pb["healed_runs"] += 1
+            res_parts = []
+            if user_recs:
+                res_parts.append(f"人工/预设恢复选择了「{'、'.join(x.get('choice', '') for x in user_recs)}」")
+            if win_focus or win_paste:
+                res_parts.append(
+                    f"切换为「{_FOCUS_STRATEGY_CN.get(win_focus, win_focus or '智能定位')} + {_PASTE_METHOD_CN.get(win_paste, win_paste or 'Win32粘贴')}」后一次通过"
+                )
+            how_txt = "；".join(res_parts) or "重新激活钉钉并核验光标落入待发送框后顺利发出"
+            rule_txt = f"下轮起优先启用「{_FOCUS_STRATEGY_CN.get(win_focus, win_focus or '安全区聚焦')}」与「{_PASTE_METHOD_CN.get(win_paste, win_paste or 'Ctrl+V')}」，并将加载等待保障在 {pb.get('recommended_paste_delay_sec') or cur_delay}s"
+            _upsert_playbook_lesson(
+                pb,
+                prev_unres.get("err_code") or "PREV-FIXED",
+                prev_unres.get("stage") or "dingtalk_paste",
+                prev_unres.get("problem_summary") or "上轮运行受阻",
+                how_txt,
+                rule_txt,
+                resolved=True,
+            )
+            pb["last_unresolved_issue"] = None
+            lesson_msg = f"复盘上轮难题「{prev_unres.get('problem_summary')}」→ 解法：{how_txt}"
+            opt_msg = rule_txt
+        elif focus_fails or paste_fails or heals or user_recs or auto_confs:
+            pb["healed_runs"] += 1
+            probs = []
+            if focus_fails:
+                probs.append(f"原聚焦方式（{_FOCUS_STRATEGY_CN.get(focus_fails[0].get('strategy'), focus_fails[0].get('strategy'))}）未稳")
+            if paste_fails:
+                probs.append(f"首轮粘贴（{_PASTE_METHOD_CN.get(paste_fails[0].get('method'), paste_fails[0].get('method'))}）未触发画面变化")
+            if heals:
+                probs.append(str(heals[-1].get("detail") or "中途触发AI自动调试"))
+            prob_txt = "；".join(probs) or "发送过程出现轻微卡阻"
+            how_txt = f"自动确认/自愈切至「{_FOCUS_STRATEGY_CN.get(win_focus, win_focus or '备选聚焦')} + {_PASTE_METHOD_CN.get(win_paste, win_paste or '备选粘贴')}」后成功发送"
+            rule_txt = f"已提升胜出组合权重，下轮直接首选「{_FOCUS_STRATEGY_CN.get(win_focus, win_focus or '稳定区')} + {_PASTE_METHOD_CN.get(win_paste, win_paste or 'Win32粘贴')}」"
+            _upsert_playbook_lesson(pb, "SELF-HEALED", "dingtalk_paste", prob_txt, how_txt, rule_txt, resolved=True)
+            lesson_msg = f"本轮卡点「{prob_txt}」→ 自动解法：{how_txt}"
+            opt_msg = rule_txt
+        else:
+            lesson_msg = "本轮全程零卡顿一次顺滑通过（已累计连续稳定 {0} 轮）".format(pb["streak_ok"])
+            opt_msg = f"继续保持当前最优组合（{_FOCUS_STRATEGY_CN.get(win_focus, '精确聚焦')} + {_PASTE_METHOD_CN.get(win_paste, 'Win32扫码粘贴')}）"
+    else:
+        pb["failed_runs"] += 1
+        pb["streak_ok"] = 0
+        ed = error_detail if isinstance(error_detail, dict) else {}
+        ecode = str(ed.get("code") or "ERR-RUN-900")
+        eraw = str(ed.get("plain_reason") or ed.get("raw_error") or ed.get("title") or "执行中断")[:160]
+        next_rule = "下轮自动按训练权重切换下一组聚焦区域与剪贴板粘贴手法，并开启自动确定重试"
+        if "304" in ecode or "粘贴" in eraw or "变化" in eraw or "光标" in eraw:
+            pb["recommended_paste_delay_sec"] = min(6, max(cur_delay + 1, int(pb.get("recommended_paste_delay_sec") or 4)))
+            next_rule = f"下轮自动切换备用聚焦位置+右键菜单粘贴兜底，并将等待提高至 {pb['recommended_paste_delay_sec']}s"
+        elif "305" in ecode or "最小化" in eraw or "切换" in eraw:
+            next_rule = "下轮遇到前台短暂切走时先自动重新置顶钉钉主窗，再完成粘贴发送"
+        pb["last_unresolved_issue"] = {
+            "ts": now_s,
+            "err_code": ecode,
+            "stage": "dingtalk_paste" if "304" in ecode or "305" in ecode else "runtime",
+            "problem_summary": f"[{ecode}] {eraw}",
+            "actions_tried": [str(x.get("strategy") or "") for x in focus_fails[:3]] + [str(x.get("method") or "") for x in paste_fails[:3]],
+        }
+        _upsert_playbook_lesson(
+            pb,
+            ecode,
+            pb["last_unresolved_issue"]["stage"],
+            f"[{ecode}] {eraw}",
+            "本轮未彻底恢复，待下轮或人工干预后自动记录最终解法",
+            next_rule,
+            resolved=False,
+        )
+        lesson_msg = f"本轮阻断问题：[{ecode}] {eraw}"
+        opt_msg = next_rule
+
+    summary_line = f"{lesson_msg}；下轮优化：{opt_msg}"
+    pb["recent_trainings"].append({
+        "ts": now_s,
+        "mode": str(mode or "full"),
+        "status": st_s,
+        "duration_sec": int(duration_sec or 0),
+        "win_focus": win_focus,
+        "win_paste": win_paste,
+        "summary_line": summary_line[:240],
+    })
+    pb["recent_trainings"] = pb["recent_trainings"][-20:]
+    saved_pb = save_ai_run_playbook(pb)
+
+    win_rate_pct = int(round(100.0 * saved_pb["success_runs"] / max(1, saved_pb["total_runs"])))
+    chat_reply = (
+        f"🧠 [第 {saved_pb['total_runs']} 轮运行训练总结 · 成功率 {win_rate_pct}%（{saved_pb['success_runs']}/{saved_pb['total_runs']}）]\n"
+        f"• 执行结果：{'✅ 顺利完成' if st_s == 'ok' else '⚠️ 本轮遇阻'}（用时 {int(duration_sec or 0)}s）\n"
+        f"• 总结问题：{lesson_msg}\n"
+        f"• 自动优化：{opt_msg}"
+    )
+    out_obj = {
+        "reply": chat_reply,
+        "time": time.strftime("%H:%M:%S"),
+        "summary_line": summary_line[:160],
+        "status": st_s,
+        "total_runs": saved_pb["total_runs"],
+        "success_runs": saved_pb["success_runs"],
+    }
+    log(f"  🧠 [AI 训练总结] {summary_line}")
+    _notify_training_summary(out_obj)
+    return out_obj
 
 
 def append_ai_chat_turn(role, text, time_str="", source="", shot_info="", via="pc", sender="", on_demand_meta=None):
@@ -3073,6 +3577,21 @@ def build_ai_user_memory_context():
     if mem.get("habit_notes"):
         notes = mem["habit_notes"][-8:]
         lines.append("- 用户历史嘱咐与习惯：\n  • " + "\n  • ".join(notes))
+    try:
+        pb = load_ai_run_playbook()
+        if int(pb.get("total_runs") or 0) > 0:
+            lines.append(
+                f"- 运行训练战绩：累计 {pb['total_runs']} 轮（成功 {pb['success_runs']} / 自愈恢复 {pb['healed_runs']} / 连续顺畅 {pb['streak_ok']}）"
+            )
+        lessons = pb.get("problem_lessons") or []
+        if lessons:
+            ls_txts = [
+                f"问题「{x.get('problem_summary')}」→ 解法「{x.get('how_resolved')}」（下轮规则：{x.get('next_run_rule')}）"
+                for x in lessons[-4:]
+            ]
+            lines.append("- 历次跑表排障总结与自优化规则：\n  • " + "\n  • ".join(ls_txts))
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
@@ -3143,6 +3662,24 @@ def _local_smart_chat_fallback(cfg_norm, user_prompt, arch_ctx, api_err="", hist
     tail_note = "\n\n（当前已由内置本地分析引擎为您实时解答）" if api_err else ""
     mem_ctx = build_ai_user_memory_context()
     mem_tail = f"\n\n【我已记住您的本机习惯】\n{mem_ctx}" if mem_ctx else ""
+    if any(k in low for k in ("训练", "总结问题", "归纳问题", "怎么解决", "优化方案", "每次运行", "复盘")):
+        pb = load_ai_run_playbook()
+        lessons = pb.get("problem_lessons") or []
+        strat = get_dt_runtime_strategy_from_playbook(cfg_norm)
+        if lessons:
+            ls_lines = "\n".join(
+                f"• **问题**：{x.get('problem_summary')}\n  **解决**：{x.get('how_resolved')}\n  **优化**：{x.get('next_run_rule')}"
+                for x in reversed(lessons[-5:])
+            )
+        else:
+            ls_lines = "• 近期尚无异常阻塞记录，每次运行都会自动积累聚焦与粘贴胜率。"
+        return (
+            f"目前已累计执行 **{pb.get('total_runs', 0)} 轮训练**（成功 {pb.get('success_runs', 0)} / 自愈修复 {pb.get('healed_runs', 0)}）：\n\n"
+            f"【当前自动优化最优策略】\n{strat.get('summary')}\n\n"
+            f"【已归纳的历史问题与解决方法】\n{ls_lines}"
+            + mem_tail
+            + tail_note
+        )
     if any(k in low for k in ("报错", "失败", "为什么", "第一次", "第二次", "怎么改", "代码", "antigravity", "顺序")):
         return (
             "已为您调取历次运行成败日志并整理出原因与修复参考建议：\n\n"
@@ -4315,8 +4852,9 @@ def _build_config_verification_summary(new_cfg, changes):
                 cell_notes.append(f"{cell}={val}")
 
     send_mode_txt = "粘贴后直接自动发送" if c.get("dt_auto_send") else "只贴进输入框暂不自动按 Enter"
-    silent_txt = "静音发送" if c.get("dt_silent_send", True) else "常规提醒发送"
+    silent_txt = "静音发送" if c.get("dt_silent_send", True) else "常规提醒发送（不点静音）"
     delay_sec = c.get("dt_paste_delay_sec", 3)
+    send_wait_s = c.get("dt_send_wait_sec", 5)
 
     # 配套核验提示
     warnings = []
@@ -4334,7 +4872,7 @@ def _build_config_verification_summary(new_cfg, changes):
         f"2. **每天触发时间**：{tt_desc}",
         f"3. **要的数据日期**：表格 D3 日期 = **{d3_desc}**" + (f"（关键自定义格：{', '.join(cell_notes[:6])}）" if cell_notes else ""),
         f"4. **目标钉钉会话**：**{tgt_desc}**",
-        f"5. **投递方式与等待**：{'自动打开钉钉发送' if c.get('enable_dingtalk') else '仅写表不发钉钉'}｜{silent_txt}｜{send_mode_txt}｜打开聊天后等 {delay_sec} 秒粘贴",
+        f"5. **投递方式与等待**：{'自动打开钉钉发送' if c.get('enable_dingtalk') else '仅写表不发钉钉'}｜{silent_txt}｜{send_mode_txt}｜切会话等 {delay_sec} 秒粘贴 · 贴后等 {send_wait_s} 秒发",
         "",
         "（提示：若您只是先预设方案还没开启自动定时跑，别忘了点首页左下角【自动值守】卡片启动值守；以上哪一项要修改，直接回复我一句话就能立刻帮您改好！）",
     ]
@@ -4351,8 +4889,10 @@ def try_handle_ai_config_command(user_text, cfg):
 
     # 排除单纯询问“怎么设置/为什么/是不是”的问题（除非带了明确的修改动作+时间或发送目标）
     question_only = ("怎么设置", "如何设置", "在哪设置", "哪里设置", "为什么", "能不能", "你是谁", "分析", "总结", "对比", "复盘")
-    has_setter_verb = any(k in raw for k in ("帮我设", "给我设", "帮我改", "给我改", "帮我调", "帮我安排", "请设置", "设置为", "设为", "改成", "改为", "调整为", "定在", "定为", "配置成"))
-    has_send_cmd = any(k in raw for k in ("发送到", "发到", "投递到", "发给", "发送给")) and any(k in raw for k in ("点", ":", "：", "每天", "每周", "周", "工作日", "昨天", "今天", "群", "助手"))
+    has_setter_verb = any(k in raw for k in ("帮我设", "给我设", "帮我改", "给我改", "帮我调", "帮我安排", "请设置", "设置为", "设为", "改成", "改为", "调整为", "定在", "定为", "配置成", "关闭静音", "取消静音", "关掉静音"))
+    has_send_cmd = (
+        any(k in raw for k in ("发送到", "发到", "投递到", "发给", "发送给")) and any(k in raw for k in ("点", ":", "：", "每天", "每周", "周", "工作日", "昨天", "今天", "群", "助手"))
+    ) or bool(re.search(r"(?:发送前|发前|贴完|贴图.{0,4}后).{0,6}\d+\s*秒", raw))
     if any(q in raw for q in question_only) and not has_setter_verb:
         return {"handled": False}
     if not (has_setter_verb or has_send_cmd):
@@ -4493,15 +5033,22 @@ def try_handle_ai_config_command(user_text, cfg):
 
     if "仅截图" in raw or "只截图" in raw:
         new_cfg["enable_capture"] = True
-    if "取消静音" in raw or "不静音" in raw or "常规提醒" in raw:
+    if any(k in raw for k in ("关闭静音", "关掉静音", "关静音", "取消静音", "不静音", "不要静音", "不用静音", "常规提醒")):
         new_cfg["dt_silent_send"] = False
-        changes.append("发送方式设为「常规提醒(非静音)」")
+        changes.append("发送方式设为「常规提醒(关闭静音，贴完后不点静音按钮)」")
     elif "静音" in raw:
         new_cfg["enable_dingtalk"] = True
         new_cfg["dt_silent_send"] = True
         changes.append("发送方式设为「静音发送」")
 
-    delay_m = re.search(r"(?:粘贴|打开聊天|等待|延迟)\s*(\d{1,2})\s*秒", raw)
+    send_wait_m = re.search(r"(?:发送前|发前|贴完|写完|贴图.{0,6}后).{0,8}?(?:等待?|延迟)\s*(\d{1,2})\s*秒", raw)
+    if send_wait_m:
+        sw_v = max(0, min(30, int(send_wait_m.group(1))))
+        new_cfg["dt_send_wait_sec"] = sw_v
+        changes.append(f"贴完发前等待设为 {sw_v} 秒")
+
+    paste_delay_src = re.sub(r"(?:发送前|发前|贴完|写完|贴图.{0,6}后).{0,8}?(?:等待?|延迟)\s*\d{1,2}\s*秒", "", raw)
+    delay_m = re.search(r"(?:粘贴|打开聊天|等待|延迟)\s*(\d{1,2})\s*秒", paste_delay_src)
     if delay_m:
         sec_v = max(0, min(20, int(delay_m.group(1))))
         new_cfg["dt_paste_delay_sec"] = sec_v
@@ -5309,7 +5856,7 @@ def diagnose_issue(stage, exc=None, extra=None, probe_fn=probe_network):
 
 
 def wait_for_recovery(title, detail, hint="", actions=None, timeout_sec=900, error_detail=None):
-    """遇到可恢复阻塞时处理选择：除必须人工登录外默认自动选确定继续，同一阻塞二次出现时再停下人工干预。"""
+    """遇到可恢复阻塞时处理选择：除必须人工登录外默认自动选确定继续，多次自动换策略重试，达上限后记入 AI 训练档案。"""
     global _waiting_recovery, _recovery_choice, _runtime_prompt
     check_stop()
     act_list = [dict(a) for a in (actions or [{"id": "retry", "label": "重试当前步", "style": "primary"}])]
@@ -5320,18 +5867,35 @@ def wait_for_recovery(title, detail, hint="", actions=None, timeout_sec=900, err
         auto_ok = bool(load_config().get("auto_confirm_choices", True))
     except Exception:
         auto_ok = True
-    if auto_ok and not need_human_login and act_list and title_str not in _auto_confirmed_recovery_titles:
-        auto_act = next(
-            (a for a in act_list if str(a.get("id") or "") in ("retry", "continue", "retry_paste")),
-            None,
-        )
-        if auto_act is not None:
-            auto_id = str(auto_act.get("id") or "retry")
-            auto_lbl = str(auto_act.get("label") or auto_id)
+    if auto_ok and not need_human_login and act_list:
+        cur_cnt = int(_auto_confirmed_recovery_counts.get(title_str, 0))
+        if cur_cnt < 3:
+            _auto_confirmed_recovery_counts[title_str] = cur_cnt + 1
             _auto_confirmed_recovery_titles.add(title_str)
-            log(f"▶ 已按默认自动确定规则选择「{auto_lbl}」继续执行（无需手动点确认）")
-            sleep_check(0.35)
-            return auto_id
+            prefer_order = ("retry", "retry_paste", "continue", "ok", "yes", "confirm") if cur_cnt >= 1 else (
+                "retry_paste", "retry", "continue", "ok", "yes", "confirm"
+            )
+            auto_act = None
+            for pid in prefer_order:
+                auto_act = next((a for a in act_list if str(a.get("id") or "") == pid), None)
+                if auto_act is not None:
+                    break
+            if auto_act is None:
+                auto_act = next(
+                    (a for a in act_list if str(a.get("id") or "") not in ("cancel", "skip_search", "skip", "skip_target")),
+                    None,
+                )
+            if auto_act is not None:
+                auto_id = str(auto_act.get("id") or "retry")
+                auto_lbl = str(auto_act.get("label") or auto_id)
+                try:
+                    record_run_trace_event("auto_confirm", f"{title_str}->{auto_id}", {"attempt": cur_cnt + 1})
+                except Exception:
+                    pass
+                log(f"▶ 已按默认自动确定规则选择「{auto_lbl}」继续执行（第 {cur_cnt + 1}/3 次自动确认，无需手动点击）")
+                sleep_check(0.35)
+                return auto_id
+        raise RuntimeError(f"{title_str}：已按默认确定规则自动重试 {cur_cnt} 次仍未恢复，请检查现场或查看 AI 复盘分析")
     with _runtime_lock:
         det = error_detail or (_last_diagnosed_detail if _last_diagnosed_detail and _last_diagnosed_detail.get("code") in str(title or "") else None)
         if det is None:
@@ -5756,8 +6320,94 @@ def save_clipboard_image_if_exists(path):
     return "error"
 
 
-def _write_dib_to_clipboard_windows(img_rgb):
-    """在本进程内直接通过 Win32 CF_DIB 将 RGB 图像写入系统剪贴板，绕开临时子进程延迟与句柄丢失。"""
+def _win32_release_modifiers():
+    """在发送组合快捷键前安全抬起残留的系统修饰键，防止卡键导致快捷键错乱。"""
+    if os.name != "nt":
+        return
+    try:
+        u32 = ctypes.windll.user32
+        for vk in (0x11, 0xA2, 0xA3, 0x10, 0xA0, 0xA1, 0x12, 0xA4, 0xA5, 0x5B, 0x5C):
+            if u32.GetAsyncKeyState(vk) & 0x8000:
+                scan = u32.MapVirtualKeyW(vk, 0)
+                ext = 0x0001 if vk in (0xA3, 0xA5, 0x5B, 0x5C) else 0
+                u32.keybd_event(vk, scan, ext | 0x0002, 0)
+    except Exception:
+        pass
+
+
+def _win32_send_vk_combo(vk_list, hold_sec=0.04):
+    """使用 Win32 SendInput + 硬件扫描码发送组合键，兼容 Qt/Electron 及中文输入法状态。"""
+    if os.name != "nt" or not vk_list:
+        return False
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = (
+            ("dx", wintypes.LONG),
+            ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_size_t),
+        )
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = (
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_size_t),
+        )
+
+    class _INPUT_UNION(ctypes.Union):
+        _fields_ = (("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT))
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = (("type", wintypes.DWORD), ("u", _INPUT_UNION))
+
+    EXTENDED_VKS = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0xA3, 0xA5}
+    try:
+        u32 = ctypes.windll.user32
+        u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+        u32.SendInput.restype = wintypes.UINT
+        u32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        u32.MapVirtualKeyW.restype = wintypes.UINT
+        _win32_release_modifiers()
+
+        downs = []
+        ups = []
+        for vk in vk_list:
+            vki = int(vk)
+            scan = int(u32.MapVirtualKeyW(vki, 0) or 0)
+            ext_flag = 0x0001 if vki in EXTENDED_VKS else 0
+            # 当同时带硬件扫描码时优先触发系统底层热键与Qt编辑器粘贴路由
+            flags_dn = (0x0008 if scan else 0) | ext_flag
+            flags_up = flags_dn | 0x0002
+            in_dn = _INPUT(1, _INPUT_UNION(ki=_KEYBDINPUT(vki, scan, flags_dn, 0, 0)))
+            in_up = _INPUT(1, _INPUT_UNION(ki=_KEYBDINPUT(vki, scan, flags_up, 0, 0)))
+            downs.append(in_dn)
+            ups.insert(0, in_up)
+
+        arr_dn = (_INPUT * len(downs))(*downs)
+        sent1 = u32.SendInput(len(downs), arr_dn, ctypes.sizeof(_INPUT))
+        time.sleep(max(0.02, float(hold_sec)))
+        arr_up = (_INPUT * len(ups))(*ups)
+        sent2 = u32.SendInput(len(ups), arr_up, ctypes.sizeof(_INPUT))
+        return sent1 == len(downs) and sent2 == len(ups)
+    except Exception:
+        return False
+
+
+def _win32_send_ctrl_key(vk_key, hold_sec=0.05):
+    return _win32_send_vk_combo([0x11, int(vk_key)], hold_sec=hold_sec)
+
+
+def _win32_send_single_vk(vk_key, hold_sec=0.04):
+    return _win32_send_vk_combo([int(vk_key)], hold_sec=hold_sec)
+
+
+def _write_dib_to_clipboard_windows(img_rgb, png_bytes=None):
+    """在本进程内通过 Win32 同时写入 CF_DIB 与 PNG 双格式剪贴板，确保兼容所有版本钉钉粘贴识别。"""
     if os.name != "nt":
         return False
     import io
@@ -5767,6 +6417,13 @@ def _write_dib_to_clipboard_windows(img_rgb):
     if len(bmp_bytes) <= 14:
         return False
     dib_bytes = bmp_bytes[14:]  # 剥离 BITMAPFILEHEADER 即为标准 CF_DIB (BITMAPINFOHEADER + 像素)
+    if png_bytes is None:
+        try:
+            pbuf = io.BytesIO()
+            img_rgb.save(pbuf, format="PNG", optimize=True)
+            png_bytes = pbuf.getvalue()
+        except Exception:
+            png_bytes = None
 
     u32 = ctypes.WinDLL("user32", use_last_error=True)
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -5776,6 +6433,8 @@ def _write_dib_to_clipboard_windows(img_rgb):
     u32.EmptyClipboard.restype = wintypes.BOOL
     u32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
     u32.SetClipboardData.restype = ctypes.c_void_p
+    u32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    u32.RegisterClipboardFormatW.restype = wintypes.UINT
     u32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
     u32.IsClipboardFormatAvailable.restype = wintypes.BOOL
     u32.CloseClipboard.argtypes = []
@@ -5790,55 +6449,97 @@ def _write_dib_to_clipboard_windows(img_rgb):
     k32.GlobalFree.restype = ctypes.c_void_p
 
     CF_DIB = 8
+    CF_PNG = int(u32.RegisterClipboardFormatW("PNG") or 0)
     GMEM_MOVEABLE = 0x0002
+
+    def _alloc_and_copy(raw_bytes):
+        hm = k32.GlobalAlloc(GMEM_MOVEABLE, len(raw_bytes))
+        if not hm:
+            return None
+        ptr = k32.GlobalLock(hm)
+        if not ptr:
+            try:
+                k32.GlobalFree(hm)
+            except Exception:
+                pass
+            return None
+        try:
+            ctypes.memmove(ptr, raw_bytes, len(raw_bytes))
+        finally:
+            k32.GlobalUnlock(hm)
+        return hm
+
     for _ in range(8):
         if u32.OpenClipboard(None):
             h_mem = None
-            transferred = False
+            h_png = None
             try:
                 u32.EmptyClipboard()
-                h_mem = k32.GlobalAlloc(GMEM_MOVEABLE, len(dib_bytes))
+                h_mem = _alloc_and_copy(dib_bytes)
                 if h_mem:
-                    ptr = k32.GlobalLock(h_mem)
-                    if ptr:
-                        try:
-                            ctypes.memmove(ptr, dib_bytes, len(dib_bytes))
-                        finally:
-                            k32.GlobalUnlock(h_mem)
-                        if u32.SetClipboardData(CF_DIB, h_mem):
-                            transferred = True
-                            return bool(u32.IsClipboardFormatAvailable(CF_DIB))
+                    if u32.SetClipboardData(CF_DIB, h_mem):
+                        h_mem = None  # 系统已接管内存所有权，禁止释放
+                if CF_PNG and png_bytes:
+                    h_png = _alloc_and_copy(png_bytes)
+                    if h_png:
+                        if u32.SetClipboardData(CF_PNG, h_png):
+                            h_png = None
+                if u32.IsClipboardFormatAvailable(CF_DIB):
+                    return True
             finally:
-                if h_mem and not transferred:
-                    try:
-                        k32.GlobalFree(h_mem)
-                    except Exception:
-                        pass
+                for leftover in (h_mem, h_png):
+                    if leftover:
+                        try:
+                            k32.GlobalFree(leftover)
+                        except Exception:
+                            pass
                 u32.CloseClipboard()
         time.sleep(0.08)
     return False
 
 
-def set_clipboard_image_from_file(path):
-    """将图片等比规范至钉钉安全像素宽度内，并通过本进程原生 CF_DIB（含 PS 兜底）写入剪贴板。"""
-    src = Path(path)
+def _prepare_scaled_send_image(src_path):
+    """一次性等比缩放至钉钉安全分辨率并预先编码 PNG 字节流，避免粘贴重试循环重复缩放耗时。"""
+    src = Path(src_path)
     use_path = src
+    png_bytes = None
     try:
+        import io
         im = Image.open(src).convert("RGB")
-        max_w = 4600
-        max_pixels = 12_000_000
-        scale = 1.0
-        if im.width > max_w:
-            scale = min(scale, max_w / float(im.width))
-        if im.width * im.height > max_pixels:
-            scale = min(scale, (max_pixels / float(im.width * im.height)) ** 0.5)
-        if scale < 0.999:
-            new_size = (max(1, int(im.width * scale)), max(1, int(im.height * scale)))
-            im = im.resize(new_size, Image.Resampling.LANCZOS)
-            use_path = src.with_name(src.stem + "_send.png")
-            im.save(use_path, "PNG", optimize=True)
         try:
-            if _write_dib_to_clipboard_windows(im):
+            max_w = 4600
+            max_pixels = 12_000_000
+            scale = 1.0
+            if im.width > max_w:
+                scale = min(scale, max_w / float(im.width))
+            if im.width * im.height > max_pixels:
+                scale = min(scale, (max_pixels / float(im.width * im.height)) ** 0.5)
+            if scale < 0.999:
+                new_size = (max(1, int(im.width * scale)), max(1, int(im.height * scale)))
+                im = im.resize(new_size, Image.Resampling.LANCZOS)
+                use_path = src.with_name(src.stem + "_send.png")
+                im.save(use_path, "PNG", optimize=True)
+            pbuf = io.BytesIO()
+            im.save(pbuf, format="PNG", optimize=True)
+            png_bytes = pbuf.getvalue()
+        finally:
+            im.close()
+    except Exception:
+        use_path = src
+    return use_path, png_bytes
+
+
+def set_clipboard_image_from_file(path, cached_scaled_path=None, cached_png_bytes=None):
+    """将图片等比规范至钉钉安全像素宽度内，并通过本进程原生 CF_DIB+PNG 双格式（含 PS 兜底）写入剪贴板。"""
+    src = Path(path)
+    use_path = Path(cached_scaled_path) if (cached_scaled_path and Path(cached_scaled_path).exists()) else src
+    png_bytes = cached_png_bytes
+    try:
+        if use_path == src and png_bytes is None:
+            use_path, png_bytes = _prepare_scaled_send_image(src)
+        im = Image.open(use_path).convert("RGB")
+        try:
+            if _write_dib_to_clipboard_windows(im, png_bytes=png_bytes):
                 return True
         finally:
             im.close()
@@ -6035,6 +6736,7 @@ DEFAULT_CONFIG = {
     "auto_confirm_choices": True, # 默认对非登录类确认选择自动点击确定继续
     "dt_clear_before_send": True,  # 粘贴前先清空聊天输入框原有残留内容
     "dt_paste_delay_sec": 1,     # 打开/切入会话后等待几秒再粘贴图片（1秒极速就绪）
+    "dt_send_wait_sec": 5,       # 截图与文案全部写入输入框后，等待几秒再直接按 Enter 发送（默认5秒）
     "dt_silent_send": True,      # 发送前自动勾选「设为静音」（静音发送）
     "dt_minimize_after_send": True,  # 自动发送完成后最小化钉钉窗口
     "dt_search": "文件小助手",    # 钉钉搜索的主会话名（兼容单目标及回退）
@@ -6198,6 +6900,12 @@ def normalize_config(cfg):
     except Exception:
         p_del = 3
     out["dt_paste_delay_sec"] = max(0, min(20, p_del))
+    try:
+        s_wait = out.get("dt_send_wait_sec", 5)
+        s_wait = 5 if isinstance(s_wait, bool) or s_wait in (None, "") else int(round(float(s_wait)))
+    except Exception:
+        s_wait = 5
+    out["dt_send_wait_sec"] = max(0, min(30, s_wait))
 
     if out.get("dt_time_mode") not in ("datetime", "date_only", "none"):
         out["dt_time_mode"] = "datetime"
@@ -9426,6 +10134,148 @@ def _enable_dingtalk_silent_send_image():
     return True
 
 
+def _compute_dt_compose_click_points(win_rect, edit_rect=None, input_wnd_rect=None, bottom_bar_rect=None, dpi_scale=1.0):
+    """计算钉钉待发送输入框的多候选安全点击坐标与截图区域，严格避开顶部工具栏、消息记录区与底栏按钮。"""
+    def _rect_tuple(rc):
+        if rc is None:
+            return None
+        if isinstance(rc, (tuple, list)) and len(rc) == 4:
+            return tuple(int(v) for v in rc)
+        return (int(rc.left), int(rc.top), int(rc.right), int(rc.bottom))
+
+    wr = _rect_tuple(win_rect)
+    if not wr or wr[2] <= wr[0] or wr[3] <= wr[1]:
+        return []
+    r_l, r_t, r_r, r_b = wr
+    W = max(1, r_r - r_l)
+    H = max(1, r_b - r_t)
+    sc = max(1.0, float(dpi_scale or 1.0))
+
+    top_toolbar_pad = max(34, int(36 * sc))
+    safe_min_x = r_l + int(W * 0.25)
+    safe_max_x = r_r - max(40, int(42 * sc))
+    safe_min_y = r_t + int(H * 0.62)
+    safe_max_y = r_b - max(38, int(44 * sc))
+
+    er = _rect_tuple(edit_rect)
+    ir = _rect_tuple(input_wnd_rect)
+    br = _rect_tuple(bottom_bar_rect)
+    if br is not None and br[1] > safe_min_y + 18:
+        safe_max_y = min(safe_max_y, br[1] - max(10, int(10 * sc)))
+
+    def _clamp_pt(px, py):
+        return (
+            max(safe_min_x, min(safe_max_x, int(px))),
+            max(safe_min_y, min(max(safe_min_y, safe_max_y), int(py))),
+        )
+
+    out = []
+    if er is not None and (er[2] - er[0]) >= 80 and (er[3] - er[1]) >= 22:
+        ew = er[2] - er[0]
+        eh = er[3] - er[1]
+        ey_max = (br[1] - 10) if (br is not None and br[1] > er[1] + 20) else (er[3] - 8)
+        raw_x = er[0] + int(ew * 0.35)
+        raw_y = min(ey_max, er[1] + max(14, int(eh * 0.55)))
+        cx, cy = _clamp_pt(raw_x, raw_y)
+        patch = (
+            max(r_l + int(W * 0.24), er[0] + 4),
+            max(safe_min_y, er[1] + 2),
+            min(r_r - 12, er[2] - 4),
+            min(ey_max, er[3] - 2),
+        )
+        out.append(("uia_edit_child", cx, cy, patch))
+
+    if ir is not None and br is not None and (ir[2] - ir[0]) >= 100 and br[1] > ir[1] + top_toolbar_pad + 12:
+        iw = ir[2] - ir[0]
+        top_safe = ir[1] + top_toolbar_pad
+        bot_safe = br[1] - max(8, int(8 * sc))
+        raw_x = ir[0] + int(iw * 0.35)
+        raw_y = max(top_safe + 6, bot_safe - max(16, int(18 * sc)))
+        cx, cy = _clamp_pt(raw_x, raw_y)
+        patch = (
+            max(r_l + int(W * 0.24), ir[0] + 6),
+            max(safe_min_y, top_safe),
+            min(r_r - 12, ir[2] - 6),
+            max(top_safe + 28, bot_safe),
+        )
+        out.append(("uia_above_bottombar", cx, cy, patch))
+
+    if ir is not None and (ir[2] - ir[0]) >= 100 and (ir[3] - ir[1]) >= 40:
+        iw = ir[2] - ir[0]
+        top_safe = ir[1] + top_toolbar_pad
+        raw_x = ir[0] + int(iw * 0.35)
+        raw_y = max(top_safe + 8, ir[3] - max(52, int(52 * sc)))
+        if br is not None and br[1] > top_safe + 14:
+            raw_y = min(raw_y, br[1] - max(12, int(12 * sc)))
+        cx, cy = _clamp_pt(raw_x, raw_y)
+        patch = (
+            max(r_l + int(W * 0.24), ir[0] + 6),
+            max(safe_min_y, top_safe),
+            min(r_r - 12, ir[2] - 6),
+            min(r_b - 28, ir[3] - 32),
+        )
+        out.append(("uia_input_wnd_lower", cx, cy, patch))
+
+    default_patch = (r_l + int(W * 0.26), r_t + int(H * 0.72), r_r - int(W * 0.08), r_b - int(H * 0.07))
+    out.append(("ratio_bottom_85", int(r_l + W * 0.45), int(r_t + H * 0.85), default_patch))
+    out.append(("ratio_bottom_89", int(r_l + W * 0.42), int(r_t + H * 0.89), default_patch))
+    out.append(("ratio_bottom_79", int(r_l + W * 0.48), int(r_t + H * 0.79), default_patch))
+    return out
+
+
+def _get_win_gui_caret_info(hwnd):
+    """查询目标窗口线程的 Win32 光标与菜单状态（含屏幕坐标转换）。"""
+    if os.name != "nt" or not hwnd:
+        return {"in_menu": False, "has_caret": False, "caret_screen_pt": None, "hwnd_focus": 0}
+    try:
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND),
+                ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND),
+                ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            ]
+
+        class _PT(ctypes.Structure):
+            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+        u32 = ctypes.windll.user32
+        u32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
+        u32.GetGUIThreadInfo.restype = wintypes.BOOL
+        u32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(_PT)]
+        u32.ClientToScreen.restype = wintypes.BOOL
+        tid = u32.GetWindowThreadProcessId(int(hwnd), None)
+        if not tid:
+            return {"in_menu": False, "has_caret": False, "caret_screen_pt": None, "hwnd_focus": 0}
+        gti = GUITHREADINFO()
+        gti.cbSize = ctypes.sizeof(GUITHREADINFO)
+        if not u32.GetGUIThreadInfo(tid, ctypes.byref(gti)):
+            return {"in_menu": False, "has_caret": False, "caret_screen_pt": None, "hwnd_focus": 0}
+        in_menu = bool((gti.flags & 0x00000014) or gti.hwndMenuOwner)
+        careth = int(gti.hwndCaret or gti.hwndFocus or 0)
+        rc = gti.rcCaret
+        has_caret = False
+        caret_pt = None
+        if careth and rc.bottom > rc.top and (rc.bottom - rc.top) >= 6:
+            pt = _PT(int((rc.left + rc.right) // 2), int((rc.top + rc.bottom) // 2))
+            if u32.ClientToScreen(wintypes.HWND(careth), ctypes.byref(pt)):
+                has_caret = True
+                caret_pt = (int(pt.x), int(pt.y))
+        return {
+            "in_menu": in_menu,
+            "has_caret": has_caret,
+            "caret_screen_pt": caret_pt,
+            "hwnd_focus": int(gti.hwndFocus or 0),
+        }
+    except Exception:
+        return {"in_menu": False, "has_caret": False, "caret_screen_pt": None, "hwnd_focus": 0}
+
+
 def _evaluate_compose_focus_ctrl(fc, r):
     """纯粹判定给定焦点控件 fc 是否位于钉钉底部对话内容输入窗口内（便于单测与生产共用）。"""
     if fc is None:
@@ -9608,8 +10458,8 @@ def _restore_and_activate_hwnd(hwnd, maximize=True, wake_exe_candidates=None):
     return not bool(user32.IsIconic(hwnd))
 
 
-def _commit_dingtalk_send(cur_hwnd, send_enter_fn=None, timeout=1.5):
-    """发送消息并针对富文本 Aa 工具栏 / Ctrl+Enter 设置自动补点右下角「发送(S)」按钮。"""
+def _commit_dingtalk_send(cur_hwnd, send_enter_fn=None, timeout=1.5, input_rect=None):
+    """先用原生硬件扫描码发 Enter，并比对发送框画面变化后按需补点右下角「发送(S)」按钮，避免误发或漏发。"""
     from pywinauto import Application, keyboard as _pwa_kbd  # type: ignore[import-not-found]
 
     hwnd_val = 0
@@ -9626,11 +10476,18 @@ def _commit_dingtalk_send(cur_hwnd, send_enter_fn=None, timeout=1.5):
             except Exception:
                 hwnd_val = 0
 
+    before_send_patch = _capture_dt_input_patch(None, input_rect=input_rect) if input_rect is not None else None
     if callable(send_enter_fn):
         send_enter_fn()
     else:
-        _pwa_kbd.send_keys("{ENTER}")
-    sleep_check(0.45)
+        if not _win32_send_single_vk(0x0D):
+            _pwa_kbd.send_keys("{ENTER}")
+    sleep_check(0.50)
+
+    if before_send_patch is not None and input_rect is not None:
+        after_send_patch = _capture_dt_input_patch(None, input_rect=input_rect)
+        if _did_dt_input_change(before_send_patch, after_send_patch):
+            return False
 
     if not hwnd_val:
         return False
@@ -9644,7 +10501,7 @@ def _commit_dingtalk_send(cur_hwnd, send_enter_fn=None, timeout=1.5):
         w_h = max(1, s_rect.height())
 
         send_btn = None
-        for ctrl, _d in _iter_dt_uia_pruned(s_wrap, max_depth=22):
+        for ctrl, _d in _iter_dt_uia_pruned(s_wrap, max_depth=24):
             try:
                 ii = ctrl.element_info
                 aid_l = (ii.automation_id or "").lower()
@@ -9682,7 +10539,8 @@ def _commit_dingtalk_send(cur_hwnd, send_enter_fn=None, timeout=1.5):
             sleep_check(0.35)
             try:
                 if send_enter_fn is None and send_btn.is_enabled():
-                    _pwa_kbd.send_keys("^{ENTER}")
+                    if not _win32_send_ctrl_key(0x0D):
+                        _pwa_kbd.send_keys("^{ENTER}")
                     sleep_check(0.25)
             except Exception:
                 pass
@@ -9693,10 +10551,16 @@ def _commit_dingtalk_send(cur_hwnd, send_enter_fn=None, timeout=1.5):
     return False
 
 
-def _capture_dt_input_patch(r):
-    """截取钉钉聊天输入区局部灰度缩略图，用于核对图片粘贴是否真正进入输入框。"""
+def _capture_dt_input_patch(r, input_rect=None):
+    """优先截取真实待发送输入区局部灰度图（未知输入区时再按窗口右下比例兜底），核对粘贴/发送前后画面变化。"""
     try:
         from PIL import ImageGrab
+        if isinstance(input_rect, (tuple, list)) and len(input_rect) == 4:
+            x1, y1, x2, y2 = [int(v) for v in input_rect]
+            if x2 - x1 >= 40 and y2 - y1 >= 24:
+                return ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True).convert("L")
+        if r is None:
+            return None
         left = int(r.left)
         top = int(r.top)
         right = int(r.right)
@@ -9704,9 +10568,9 @@ def _capture_dt_input_patch(r):
         W = max(1, right - left)
         H = max(1, bottom - top)
         x1 = left + int(W * 0.25)
-        y1 = top + int(H * 0.63)
-        x2 = right - int(W * 0.06)
-        y2 = bottom - int(H * 0.08)
+        y1 = top + int(H * 0.72)
+        x2 = right - int(W * 0.08)
+        y2 = bottom - int(H * 0.07)
         if x2 - x1 < 40 or y2 - y1 < 24:
             return None
         return ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True).convert("L")
@@ -9960,6 +10824,10 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
         log(f"  {priv_info['message']}")
     pc_plan = probe_pc_and_dingtalk_profile(cfg)
     log(f"  🖥️ 当前电脑自适应方案：{pc_plan['summary']}")
+    dt_strat = get_dt_runtime_strategy_from_playbook(cfg)
+    log(f"  🧠 [AI 训练策略] {dt_strat['summary']}")
+    scaled_send_path = None
+    scaled_png_bytes = None
     tmp_img = app_dir() / "_sheetmate_tmp.png"
     try:
         exe_candidates = _resolve_dingtalk_exe_candidates()
@@ -10009,6 +10877,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 raise RuntimeError("剪贴板里没有图片，已停止钉钉发送")
             if state0 != "saved":
                 raise RuntimeError("表格图片暂存失败，已停止钉钉发送")
+            scaled_send_path, scaled_png_bytes = _prepare_scaled_send_image(tmp_img)
             if cfg.get("save_shot_history", True):
                 hist_p = archive_history_shot(tmp_img, keep=20)
                 if hist_p is not None:
@@ -10070,6 +10939,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
         _KEYUP = 0x0002
         _VK_CTRL, _VK_SHIFT, _VK_F = 0x11, 0x10, 0x46
         self_pid = os.getpid()
+        fg_reclaim_state = {"count": 0}
 
         def _get_win_pid_hwnd(win):
             if win is None:
@@ -10118,7 +10988,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                     ding_pids = {p for p, _ in _list_dingtalk_processes() if p}
                     allowed_pids = {p for p in (cur_pid, expected_pid, self_pid, *ding_pids) if p}
                     if fg_pid and allowed_pids and fg_pid not in allowed_pids and get_user_idle_seconds() < 2.5:
-                        # 二次复核，排除窗口最大化重绘/输入法浮窗导致的瞬间焦点跳变
+                        # 二次复核，排除窗口最大化重绘/输入法浮窗导致的瞬间焦点跳变；若开启自动确认且主窗仍在先拉回最多2次
                         time.sleep(0.25)
                         fg2 = int(user32.GetForegroundWindow() or 0)
                         if fg2:
@@ -10126,6 +10996,17 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             user32.GetWindowThreadProcessId(fg2, ctypes.byref(fg_pv2))
                             fg_pid2 = int(fg_pv2.value or 0)
                             if fg_pid2 and fg_pid2 not in allowed_pids and get_user_idle_seconds() < 2.5:
+                                if bool(cfg.get("auto_confirm_choices", True)) and fg_reclaim_state["count"] < 2 and cur_hwnd:
+                                    fg_reclaim_state["count"] += 1
+                                    log("  检测到前台焦点短暂漂移，按默认自动确定规则将钉钉主窗拉回前台继续…")
+                                    _restore_and_activate_hwnd(cur_hwnd, maximize=False, wake_exe_candidates=exe_candidates)
+                                    sleep_check(0.35)
+                                    fg3 = int(user32.GetForegroundWindow() or 0)
+                                    if fg3:
+                                        fg_pv3 = wintypes.DWORD(0)
+                                        user32.GetWindowThreadProcessId(fg3, ctypes.byref(fg_pv3))
+                                        if int(fg_pv3.value or 0) in allowed_pids:
+                                            return w_cur, cur_pid, cur_hwnd
                                 raise DingTalkInterrupted("检测到您主动切换到了其他应用窗口")
             return w_cur, cur_pid, cur_hwnd
 
@@ -10176,35 +11057,89 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 except Exception:
                     pass
 
-        def _send_paste_shortcut():
+        def _send_paste_shortcut(method="win32_sendinput_ctrl_v", compose_rect=None):
+            m = str(method or "win32_sendinput_ctrl_v")
+            if m == "context_menu_paste" and isinstance(compose_rect, (tuple, list)) and len(compose_rect) == 4:
+                try:
+                    rx = int((compose_rect[0] + compose_rect[2]) / 2)
+                    ry = int((compose_rect[1] + compose_rect[3]) / 2)
+                    ua.RightClick(rx, ry, waitTime=0.22)
+                    sleep_check(0.28)
+                    from pywinauto import Application, Desktop  # type: ignore[import-not-found]
+                    ding_pids = {p for p, _ in _list_dingtalk_processes() if p}
+                    clicked_menu = False
+                    for pw in Desktop(backend="uia").windows():
+                        try:
+                            if ding_pids and pw.process_id() not in ding_pids:
+                                continue
+                            if not pw.is_visible():
+                                continue
+                            papp = Application(backend="uia").connect(handle=pw.handle, timeout=1.0).window(handle=pw.handle)
+                            for spec in (
+                                {"title_re": r"^(粘贴|Paste)(\([A-Za-z]\))?$", "control_type": "MenuItem", "found_index": 0},
+                                {"title_re": r".*(粘贴|Paste).*", "found_index": 0},
+                            ):
+                                item = papp.child_window(**spec)
+                                if item.exists(timeout=0.2):
+                                    _uia_click_ctrl(_unwrap_uia(item))
+                                    clicked_menu = True
+                                    break
+                            if clicked_menu:
+                                break
+                        except Exception:
+                            pass
+                    if clicked_menu:
+                        return True
+                    _win32_send_single_vk(0x1B)
+                    sleep_check(0.12)
+                except Exception:
+                    try:
+                        _win32_send_single_vk(0x1B)
+                    except Exception:
+                        pass
+            if m == "uia_ctrl_v":
+                try:
+                    ua.SendKeys("{Ctrl}v", waitTime=0.32)
+                    return True
+                except Exception:
+                    pass
+            if m == "pywinauto_ctrl_v":
+                try:
+                    from pywinauto import keyboard as _pwa_kbd  # type: ignore[import-not-found]
+                    _pwa_kbd.send_keys("^v")
+                    return True
+                except Exception:
+                    pass
+            if _win32_send_ctrl_key(ord("V")):
+                return True
             try:
                 from pywinauto import keyboard as _pwa_kbd  # type: ignore[import-not-found]
                 _pwa_kbd.send_keys("^v")
-                return
+                return True
             except Exception:
-                pass
-            ua.SendKeys("{Ctrl}v", waitTime=0.35)
+                ua.SendKeys("{Ctrl}v", waitTime=0.35)
+                return True
 
-        def _paste_text(text, verify=False):
+        def _paste_text(text, verify=False, method="win32_sendinput_ctrl_v"):
             if verify:
                 ready = False
                 for _ in range(6):
                     set_clipboard_windows(text)
-                    time.sleep(0.18)
+                    time.sleep(0.16)
                     try:
                         if get_clipboard_text_windows().strip() == text.strip():
                             ready = True
                             break
                     except Exception:
                         pass
-                    time.sleep(0.2)
+                    time.sleep(0.18)
                 if not ready:
                     return False
             else:
                 set_clipboard_windows(text)
-            time.sleep(0.25)
-            _send_paste_shortcut()
-            time.sleep(0.25)
+            time.sleep(0.18)
+            _send_paste_shortcut(method=method)
+            time.sleep(0.24)
             return True
 
         def _type_unicode(text):
@@ -10265,7 +11200,6 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                         out.append((h, ctl))
             return out
 
-        def _search_doc():
             for h, ctl in _search_controls():
                 try:
                     d = ctl.DocumentControl(searchDepth=12, Name="advancedSearch")
@@ -10497,11 +11431,13 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 return min(found, key=lambda x: x[1].top)
             return None
 
-        def _focus_chat_input(win, r):
-            """优先精准定位 widget_input_wnd / drich_edit 对话输入控件，避开富文本工具栏与底栏按钮。"""
-            check_stop()
-            W = r.right - r.left
-            H = r.bottom - r.top
+        def _scan_compose_candidates(win, r):
+            """深度扫描钉钉 Qt 输入区（edit / widget_input_wnd / bottomBarWidget）并生成按训练权重排序的安全点位列表。"""
+            dpi_sc = float((pc_plan or {}).get("dpi_scale") or 1.0)
+            edit_rect = None
+            input_wnd_rect = None
+            bottom_bar_rect = None
+            edit_ctrl = None
             hwnd_now = 0
             if win is not None:
                 try:
@@ -10518,142 +11454,179 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                     input_wnd = None
                     ed_hit = None
                     rich_low = DT_RICH_EDIT_AUTO_ID.lower()
-                    for ctrl, _ in _iter_dt_uia_pruned(pwrap, max_depth=18):
-                        aid_l = (ctrl.element_info.automation_id or "").lower()
-                        if input_wnd is None and (aid_l.endswith(".widget_input_wnd") or aid_l.endswith(".widgetinputwnd")):
-                            try:
+                    W_win = max(1, r.right - r.left)
+                    H_win = max(1, r.bottom - r.top)
+                    for ctrl, _ in _iter_dt_uia_pruned(pwrap, max_depth=24):
+                        try:
+                            ii = ctrl.element_info
+                            aid_l = (ii.automation_id or "").lower()
+                            if bottom_bar_rect is None and (
+                                aid_l.endswith(".bottombarwidget")
+                                or aid_l.endswith(".combo_send_button_widget")
+                            ):
+                                br = ctrl.rectangle()
+                                if br.width() > 60 and br.top >= r.top + int(H_win * 0.65):
+                                    bottom_bar_rect = (br.left, br.top, br.right, br.bottom)
+                            if input_wnd is None and (aid_l.endswith(".widget_input_wnd") or aid_l.endswith(".widgetinputwnd")):
                                 ir = ctrl.rectangle()
                                 if ir.width() > 100 and ir.height() > 36:
                                     input_wnd = ctrl
-                            except Exception:
-                                pass
-                        if ed_hit is None and (aid_l == rich_low or aid_l.endswith(".drich_edit")):
-                            ed_hit = ctrl
-                        if input_wnd is not None and ed_hit is not None:
-                            break
-                    target_container = input_wnd if input_wnd is not None else ed_hit
-                    if target_container is not None:
-                        for ch, _ in _iter_dt_uia_pruned(target_container, max_depth=8):
-                            try:
-                                ii = ch.element_info
-                                aid_c = (ii.automation_id or "").lower()
-                                if "bottombar" in aid_c:
-                                    continue
-                                rr = ch.rectangle()
-                                nm_l = (ii.name or "").lower()
-                                if ((ii.control_type or "") in ("Edit", "Document")
-                                        and rr.width() > 100 and rr.height() > 22
-                                        and "搜索" not in nm_l and "search" not in nm_l):
-                                    _uia_click_ctrl(ch)
-                                    time.sleep(0.22)
-                                    return
-                            except Exception:
-                                pass
-                        if input_wnd is not None:
-                            try:
-                                ir = input_wnd.rectangle()
-                                if ir.width() > 100 and ir.height() > 36:
-                                    input_wnd.click_input(coords=(max(20, ir.width() // 2), max(14, int(ir.height() * 0.38))))
-                                    time.sleep(0.22)
-                                    return
-                            except Exception:
-                                pass
-                        _uia_click_ctrl(target_container)
-                        time.sleep(0.22)
-                        return
-                    for ctrl, _ in _iter_dt_uia_pruned(pwrap, max_depth=14):
-                        try:
-                            ii = ctrl.element_info
-                            rr = ctrl.rectangle()
+                                    input_wnd_rect = (ir.left, ir.top, ir.right, ir.bottom)
+                            if ed_hit is None and (aid_l == rich_low or aid_l.endswith(".drich_edit")):
+                                ed_hit = ctrl
                             nm_l = (ii.name or "").lower()
-                            if ((ii.control_type or "") in ("Edit", "Document")
-                                    and rr.width() > 120 and rr.height() > 24
-                                    and rr.top >= r.top + int(H * 0.52)
-                                    and rr.left >= r.left + int(W * 0.24)
-                                    and "搜索" not in nm_l and "search" not in nm_l):
-                                _uia_click_ctrl(ctrl)
-                                time.sleep(0.22)
-                                return
+                            if (
+                                edit_rect is None
+                                and "bottombar" not in aid_l
+                                and (ii.control_type or "") in ("Edit", "Document")
+                                and "搜索" not in nm_l
+                                and "search" not in nm_l
+                            ):
+                                er = ctrl.rectangle()
+                                if er.width() > 120 and er.height() > 22 and er.top >= r.top + int(H_win * 0.50) and er.left >= r.left + int(W_win * 0.24):
+                                    edit_rect = (er.left, er.top, er.right, er.bottom)
+                                    edit_ctrl = ctrl
+                        except Exception:
+                            pass
+                    if input_wnd_rect is None and ed_hit is not None:
+                        try:
+                            er2 = ed_hit.rectangle()
+                            if er2.width() > 100 and er2.height() > 36:
+                                input_wnd_rect = (er2.left, er2.top, er2.right, er2.bottom)
                         except Exception:
                             pass
                 except Exception:
                     pass
-            in_x = int(r.left + W * 0.56)
-            in_y = int(r.top + H * 0.78)
-            ua.Click(in_x, in_y, waitTime=0.35)
+            cands = _compute_dt_compose_click_points(
+                (r.left, r.top, r.right, r.bottom),
+                edit_rect=edit_rect,
+                input_wnd_rect=input_wnd_rect,
+                bottom_bar_rect=bottom_bar_rect,
+                dpi_scale=dpi_sc,
+            )
+            order_pref = list((dt_strat or {}).get("focus_order") or DEFAULT_DT_FOCUS_STRATEGIES)
+            rank_map = {nm: idx for idx, nm in enumerate(order_pref)}
+            cands.sort(key=lambda it: rank_map.get(it[0], 999))
+            return cands, edit_ctrl
+
+        def _focus_chat_input(win, r, strategy_hint=None):
+            """按训练权重顺序点击待发送输入框并确认坐标安全，返回命中的 (strategy_name, compose_patch_rect)。"""
+            check_stop()
+            cands, _edit_ctrl = _scan_compose_candidates(win, r)
+            if not cands:
+                W = r.right - r.left
+                H = r.bottom - r.top
+                cx = int(r.left + W * 0.48)
+                cy = int(r.top + H * 0.85)
+                ua.Click(cx, cy, waitTime=0.25)
+                return "ratio_bottom_85", (int(r.left + W * 0.26), int(r.top + H * 0.72), int(r.right - W * 0.08), int(r.bottom - H * 0.07))
+            picked = None
+            if strategy_hint:
+                picked = next((c for c in cands if c[0] == strategy_hint), None)
+            if picked is None:
+                picked = cands[0]
+            strat_name, cx, cy, patch_rect = picked
+            ua.Click(int(cx), int(cy), waitTime=0.22)
+            time.sleep(0.18)
+            return strat_name, patch_rect
 
         def _is_win_in_menu_mode(hwnd):
-            """调用 Win32 GetGUIThreadInfo 检测目标窗口线程是否仍处于弹出菜单模式。"""
-            try:
-                class GUITHREADINFO(ctypes.Structure):
-                    _fields_ = [
-                        ("cbSize", wintypes.DWORD),
-                        ("flags", wintypes.DWORD),
-                        ("hwndActive", wintypes.HWND),
-                        ("hwndFocus", wintypes.HWND),
-                        ("hwndCapture", wintypes.HWND),
-                        ("hwndMenuOwner", wintypes.HWND),
-                        ("hwndMoveSize", wintypes.HWND),
-                        ("hwndCaret", wintypes.HWND),
-                        ("rcCaret", wintypes.RECT),
-                    ]
+            return bool(_get_win_gui_caret_info(hwnd).get("in_menu"))
 
-                user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
-                user32.GetGUIThreadInfo.restype = wintypes.BOOL
-                tid = user32.GetWindowThreadProcessId(int(hwnd), None)
-                if not tid:
-                    return False
-                gti = GUITHREADINFO()
-                gti.cbSize = ctypes.sizeof(GUITHREADINFO)
-                if not user32.GetGUIThreadInfo(tid, ctypes.byref(gti)):
-                    return False
-                # GUI_INMENUMODE=0x4, GUI_POPUPMENUMODE=0x10
-                return bool((gti.flags & 0x00000014) or gti.hwndMenuOwner)
-            except Exception:
-                return False
-
-        def _is_focus_in_chat_compose(ding_now, r):
-            """检查当前焦点控件是否确在钉钉对话内容输入窗口（含前台句柄、菜单状态与控件区域校验）。"""
+        def _is_focus_in_chat_compose(ding_now, r, compose_rect=None):
+            """联合校验 UIA 焦点控件与 Win32 Caret 闪烁光标位置，确保光标确实已进入待发送框。"""
             if _is_search_popup_open():
                 return False, "全局搜索弹窗处于打开状态"
             try:
                 ding_hwnd = int(ding_now.NativeWindowHandle)
             except Exception:
                 ding_hwnd = 0
+            caret_info = {"in_menu": False, "has_caret": False, "caret_screen_pt": None}
             if ding_hwnd:
                 fg_hwnd = int(user32.GetForegroundWindow() or 0)
                 if fg_hwnd != ding_hwnd:
                     return False, "当前前台窗口并非钉钉主窗（可能仍有弹出菜单或切换了窗口）"
-                if _is_win_in_menu_mode(ding_hwnd):
+                caret_info = _get_win_gui_caret_info(ding_hwnd)
+                if caret_info.get("in_menu"):
                     return False, "钉钉线程仍处于菜单展开模式，尚未回到输入窗口"
             try:
                 fc = ua.GetFocusedControl()
             except Exception:
                 fc = None
-            return _evaluate_compose_focus_ctrl(fc, r)
+            ok_uia, desc_uia = _evaluate_compose_focus_ctrl(fc, r)
+            if ok_uia:
+                return True, desc_uia
+            if caret_info.get("has_caret") and caret_info.get("caret_screen_pt"):
+                cx_pt, cy_pt = caret_info["caret_screen_pt"]
+                W = max(1, r.right - r.left)
+                H = max(1, r.bottom - r.top)
+                if cy_pt >= r.top + int(H * 0.56) and cx_pt >= r.left + int(W * 0.22):
+                    if isinstance(compose_rect, (tuple, list)) and len(compose_rect) == 4:
+                        if compose_rect[0] - 40 <= cx_pt <= compose_rect[2] + 40 and compose_rect[1] - 30 <= cy_pt <= compose_rect[3] + 35:
+                            return True, f"Win32输入光标已就位({cx_pt},{cy_pt})"
+                    return True, f"Win32底部输入光标已激活({cx_pt},{cy_pt})"
+            return False, desc_uia
 
-        def _verify_and_focus_chat_input(retries=2):
-            """点完静音后把光标切回对话内容输入窗口并严格校验，确认后再允许 Enter。"""
+        def _verify_and_focus_chat_input(retries=2, force_strategy=None):
+            """点击待发送框并严格校验光标落位；未稳时自动轮换候选点位。"""
             last_reason = "焦点未确认"
-            for attempt in range(retries + 1):
+            strat_seq = ([force_strategy] if force_strategy else []) + list((dt_strat or {}).get("focus_order") or DEFAULT_DT_FOCUS_STRATEGIES)
+            seen_strats = []
+            for s in strat_seq:
+                if s and s not in seen_strats:
+                    seen_strats.append(s)
+            for attempt in range(max(retries + 1, min(4, len(seen_strats)))):
                 check_stop()
                 ding_now = _fresh_ding()
                 if ding_now is None:
                     raise RuntimeError("找不到钉钉主窗口，无法校验光标位置")
                 r_now = ding_now.BoundingRectangle
-                _focus_chat_input(ding_now, r_now)
-                sleep_check(0.25)
-                ua.SendKeys("{End}", waitTime=0.15)
+                hint = seen_strats[attempt] if attempt < len(seen_strats) else None
+                used_strat, c_rect = _focus_chat_input(ding_now, r_now, strategy_hint=hint)
+                sleep_check(0.18)
                 _ensure_not_in_search_box(r_now)
-                ok_focus, desc = _is_focus_in_chat_compose(ding_now, r_now)
+                ok_focus, desc = _is_focus_in_chat_compose(ding_now, r_now, compose_rect=c_rect)
                 if ok_focus:
-                    log(f"  ✅ 已确认光标位于对话输入窗口（{desc}）")
-                    return True
+                    record_run_trace_event("focus_ok", used_strat)
+                    return used_strat, c_rect, desc
+                record_run_trace_event("focus_fail", used_strat, {"reason": desc})
                 last_reason = desc
-                if attempt < retries:
-                    log(f"  [光标校验] 第 {attempt + 1} 次未确认焦点在对话输入框（{desc}），0.5 秒后重新聚焦…")
-                    sleep_check(0.5)
-            raise RuntimeError(f"点完静音后光标未确认进入对话输入窗口（{last_reason}），已安全拦截发送")
+                if attempt < max(retries, min(3, len(seen_strats) - 1)):
+                    sleep_check(0.25)
+            ding_fb = _fresh_ding()
+            r_fb = ding_fb.BoundingRectangle if ding_fb is not None else None
+            cands_fb, _ = _scan_compose_candidates(ding_fb, r_fb) if (ding_fb is not None and r_fb is not None) else ([], None)
+            fb_rect = cands_fb[0][3] if cands_fb else None
+            return seen_strats[0] if seen_strats else "ratio_bottom_85", fb_rect, last_reason
+
+        def _prepare_chat_compose_box(force_strategy=None):
+            """严格执行：定位点击待发送框 -> 清空旧内容 -> 按一次 Enter 激活输入态 -> 确认光标在待发送框内。"""
+            used_strat, c_rect, focus_desc = _verify_and_focus_chat_input(retries=2, force_strategy=force_strategy)
+            if cfg.get("dt_clear_before_send", True):
+                if not _win32_send_ctrl_key(ord("A")):
+                    ua.SendKeys("{Ctrl}a", waitTime=0.10)
+                sleep_check(0.06)
+                if not _win32_send_single_vk(0x08):
+                    ua.SendKeys("{Back}", waitTime=0.08)
+                sleep_check(0.04)
+                if not _win32_send_single_vk(0x2E):
+                    ua.SendKeys("{Delete}", waitTime=0.08)
+                sleep_check(0.12)
+                log("  已清空发送框内原有内容")
+                # 发送框已清空时轻按一次 Enter，可稳定收起残留输入法候选浮层并激活光标输入态（空框不会发出消息）
+                if not _win32_send_single_vk(0x0D):
+                    ua.SendKeys("{Enter}", waitTime=0.10)
+                sleep_check(0.16)
+                log("  ✅ 已在清空的待发送框按 Enter 激活光标并确认就位（" + str(focus_desc) + "）")
+            else:
+                log(f"  ✅ 光标已确认在待发送框内（{focus_desc}）")
+            ding_chk = _fresh_ding()
+            if ding_chk is not None:
+                ok2, _ = _is_focus_in_chat_compose(ding_chk, ding_chk.BoundingRectangle, compose_rect=c_rect)
+                if not ok2:
+                    used_strat, c_rect = _focus_chat_input(ding_chk, ding_chk.BoundingRectangle, strategy_hint=used_strat)
+                    sleep_check(0.15)
+            return used_strat, c_rect
 
         def _is_focus_in_search_area(r):
             if _is_search_popup_open():
@@ -10665,9 +11638,10 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                     if "搜索" in fname or "search" in fname:
                         return True, f"焦点控件为「{fc.Name}」"
                     fr = fc.BoundingRectangle
-                    H = max(1, r.bottom - r.top)
+                    H = max(1, r.bottom - r.top) if r is not None else 900
+                    r_top = r.top if r is not None else 0
                     if (fr.bottom > fr.top and fr.right > fr.left
-                            and fr.bottom < r.top + H * 0.35):
+                            and r is not None and fr.bottom < r_top + H * 0.35):
                         return True, "焦点位于钉钉窗口顶部搜索栏区域"
             except Exception:
                 pass
@@ -10706,6 +11680,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 log(f"  → 目标 ({idx}/{total})：正在搜索「{search_name}」…")
             else:
                 log(f"  正在打开钉钉，搜索「{search_name}」…")
+            record_run_trace_event("dt_target", search_name)
 
             search_candidates, search_tokens = _extract_search_keywords(search_name)
             smart_cand_map = cfg.get("_smart_target_candidates") if isinstance(cfg, dict) else None
@@ -11032,11 +12007,11 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             except Exception:
                                 pass
 
-                        # 按用户设定等待 N 秒让钉钉聊天框加载完成再粘贴（纯文字直发极速免等）
+                        # 按用户设定及训练优化结果等待 N 秒让钉钉聊天框加载完成再粘贴（纯文字直发极速免等）
                         try:
-                            paste_delay = max(0, min(20, int(round(float(cfg.get("dt_paste_delay_sec", 1))))))
+                            paste_delay = int((dt_strat or {}).get("effective_paste_delay_sec", cfg.get("dt_paste_delay_sec", 3)))
                         except Exception:
-                            paste_delay = 1
+                            paste_delay = 3
                         if str(text_only_message or "").strip():
                             if paste_delay > 0:
                                 _sleep_watch_ding(min(0.25, float(paste_delay)), expected_pid=ding_pid, fg_locked=False)
@@ -11044,131 +12019,148 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             log(f"  ⏳ 等待 {paste_delay} 秒让钉钉聊天框加载就绪后再粘贴（可在「钉钉投递」调整秒数）…")
                             _sleep_watch_ding(paste_delay, expected_pid=ding_pid, fg_locked=False)
 
-                        # 4) 聚焦底部聊天输入框并一次性先清空旧草稿
-                        ding_now, ding_pid, ding_hwnd_cur = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
-                        r = ding_now.BoundingRectangle
-                        _focus_chat_input(ding_now, r)
-                        _sleep_watch_ding(0.35, expected_pid=ding_pid, fg_locked=True)
-                        _ensure_not_in_search_box(r)
-
-                        if cfg.get("dt_clear_before_send", True):
-                            try:
-                                from pywinauto import keyboard as _pwa_kbd  # type: ignore[import-not-found]
-                                _pwa_kbd.send_keys("^a{BACKSPACE}{DELETE}")
-                            except Exception:
-                                ua.SendKeys("{Ctrl}a", waitTime=0.12)
-                                ua.SendKeys("{Back}", waitTime=0.12)
-                                ua.SendKeys("{Delete}", waitTime=0.12)
-                            sleep_check(0.22)
-                            log("  已清空发送框内原有内容")
-
+                        # 4) 精准定位待发送框 -> 清空原有内容 -> 按一次 Enter 激活并核对光标位置
                         pt_cfg = cfg.get("pipeline_tuning") if isinstance(cfg.get("pipeline_tuning"), dict) else {}
                         compose_order = str(pt_cfg.get("compose_step_order") or "image_text_silent")
-                        silent_order = str(pt_cfg.get("silent_step_order") or "uia_first")
-                        paste_key_order = str(pt_cfg.get("paste_key_order") or "pywinauto_first")
+                        silent_order = str((dt_strat or {}).get("silent_order") or pt_cfg.get("silent_step_order") or "uia_first")
+                        focus_order_list = list((dt_strat or {}).get("focus_order") or DEFAULT_DT_FOCUS_STRATEGIES)
+                        paste_order_list = list((dt_strat or {}).get("paste_order") or DEFAULT_DT_PASTE_METHODS)
+
+                        active_focus_strat, active_compose_rect = _prepare_chat_compose_box()
+                        active_paste_method = paste_order_list[0] if paste_order_list else "win32_sendinput_ctrl_v"
 
                         def _do_paste_image_step():
-                            nonlocal image_pasted_ok
-                            ding_cur, _, hwnd_cur = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
-                            r_img = ding_cur.BoundingRectangle
-                            _focus_chat_input(ding_cur, r_img)
-                            _sleep_watch_ding(0.25, expected_pid=ding_pid, fg_locked=True)
-                            if compose_order == "text_silent_image":
-                                try:
-                                    ua.SendKeys("{End}", waitTime=0.12)
-                                except Exception:
-                                    pass
-                            _ensure_not_in_search_box(r_img)
-                            before_patch = (
-                                _capture_dt_input_patch(r_img)
-                                if (hwnd_cur and int(user32.GetForegroundWindow() or 0) == hwnd_cur)
-                                else None
-                            )
-                            use_pwa_first = (paste_key_order != "uia_first")
-                            for paste_try in range(3):
-                                if not set_clipboard_image_from_file(tmp_img):
-                                    raise RuntimeError("图片恢复失败，已停止粘贴")
+                            nonlocal image_pasted_ok, active_focus_strat, active_compose_rect, active_paste_method
+                            combos = []
+                            for idx_p in range(max(4, len(focus_order_list))):
+                                fs = focus_order_list[min(idx_p, len(focus_order_list) - 1)] if idx_p > 0 else active_focus_strat
+                                pm = paste_order_list[idx_p % len(paste_order_list)]
+                                combos.append((fs, pm))
+                            max_tries = min(4, len(combos))
+                            for paste_try in range(max_tries):
+                                fs_try, pm_try = combos[paste_try]
                                 if paste_try > 0:
-                                    ding_cur, _, hwnd_cur = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
-                                    r_img = ding_cur.BoundingRectangle
-                                    _focus_chat_input(ding_cur, r_img)
-                                    _sleep_watch_ding(0.3, expected_pid=ding_pid, fg_locked=True)
-                                else:
-                                    _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                                    active_focus_strat, active_compose_rect = _prepare_chat_compose_box(force_strategy=fs_try)
+                                ding_cur, _, hwnd_cur = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                                r_img = ding_cur.BoundingRectangle
+                                if compose_order == "text_silent_image":
+                                    if not _win32_send_single_vk(0x23):
+                                        ua.SendKeys("{End}", waitTime=0.10)
                                 _ensure_not_in_search_box(r_img)
-                                if before_patch is None and hwnd_cur and int(user32.GetForegroundWindow() or 0) == hwnd_cur:
-                                    before_patch = _capture_dt_input_patch(r_img)
+                                before_patch = (
+                                    _capture_dt_input_patch(r_img, input_rect=active_compose_rect)
+                                    if (hwnd_cur and int(user32.GetForegroundWindow() or 0) == hwnd_cur)
+                                    else None
+                                )
+                                if not set_clipboard_image_from_file(
+                                    tmp_img,
+                                    cached_scaled_path=scaled_send_path,
+                                    cached_png_bytes=scaled_png_bytes,
+                                ):
+                                    raise RuntimeError("图片恢复失败，已停止粘贴")
+                                sleep_check(0.14)
 
-                                if (paste_try % 2 == 0) == use_pwa_first:
-                                    _send_paste_shortcut()
-                                else:
-                                    try:
-                                        ua.SendKeys("{Ctrl}v", waitTime=0.35)
-                                    except Exception:
-                                        _send_paste_shortcut()
-                                sleep_check(0.9)
+                                _send_paste_shortcut(method=pm_try, compose_rect=active_compose_rect)
+                                sleep_check(0.85)
 
                                 converted = False
                                 for _ in range(5):
-                                    sleep_check(0.2)
+                                    sleep_check(0.18)
                                     _raise_if_interrupted(expected_pid=ding_pid, fg_locked=False)
                                     tops = _enum_top_windows(
                                         target_classes=("ddesign::ComplexModal",), target_titles=None)
                                     if tops:
                                         modal = _safe_control_from_handle(ua, tops[0][0])
                                         if modal is not None:
-                                            for btn_lbl in ("转为图片", "确定", "是", "发送", "继续", "好"):
+                                            for btn_lbl in ("转为图片", "确定", "是", "Yes", "YES", "OK", "发送", "继续", "好", "确认"):
                                                 btn = modal.ButtonControl(searchDepth=12, Name=btn_lbl)
-                                                if btn.Exists(0.35):
+                                                if btn.Exists(0.30):
                                                     btn.Click()
                                                     converted = True
-                                                    sleep_check(0.5)
+                                                    sleep_check(0.45)
                                                     break
                                         break
-                                sleep_check(0.35)
-                                after_patch = _capture_dt_input_patch(r_img) if before_patch is not None else None
+                                sleep_check(0.30)
+                                after_patch = (
+                                    _capture_dt_input_patch(r_img, input_rect=active_compose_rect)
+                                    if before_patch is not None
+                                    else None
+                                )
                                 if converted or _did_dt_input_change(before_patch, after_patch):
+                                    active_paste_method = pm_try
+                                    record_run_trace_event("paste_ok", pm_try, {"focus": active_focus_strat, "attempt": paste_try + 1})
                                     if converted:
-                                        log("  ✅ 已自动点「转为图片」并确认图片粘贴进入钉钉输入框")
+                                        log(f"  ✅ 已自动点「转为图片」并确认图片粘贴进入钉钉输入框（{active_focus_strat} + {pm_try}）")
                                     else:
-                                        log("  ✅ 已确认图片粘贴进入钉钉输入框")
+                                        log(f"  ✅ 已确认图片粘贴进入钉钉输入框（{active_focus_strat} + {pm_try}）")
                                     image_pasted_ok = True
                                     break
-                                if paste_try < 2:
-                                    log("  ⚠️ 检测到粘贴后输入区画面无变化（钉钉可能仍在加载），等待 2 秒后自动补粘…")
-                                    sleep_check(2.0)
+                                record_run_trace_event("paste_fail", pm_try, {"focus": active_focus_strat, "reason": "画面未变化"})
+                                if paste_try < max_tries - 1:
+                                    next_fs, next_pm = combos[paste_try + 1]
+                                    log(
+                                        f"  ⚠️ 粘贴未引起输入区变化（{active_focus_strat}+{pm_try}），"
+                                        f"正在切换下一组合（{next_fs}+{next_pm}）立即重聚焦并补粘…"
+                                    )
+                                    sleep_check(1.1)
 
                             if not image_pasted_ok:
                                 raise RuntimeError("图片粘贴后输入框画面未变化，请把「打开会话后等待秒数」调大一点或手动打开会话重试")
 
                         def _do_paste_text_step():
-                            nonlocal text_pasted_ok
-                            ding_txt, _, _ = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
+                            nonlocal text_pasted_ok, active_compose_rect
+                            ding_txt, _, hwnd_txt = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
                             r_txt = ding_txt.BoundingRectangle
-                            _focus_chat_input(ding_txt, r_txt)
-                            _sleep_watch_ding(0.22, expected_pid=ding_pid, fg_locked=True)
-                            try:
-                                from pywinauto import keyboard as _pwa_kbd  # type: ignore[import-not-found]
-                                _pwa_kbd.send_keys("{END}")
-                            except Exception:
-                                ua.SendKeys("{End}", waitTime=0.15)
+                            _focus_chat_input(ding_txt, r_txt, strategy_hint=active_focus_strat)
+                            _sleep_watch_ding(0.16, expected_pid=ding_pid, fg_locked=True)
+                            if not _win32_send_single_vk(0x23):
+                                try:
+                                    ua.SendKeys("{End}", waitTime=0.12)
+                                except Exception:
+                                    pass
                             _ensure_not_in_search_box(r_txt)
-                            if not _paste_text(text_msg, verify=True):
-                                raise RuntimeError("钉钉文字未就绪，已停止自动发送，请检查后手动按 Enter")
+                            before_txt_patch = (
+                                _capture_dt_input_patch(r_txt, input_rect=active_compose_rect)
+                                if (hwnd_txt and int(user32.GetForegroundWindow() or 0) == hwnd_txt)
+                                else None
+                            )
+                            paste_method_txt = "win32_sendinput_ctrl_v" if active_paste_method == "context_menu_paste" else active_paste_method
+                            ok_clip = _paste_text(text_msg, verify=True, method=paste_method_txt)
+                            after_txt_patch = (
+                                _capture_dt_input_patch(r_txt, input_rect=active_compose_rect)
+                                if before_txt_patch is not None
+                                else None
+                            )
+                            need_unicode_fb = (not ok_clip) or (
+                                before_txt_patch is not None
+                                and after_txt_patch is not None
+                                and not _did_dt_input_change(before_txt_patch, after_txt_patch)
+                            )
+                            if need_unicode_fb:
+                                log("  ⚠️ 文字粘贴未检测到输入变化或剪贴板繁忙，改用 Unicode 直打注入后缀文案…")
+                                _focus_chat_input(ding_txt, r_txt, strategy_hint=active_focus_strat)
+                                sleep_check(0.12)
+                                if not _win32_send_single_vk(0x23):
+                                    ua.SendKeys("{End}", waitTime=0.10)
+                                _type_unicode(text_msg)
+                                record_run_trace_event("text_method", "unicode_type", {"ok": True})
+                            else:
+                                record_run_trace_event("text_method", paste_method_txt, {"ok": True})
                             text_pasted_ok = True
-                            _sleep_watch_ding(0.25, expected_pid=ding_pid, fg_locked=True)
+                            _sleep_watch_ding(0.22, expected_pid=ding_pid, fg_locked=True)
 
                         def _do_toggle_silent_step():
                             if do_silent:
-                                _enable_dingtalk_silent_send(silent_order=silent_order)
+                                ok_sil = _enable_dingtalk_silent_send(silent_order=silent_order)
+                                record_run_trace_event("silent_ok" if ok_sil else "silent_fail", "image" if silent_order == "arrow_img_then_uia" else "uia")
                             else:
-                                _disable_dingtalk_silent_send()
+                                log("  未开启静音发送，跳过点击静音按钮")
 
                         if str(text_only_message or "").strip():
                             image_pasted_ok = True
                             _do_paste_text_step()
                             _do_toggle_silent_step()
-                        elif compose_order == "text_silent_image":
+                        elif do_silent and compose_order == "text_silent_image":
                             log("  🔄 当前启用防卡顿顺序：先贴文字唤醒输入栏 -> 点设静音 -> 最后贴大图")
                             _do_paste_text_step()
                             _do_toggle_silent_step()
@@ -11178,16 +12170,27 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             _do_paste_text_step()
                             _do_toggle_silent_step()
 
-                        # 点完设为静音/取消静音后极速核验焦点并直接发送
-                        _sleep_watch_ding(0.35, expected_pid=ding_pid, fg_locked=False)
+                        # 贴好图片、日期与后缀后，等待可调秒数再直接按 Enter 发送（未开静音时不再切焦点点按钮）
+                        try:
+                            send_wait_sec = max(0, min(30, int(round(float(cfg.get("dt_send_wait_sec", 5))))))
+                        except Exception:
+                            send_wait_sec = 5
+                        if not str(text_only_message or "").strip() and cfg.get("dt_auto_send", False) and send_wait_sec > 0:
+                            log(f"  ⏳ 截图与文案已写入钉钉对话框，等待 {send_wait_sec} 秒后直接按 Enter 发送（可在「钉钉投递」调整秒数）…")
+                            _sleep_watch_ding(send_wait_sec, expected_pid=ding_pid, fg_locked=False)
+                        else:
+                            _sleep_watch_ding(0.18 if not do_silent else 0.28, expected_pid=ding_pid, fg_locked=False)
                         if _is_search_popup_open():
-                            _ensure_not_in_search_box(r)
+                            ding_mid = _fresh_ding()
+                            _ensure_not_in_search_box(ding_mid.BoundingRectangle if ding_mid is not None else None)
                         ding_commit, ding_pid, _ = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
 
                         if cfg.get("dt_auto_send", False):
-                            _focus_chat_input(ding_commit, ding_commit.BoundingRectangle)
-                            sleep_check(0.18)
-                            sent_via_btn = _commit_dingtalk_send(ding_commit)
+                            ok_c_focus, _ = _is_focus_in_chat_compose(ding_commit, ding_commit.BoundingRectangle, compose_rect=active_compose_rect)
+                            if not ok_c_focus:
+                                _focus_chat_input(ding_commit, ding_commit.BoundingRectangle, strategy_hint=active_focus_strat)
+                                sleep_check(0.14)
+                            sent_via_btn = _commit_dingtalk_send(ding_commit, input_rect=active_compose_rect)
                             silent_word = "静音" if do_silent else "常规"
                             extra_tip = "（含发送按钮补发确认）" if sent_via_btn else ""
                             log(f"  已{silent_word}发送图片和文字到「{search_name}」：{text_msg}{extra_tip}")
@@ -11218,6 +12221,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                         )
                         if heal_p.get("can_auto_fix"):
                             acts_p = heal_p.get("actions", [])
+                            record_run_trace_event("heal_applied", heal_p.get("observation") or "贴图阶段自动排障", {"stage": "dingtalk_paste", "actions": acts_p})
                             if "dismiss_popups" in acts_p:
                                 try:
                                     ua.SendKeys("{Esc}", waitTime=0.2)
@@ -11239,13 +12243,19 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                                     if do_silent:
                                         _enable_dingtalk_silent_send()
                                     else:
-                                        _disable_dingtalk_silent_send()
-                                    _sleep_watch_ding(1.0, expected_pid=ding_pid, fg_locked=False)
+                                        log("  未开启静音发送，跳过点击静音按钮")
+                                    try:
+                                        sw2 = max(0, min(30, int(round(float(cfg.get("dt_send_wait_sec", 5))))))
+                                    except Exception:
+                                        sw2 = 5
+                                    _sleep_watch_ding(float(sw2 if (cfg.get("dt_auto_send", False) and sw2 > 0) else 0.5), expected_pid=ding_pid, fg_locked=False)
                                     ding_h2, ding_pid, _ = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
                                     if cfg.get("dt_auto_send", False):
-                                        _focus_chat_input(ding_h2, ding_h2.BoundingRectangle)
-                                        sleep_check(0.18)
-                                        sent_b2 = _commit_dingtalk_send(ding_h2)
+                                        ok_h_focus, _ = _is_focus_in_chat_compose(ding_h2, ding_h2.BoundingRectangle, compose_rect=active_compose_rect)
+                                        if not ok_h_focus:
+                                            _focus_chat_input(ding_h2, ding_h2.BoundingRectangle)
+                                            sleep_check(0.16)
+                                        sent_b2 = _commit_dingtalk_send(ding_h2, input_rect=active_compose_rect)
                                         silent_w2 = "静音" if do_silent else "常规"
                                         tip_b2 = "（含发送按钮补发确认）" if sent_b2 else ""
                                         log(f"  ✅ [AI 自动调试] 已自动排障并{silent_w2}发送到「{search_name}」：{text_msg}{tip_b2}")
@@ -11488,6 +12498,34 @@ def _run_once_impl(round_num, cfg=None, trigger_lt=None, trigger_hm=None, recove
     start_str = time.strftime("%Y-%m-%d %H:%M:%S")
     if cfg is None:
         cfg = load_config()
+    reset_run_training_trace(mode="full", round_label=f"第{round_num}轮")
+    try:
+        return _run_once_impl_body(
+            round_num=round_num,
+            cfg=cfg,
+            trigger_lt=trigger_lt,
+            trigger_hm=trigger_hm,
+            recover_interactive=recover_interactive,
+            start_time=start_time,
+            start_str=start_str,
+        )
+    except Exception as exc_tr:
+        if "手动停止" not in str(exc_tr):
+            try:
+                finalize_run_training_summary(
+                    cfg,
+                    status="err",
+                    mode="full",
+                    round_label=f"第{round_num}轮",
+                    duration_sec=int(time.time() - start_time),
+                    error_detail=classify_error_detail(exc_tr),
+                )
+            except Exception:
+                pass
+        raise
+
+
+def _run_once_impl_body(round_num, cfg, trigger_lt, trigger_hm, recover_interactive, start_time, start_str):
     luya_user = (cfg.get("luya_user") or LUYA_USER).strip() or LUYA_USER
     luya_pass = cfg.get("luya_pass") or LUYA_PASS
     wps_url = (cfg.get("wps_url") or WPS_URL).strip() or WPS_URL
@@ -11727,6 +12765,10 @@ def _run_once_impl(round_num, cfg=None, trigger_lt=None, trigger_hm=None, recove
         record_run_journal(cfg, status="ok", mode="full", round_label=f"第{round_num}轮", duration_sec=duration)
     except Exception:
         pass
+    try:
+        finalize_run_training_summary(cfg, status="ok", mode="full", round_label=f"第{round_num}轮", duration_sec=duration)
+    except Exception:
+        pass
     set_step("✅ 本轮跑完")
     log(f"✅ 本轮全部完成，用时 {duration} 秒")
 
@@ -11776,6 +12818,32 @@ def _run_capture_only_impl(round_num="截图", cfg=None, recover_interactive=Tru
     trigger_lt = time.localtime(start_time)
     if cfg is None:
         cfg = load_config()
+    reset_run_training_trace(mode="capture_only", round_label="独立截图")
+    try:
+        return _run_capture_only_impl_body(
+            round_num=round_num,
+            cfg=cfg,
+            recover_interactive=recover_interactive,
+            start_time=start_time,
+            trigger_lt=trigger_lt,
+        )
+    except Exception as exc_tr:
+        if "手动停止" not in str(exc_tr):
+            try:
+                finalize_run_training_summary(
+                    cfg,
+                    status="err",
+                    mode="capture_only",
+                    round_label="独立截图",
+                    duration_sec=int(time.time() - start_time),
+                    error_detail=classify_error_detail(exc_tr),
+                )
+            except Exception:
+                pass
+        raise
+
+
+def _run_capture_only_impl_body(round_num, cfg, recover_interactive, start_time, trigger_lt):
     wps_url = (cfg.get("wps_url") or WPS_URL).strip() or WPS_URL
     log("=" * 40)
     log(f"📸 开始独立截图发送，时间 {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -11827,6 +12895,16 @@ def _run_capture_only_impl(round_num="截图", cfg=None, recover_interactive=Tru
     dur_s = int(end_time - start_time)
     try:
         record_run_journal(
+            cfg,
+            status="ok" if not capture_failed else "skipped_capture",
+            mode="capture_only",
+            round_label="独立截图",
+            duration_sec=dur_s,
+        )
+    except Exception:
+        pass
+    try:
+        finalize_run_training_summary(
             cfg,
             status="ok" if not capture_failed else "skipped_capture",
             mode="capture_only",

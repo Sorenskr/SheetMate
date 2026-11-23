@@ -1,10 +1,10 @@
-# 暗号表助手（SheetMate）v2.9.3
+# 暗号表助手（SheetMate）v2.9.4
 
-[![最新版本](https://img.shields.io/badge/Release-v2.9.3-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
+[![最新版本](https://img.shields.io/badge/Release-v2.9.4-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![运行平台](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-34C759?style=flat-square&logo=windows)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![云端远程入口](https://img.shields.io/badge/Cloud%20Web-点击打开远程控制台-5856D6?style=flat-square&logo=googlechrome)](https://sorenskr.github.io/SheetMate/)
 
-> 办公数据自动化与多端协同桌面助手：自动登录后台抓数、一键清洗写入 WPS 在线汇总表、高清智能截图、无坐标钉钉静音发群，支持手机与异地网页端到端加密聊天遥控。
+> 办公数据自动化与多端协同桌面助手：自动登录后台抓数、一键清洗写入 WPS 在线汇总表、高清智能截图、无坐标钉钉智能发群，支持手机与异地网页端到端加密聊天遥控。
 
 ---
 
@@ -20,7 +20,14 @@
 
 ---
 
-## ✨ v2.9.3 核心功能一览
+## ✨ v2.9.4 核心功能一览
+
+- **钉钉贴图与直发全链路加固（关闭静音免点静音 + 可调等待直发）**
+  - 搜索并定位目标会话后精准锁定聊天发送框、自动清空待发送框残留内容并按 Enter 激活输入区；采用 `CF_DIB + PNG` 双格式图片剪贴板与四重粘贴回退策略，保障截图与时间后缀稳定写入。
+  - 关闭「静音发送」时跳过点击静音按钮，截图与时间后缀写入钉钉对话框后支持自定义等待秒数（默认 `5` 秒，可在【投递设置】或通过 AI 指令在 `0–30` 秒间随时调整），确认光标在输入区内直接按 Enter 发送，防止误触图片缩略图。
+- **全流程默认自动确定 + 内置 AI 每次运行自训练优化**
+  - 非登录类的二次确认与恢复提示全流程默认自动确定，不再因人工确认弹窗中断。
+  - 内置智能助手在每次运行与异常自愈后自动复盘归纳执行问题并积累策略库，持续提升后续任务执行成功率。
 
 - **可选账号登录 & 跨电脑全量加密云同步**
   - 支持**免登录直接使用默认本地设置**，也可在右上角或【设置】页登录专属同步账号（首次登录自动加密建库）。

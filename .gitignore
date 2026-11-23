@@ -26,6 +26,7 @@ team_hub_state.json
 ai_data_archive.json
 ai_greetings_seen.json
 ai_user_memory.json
+ai_run_playbook.json
 dt_verified_targets.json
 run_journal.jsonl
 report_archive.jsonl

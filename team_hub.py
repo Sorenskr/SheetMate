@@ -715,8 +715,8 @@ def check_config_edit_permission(old_cfg, new_cfg, perms):
         ("can_edit_accounts", "修改 WPS 链接或 Luya 后台账号密码", (
             "wps_url", "luya_user", "luya_pass",
         )),
-        ("can_edit_logic", "调整粘贴等待秒数、防撞与内部模块顺序", (
-            "dt_paste_delay_sec", "dt_minimize_after_send", "pipeline_tuning", "open_wps_after_run",
+        ("can_edit_logic", "调整粘贴与发前等待秒数、防撞与内部模块顺序", (
+            "dt_paste_delay_sec", "dt_send_wait_sec", "dt_minimize_after_send", "pipeline_tuning", "open_wps_after_run",
             "prevent_sleep", "save_shot_history",
         )),
         ("can_use_ai", "修改内置 AI 设置", ("ai_assistant",)),

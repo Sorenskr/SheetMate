@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.9.3 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.9.4 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -273,6 +273,8 @@ class _SheetMateController:
             app.set_runtime_callback(self._on_runtime_state)
         if hasattr(app, "set_spotlight_callback"):
             app.set_spotlight_callback(self._on_data_spotlight)
+        if hasattr(app, "set_training_summary_callback"):
+            app.set_training_summary_callback(self._on_training_summary)
         self.attach_glass(glass, tk_root)
 
         threading.Thread(target=self._check_privilege_startup, daemon=True).start()
@@ -465,6 +467,40 @@ class _SheetMateController:
                 pass
         if spot.get("summary_line"):
             self._on_log(f"数据变化播报：{spot['summary_line']}")
+
+    def _on_training_summary(self, summary_obj):
+        if not isinstance(summary_obj, dict):
+            return
+        reply_txt = str(summary_obj.get("reply") or "").strip()
+        if not reply_txt:
+            return
+        item = {
+            "role": "model",
+            "text": reply_txt,
+            "time": summary_obj.get("time") or time.strftime("%H:%M:%S"),
+            "model": "",
+            "source": "run_training",
+            "shot_info": summary_obj.get("summary_line") or "本轮运行训练复盘",
+            "via": "pc",
+        }
+        with self._lock:
+            self._brief_cache = (0.0, {})
+            self.ai_chat_history.append(dict(item))
+            if len(self.ai_chat_history) > 25:
+                self.ai_chat_history = self.ai_chat_history[-25:]
+            self._chat_seq += 1
+        if hasattr(self.app, "append_ai_chat_turn"):
+            try:
+                self.app.append_ai_chat_turn(
+                    "model",
+                    reply_txt,
+                    time_str=item["time"],
+                    source="run_training",
+                    shot_info=item["shot_info"],
+                    via="pc",
+                )
+            except Exception:
+                pass
 
     @staticmethod
     def _sanitize_config_for_client(cfg_dict):
@@ -2487,8 +2523,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/png" href="/icon.png?v=2.9.3" />
-<link rel="shortcut icon" href="/favicon.ico?v=2.9.3" />
+<link rel="icon" type="image/png" href="/icon.png?v=2.9.4" />
+<link rel="shortcut icon" href="/favicon.ico?v=2.9.4" />
 <style>
   :root {
     --bg: #EAF0F8;
@@ -4854,9 +4890,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.9.3" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.9.4" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.9.3</span>
+          <span class="ver-pill" id="verBadge">v2.9.4</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -5491,6 +5527,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <button type="button" class="step-btn" id="dtPasteDelayMinus">-</button>
                         <span class="step-val" id="dtPasteDelayVal">3秒</span>
                         <button type="button" class="step-btn" id="dtPasteDelayPlus">+</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="slot-block" style="padding:10px 13px;border-bottom:0.5px solid var(--sep);">
+                  <div class="preset-sub-row">
+                    <div class="row-main">
+                      <div class="row-title" style="font-size:13px;">贴完图片与文案后等待几秒再按 Enter 发送</div>
+                      <div class="row-sub" style="font-size:11px;">图片、日期与后缀全部写入对话框后，等待该秒数让大图渲染稳定再直接按 Enter 发送；关闭静音时不点击静音按钮</div>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                      <div class="mini-seg" id="dtSendWaitQuickSeg">
+                        <button type="button" class="mini-seg-btn" data-sec="0">0秒</button>
+                        <button type="button" class="mini-seg-btn" data-sec="3">3秒</button>
+                        <button type="button" class="mini-seg-btn" data-sec="5">5秒</button>
+                        <button type="button" class="mini-seg-btn" data-sec="8">8秒</button>
+                        <button type="button" class="mini-seg-btn" data-sec="10">10秒</button>
+                      </div>
+                      <div class="stepper-grp">
+                        <button type="button" class="step-btn" id="dtSendWaitMinus">-</button>
+                        <span class="step-val" id="dtSendWaitVal">5秒</span>
+                        <button type="button" class="step-btn" id="dtSendWaitPlus">+</button>
                       </div>
                     </div>
                   </div>
@@ -7414,6 +7472,23 @@ function renderDtPasteDelay() {
   }
 }
 
+function clampSendWait(val, fallback = 5) {
+  const n = Number(val);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(30, Math.round(n)));
+}
+
+function renderDtSendWait() {
+  const sec = clampSendWait(cfg.dt_send_wait_sec, 5);
+  cfg.dt_send_wait_sec = sec;
+  if ($("dtSendWaitVal")) $("dtSendWaitVal").textContent = `${sec}秒`;
+  if ($("dtSendWaitQuickSeg")) {
+    for (const b of $("dtSendWaitQuickSeg").querySelectorAll(".mini-seg-btn")) {
+      b.classList.toggle("active", Number(b.dataset.sec) === sec);
+    }
+  }
+}
+
 function ensurePipelineTuningStruct() {
   if (!cfg.pipeline_tuning || typeof cfg.pipeline_tuning !== "object") {
     cfg.pipeline_tuning = {};
@@ -7510,6 +7585,10 @@ function switchTab(name) {
 }
 
 function iosAlert(title, msg, { okText = "好", cancelText = null, danger = false } = {}) {
+  const cfgSafe = (typeof cfg === "object" && cfg) ? cfg : {};
+  if (cancelText && !danger && cfgSafe.auto_confirm_choices !== false) {
+    return Promise.resolve(true);
+  }
   return new Promise((resolve) => {
     $("alertTitle").textContent = title;
     $("alertMsg").textContent = msg;
@@ -8217,7 +8296,8 @@ function updateSummaries() {
   policyParts.push($("dtAutoSend").checked ? "自动发送" : "暂不发");
   $("sumPolicy").textContent = policyParts.join(" · ");
   const pasteWait = clampPasteDelay(cfg.dt_paste_delay_sec, 3);
-  $("sumPolicySub").textContent = `${modeLbl} (${offLbl}) · 等${pasteWait}秒粘贴 · ${prev.suf ? "「" + prev.suf + "」" : "无后缀"}`;
+  const sendWait = clampSendWait(cfg.dt_send_wait_sec, 5);
+  $("sumPolicySub").textContent = `${modeLbl} (${offLbl}) · 贴前等${pasteWait}秒 · 贴后等${sendWait}秒发 · ${prev.suf ? "「" + prev.suf + "」" : "无后缀"}`;
 
   const ds = hmStr(cfg.day.sh, cfg.day.sm);
   const de = hmStr(cfg.day.eh, cfg.day.em);
@@ -8287,6 +8367,7 @@ function renderConfig() {
   renderDtTargets();
   renderDingtalkDatePanel();
   renderDtPasteDelay();
+  renderDtSendWait();
   renderPipelineTuning();
   renderAiControls();
 
@@ -8323,6 +8404,7 @@ function collectConfigFromDOM() {
   cfg.save_shot_history = $("saveShotHistory").checked;
   cfg.dt_cutoff_enabled = $("dtCutoffEnabled").checked;
   cfg.dt_paste_delay_sec = clampPasteDelay(cfg.dt_paste_delay_sec, 3);
+  cfg.dt_send_wait_sec = clampSendWait(cfg.dt_send_wait_sec, 5);
   cfg.pipeline_tuning = ensurePipelineTuningStruct();
   syncPrimaryDtSearch();
   ensureSummaryPresetsStruct();
@@ -9124,6 +9206,17 @@ function bindEvents() {
   }
   if ($("dtPasteDelayPlus")) {
     $("dtPasteDelayPlus").onclick = () => { cfg.dt_paste_delay_sec = clampPasteDelay(clampPasteDelay(cfg.dt_paste_delay_sec, 3) + 1, 3); renderDtPasteDelay(); scheduleSave(true); };
+  }
+  if ($("dtSendWaitQuickSeg")) {
+    for (const b of $("dtSendWaitQuickSeg").querySelectorAll(".mini-seg-btn")) {
+      b.onclick = () => { cfg.dt_send_wait_sec = clampSendWait(b.dataset.sec, 5); renderDtSendWait(); scheduleSave(true); };
+    }
+  }
+  if ($("dtSendWaitMinus")) {
+    $("dtSendWaitMinus").onclick = () => { cfg.dt_send_wait_sec = clampSendWait(clampSendWait(cfg.dt_send_wait_sec, 5) - 1, 5); renderDtSendWait(); scheduleSave(true); };
+  }
+  if ($("dtSendWaitPlus")) {
+    $("dtSendWaitPlus").onclick = () => { cfg.dt_send_wait_sec = clampSendWait(clampSendWait(cfg.dt_send_wait_sec, 5) + 1, 5); renderDtSendWait(); scheduleSave(true); };
   }
   if ($("dtComposeOrderSeg")) {
     for (const b of $("dtComposeOrderSeg").querySelectorAll(".mini-seg-btn")) {
