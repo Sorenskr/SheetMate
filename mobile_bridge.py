@@ -27,9 +27,7 @@ import subprocess
 import threading
 import time
 import unicodedata
-import urllib.error
 from urllib.parse import parse_qs, urlparse
-import urllib.request
 
 DEFAULT_REMOTE_PASSWORD = "admin"
 GITHUB_PAGES_URL = "https://sorenskr.github.io/SheetMate/"
@@ -165,7 +163,8 @@ def _safe_read_json(rfile, headers, max_bytes=MAX_HTTP_BODY_BYTES):
         raise ValueError("PayloadTooLarge")
     raw = rfile.read(ln)
     try:
-        return json.loads(raw.decode("utf-8"))
+        obj = json.loads(raw.decode("utf-8"))
+        return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
 
@@ -942,6 +941,73 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   .m-typing-dots span:nth-child(2) { animation-delay: 0.16s; }
   .m-typing-dots span:nth-child(3) { animation-delay: 0.32s; }
   @keyframes m-dot-bounce { 0%, 80%, 100% { opacity: 0.35; transform: scale(0.8); } 40% { opacity: 1; transform: scale(1.1); } }
+  .m-bubble.thinking {
+    max-width: 92%;
+    background: linear-gradient(135deg, rgba(10, 132, 255, 0.09), rgba(88, 86, 214, 0.08));
+    border: 1px solid rgba(10, 132, 255, 0.25);
+    padding: 10px 12px;
+    animation: m-think-glow 2.2s ease-in-out infinite;
+  }
+  @keyframes m-think-glow {
+    0%, 100% { border-color: rgba(10, 132, 255, 0.22); }
+    50% { border-color: rgba(88, 86, 214, 0.44); }
+  }
+  .m-think-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .m-think-cat {
+    width: 26px; height: 26px; flex-shrink: 0;
+    animation: m-cat-hop 1.4s ease-in-out infinite;
+  }
+  @keyframes m-cat-hop {
+    0%, 100% { transform: translateY(0) rotate(0deg); }
+    45% { transform: translateY(-3px) rotate(-3deg); }
+    75% { transform: translateY(-1px) rotate(3deg); }
+  }
+  .m-think-title { font-size: 12.5px; font-weight: 700; color: var(--blue); }
+  .m-think-dots { display: inline-flex; align-items: center; gap: 4px; }
+  .m-think-dots span {
+    width: 5.5px; height: 5.5px; border-radius: 50%;
+    animation: m-dot-bounce 1.05s infinite ease-in-out;
+  }
+  .m-think-dots span:nth-child(1) { background: #0A84FF; }
+  .m-think-dots span:nth-child(2) { background: #5856D6; animation-delay: 0.16s; }
+  .m-think-dots span:nth-child(3) { background: #30B0C7; animation-delay: 0.32s; }
+  .m-think-timer {
+    margin-left: auto; font-size: 11px; font-weight: 700;
+    color: var(--sub); background: rgba(120, 120, 128, 0.12);
+    padding: 2px 7px; border-radius: 999px;
+  }
+  .m-think-steps {
+    margin-top: 7px; padding-top: 6px; border-top: 0.5px dashed rgba(10, 132, 255, 0.22);
+    display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--sub);
+  }
+  .m-think-step { display: flex; align-items: center; gap: 6px; line-height: 1.38; }
+  .m-step-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .m-step-dot.done { background: var(--green); }
+  .m-step-dot.now { background: var(--blue); animation: m-step-pulse 1.1s infinite ease-in-out; }
+  .m-step-dot.wait { background: rgba(120, 120, 128, 0.35); }
+  @keyframes m-step-pulse { 0%, 100% { opacity: 0.45; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1.2); } }
+  .m-thought-box {
+    margin-bottom: 7px; border-radius: 10px;
+    background: rgba(10, 132, 255, 0.06); border: 0.5px solid rgba(10, 132, 255, 0.18);
+    padding: 5px 9px; font-size: 11.5px;
+  }
+  .m-thought-box summary {
+    cursor: pointer; list-style: none; display: flex; align-items: center; gap: 5px;
+    font-weight: 700; color: var(--blue); user-select: none; outline: none;
+  }
+  .m-thought-box summary::-webkit-details-marker { display: none; }
+  .m-thought-list {
+    margin-top: 5px; padding-top: 5px; border-top: 0.5px dashed rgba(10, 132, 255, 0.2);
+    display: flex; flex-direction: column; gap: 3px; color: var(--sub); line-height: 1.4;
+  }
+  .m-card-toggle {
+    border: none; background: rgba(10, 132, 255, 0.1); color: var(--blue);
+    font-family: inherit; font-size: 11px; font-weight: 700;
+    padding: 3px 9px; border-radius: 999px; cursor: pointer;
+  }
+  .m-status-compact .m-track,
+  .m-status-compact .m-status-times,
+  .m-status-compact .m-actions-row { display: none; }
   .m-remember-row {
     display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--sub);
   }
@@ -966,6 +1032,107 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     display: flex; align-items: center; justify-content: space-between; gap: 8px;
     padding: 9px 11px; border-radius: 12px; border: 0.5px solid var(--sep); background: rgba(120, 120, 128, 0.07);
   }
+  .m-shot-wrap {
+    margin: 7px 0 4px;
+    border-radius: 11px;
+    overflow: hidden;
+    border: 1px solid rgba(10, 132, 255, 0.25);
+    background: #0F172A;
+    cursor: pointer;
+  }
+  .m-shot-img { display: block; width: 100%; max-height: 220px; object-fit: contain; }
+  .m-shot-tip {
+    padding: 4px 8px;
+    font-size: 11px;
+    color: #E2E8F0;
+    background: rgba(15, 23, 42, 0.85);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .m-confirm-card {
+    margin-top: 8px;
+    padding: 9px 10px;
+    border-radius: 12px;
+    background: rgba(255, 149, 0, 0.10);
+    border: 1px solid rgba(255, 149, 0, 0.36);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .m-confirm-card.done {
+    background: rgba(52, 199, 89, 0.08);
+    border-color: rgba(52, 199, 89, 0.30);
+  }
+  .m-confirm-hdr { font-size: 12px; font-weight: 700; color: var(--orange); }
+  .m-confirm-card.done .m-confirm-hdr { color: var(--green); }
+  .m-confirm-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+  .m-confirm-btn {
+    border: 0.5px solid var(--sep);
+    background: var(--card);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 7px 11px;
+    border-radius: 9px;
+    cursor: pointer;
+    flex: 1;
+    min-width: 112px;
+  }
+  .m-confirm-btn.primary { background: var(--blue); color: #FFFFFF; border-color: var(--blue); }
+  .m-confirm-btn.danger { background: rgba(255, 59, 48, 0.14); color: var(--red); border-color: rgba(255, 59, 48, 0.3); }
+  .m-confirm-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .m-confirm-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .m-confirm-chip {
+    border: 0.5px solid rgba(10, 132, 255, 0.34);
+    background: rgba(10, 132, 255, 0.09);
+    color: var(--blue);
+    font-family: inherit;
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 4px 9px;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .m-confirm-input-row { display: flex; gap: 6px; align-items: center; }
+  .m-confirm-input-row input {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--sep);
+    background: var(--card);
+    color: var(--text);
+    border-radius: 9px;
+    padding: 6px 9px;
+    font-size: 13px;
+    font-family: inherit;
+    outline: none;
+  }
+  .m-confirm-done { font-size: 12px; font-weight: 700; color: var(--green); }
+  .m-confirm-alert-bar {
+    display: none;
+    margin: 0 12px 6px;
+    padding: 8px 11px;
+    border-radius: 11px;
+    background: rgba(255, 149, 0, 0.16);
+    border: 1px solid rgba(255, 149, 0, 0.44);
+    color: var(--orange);
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    flex-shrink: 0;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+  .m-confirm-alert-bar.show { display: flex; }
+  .m-zoom-mask {
+    position: fixed; inset: 0; background: rgba(6, 10, 18, 0.90); z-index: 980;
+    display: none; flex-direction: column; align-items: center; justify-content: center; padding: 14px; gap: 10px;
+  }
+  .m-zoom-mask.show { display: flex; }
+  .m-zoom-img { max-width: 96vw; max-height: 82vh; border-radius: 12px; object-fit: contain; background: #0F172A; }
+  .m-zoom-tip { color: #E2E8F0; font-size: 12px; }
   .m-b-meta { font-size: 10.5px; opacity: 0.72; margin-top: 5px; }
   .m-composer {
     padding: 8px 12px 10px;
@@ -1083,7 +1250,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="m-dl-card" id="mDownloadCard">
       <div class="m-dl-head">
         <div class="m-dl-title">电脑还没装软件？免费下载客户端</div>
-        <span class="m-dl-badge">v2.9.5 纯净单文件版</span>
+        <span class="m-dl-badge">v2.9.6 纯净单文件版</span>
       </div>
       <div class="m-dl-desc">
         下载这单个 SheetMate.exe 双击直接运行（绝不生成杂乱文件夹、无需安装环境、关闭窗口直接结束退出），支持自动抓数写 WPS 表、钉钉静音发群与云端异地遥控。
@@ -1104,16 +1271,19 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div class="m-main" id="mMainApp">
-    <div class="m-status-card">
+    <div class="m-status-card" id="mStatusCard">
       <div class="m-st-row">
         <div style="display:flex;align-items:center;gap:7px;min-width:0;">
           <span class="m-st-dot" id="mStatusDot"></span>
           <span style="font-size:13px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" id="mStepText">正在同步电脑状态…</span>
         </div>
-        <span style="font-size:11.5px;font-weight:700;color:var(--blue);white-space:nowrap;" id="mBriefPill">实时在线</span>
+        <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+          <span style="font-size:11.5px;font-weight:700;color:var(--blue);white-space:nowrap;" id="mBriefPill">实时在线</span>
+          <button type="button" class="m-card-toggle" id="mToggleCardBtn">收起</button>
+        </div>
       </div>
       <div class="m-track"><div class="m-fill" id="mProgFill"></div></div>
-      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--sub);">
+      <div class="m-status-times" style="display:flex;justify-content:space-between;font-size:11px;color:var(--sub);">
         <span id="mLastRun">上次：—</span>
         <span id="mNextRun">下次：—</span>
       </div>
@@ -1126,18 +1296,27 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <div class="m-hands-off" id="mHandsOffBanner">电脑正在自动粘贴发钉钉中，请勿操作电脑键鼠</div>
+    <div class="m-confirm-alert-bar" id="mConfirmAlertBar">
+      <span id="mConfirmAlertText">电脑正等待您看图确认钉钉发送对象</span>
+      <span style="text-decoration:underline;flex-shrink:0;">去确认</span>
+    </div>
 
     <div class="m-quick-bar" id="mQuickChips">
+      <button type="button" class="m-chip" data-mp="暂停运行">暂停运行</button>
+      <button type="button" class="m-chip" data-mp="继续运行">继续运行</button>
+      <button type="button" class="m-chip" data-mp="取消当前任务">取消当前任务</button>
       <button type="button" class="m-chip" data-mp="我要看昨天的数据，发给我">看昨天数据发给我</button>
       <button type="button" class="m-chip" data-mp="帮我跑一下程序，最新数据发给我">跑程序发给我</button>
       <button type="button" class="m-chip" data-mp="请按简报总结一下当前最新数据变化">总结当前数据</button>
       <button type="button" class="m-chip" data-mp="汇报一下电脑现在的工作状态与下次计划">查电脑状态</button>
+      <button type="button" class="m-chip" data-mtpl="帮我在定时计划里新增一个每天 14:30 发到「目标群名」，发日期+时间，内容写「午间数据情况」，非静音">加定时：某点发某群</button>
+      <button type="button" class="m-chip" data-mtpl="帮我在定时计划里新增一个每天 09:00 发昨天数据到「目标群名」，只发年月日日期，内容写「昨日数据情况」">加定时：发昨天日期</button>
     </div>
 
     <div class="m-feed" id="mChatFeed"></div>
 
     <div class="m-composer">
-      <input type="text" id="mChatInput" placeholder="跟电脑小猫说：看昨天数据发给我 / 跑一下发给小王…" />
+      <input type="text" id="mChatInput" placeholder="跟电脑说：暂停运行 / 取消当前任务 / 看昨天数据发给我…" />
       <button type="button" class="m-send-btn" id="mSendBtn">发送</button>
     </div>
   </div>
@@ -1152,6 +1331,10 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="mSwitchAcctList" style="display:flex;flex-direction:column;gap:7px;max-height:240px;overflow-y:auto;"></div>
     <button type="button" class="m-btn-primary" id="mSwitchAddNewBtn" style="padding:10px;font-size:13.5px;">＋ 登录其他账号 / 换一台电脑</button>
   </div>
+</div>
+<div class="m-zoom-mask" id="mImgZoomMask">
+  <img class="m-zoom-img" id="mImgZoomPreview" src="" alt="钉钉现场截图" />
+  <div class="m-zoom-tip">点击画面或遮罩即可关闭放大视图</div>
 </div>
 <div class="m-toast" id="mToast"></div>
 
@@ -1473,6 +1656,11 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
               ? new Uint8Array(ev.data)
               : (ev.data ? te.encode(String(ev.data)) : new Uint8Array(0));
             if (!chunk.length) return;
+            if (entry.rxBuf.length + chunk.length > 524288) {
+              entry.rxBuf = new Uint8Array(0);
+              try { ws.close(); } catch (_e2) {}
+              return;
+            }
             entry.rxBuf = joinU8([entry.rxBuf, chunk]);
             drainRx(entry);
           } catch (_e) {}
@@ -1599,6 +1787,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   let lastChatSeq = -1;
   let lastPaused = false;
   let pollTimer = null;
+  let pollInFlight = false;
   let cachedChatHistory = [];
   let pendingUserMsgs = [];
 
@@ -1647,26 +1836,255 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
   }
 
+  function buildMobileThinkingCatSvg() {
+    return `<svg class="m-think-cat" viewBox="0 0 36 36" fill="none"><path d="M7 15 L5 5 L13.5 11 L22.5 11 L31 5 L29 15 A11 10 0 0 1 7 15 Z" fill="#4F46E5" stroke="#38BDF8" stroke-width="1.3" stroke-linejoin="round"/><rect x="9" y="14" width="18" height="12" rx="5.5" fill="#0F172A"/><circle cx="14" cy="19.5" r="2" fill="#38BDF8"/><circle cx="22" cy="19.5" r="2" fill="#38BDF8"/><circle cx="14.7" cy="18.8" r="0.7" fill="#FFFFFF"/><circle cx="22.7" cy="18.8" r="0.7" fill="#FFFFFF"/><path d="M15.3 23.2 Q18 24.8 20.7 23.2" stroke="#F8FAFC" stroke-width="1.4" stroke-linecap="round"/></svg>`;
+  }
+
   function formatMsgText(raw) {
-    return String(raw || "").replace(/\*\*([^*]+)\*\*/g, "$1");
+    return String(raw || "").replace(/\*\*([^*]+)\*\*/g, "$1").replace(/\*\*([^*:\n]+)\*\s*:/g, "$1:");
+  }
+
+  function getMobileThinkingStages(promptText) {
+    const q = String(promptText || "").toLowerCase();
+    const isData = !q || /(表|图|截图|汇总|数据|团队|小组|排行|排名|注册|转化|华人|暗号|对比|增量|总结|简报|昨天|今天|本周)/.test(q);
+    if (isData) {
+      return [
+        "正在连接电脑，理解分析意图",
+        "正在读取汇总表最新截图与历史数据档案",
+        "正在生成数据解读与趋势要点",
+      ];
+    }
+    return [
+      "正在将指令加密送达电脑端",
+      "正在匹配快捷动作或检索本地配置知识库",
+      "正在组织清晰答复并同步返回",
+    ];
+  }
+
+  function buildMobileThinkingNode(promptText, elapsedSec) {
+    const box = document.createElement("div");
+    box.className = "m-bubble model thinking m-think-bubble";
+    box.id = "mActiveThinkBubble";
+    const stages = getMobileThinkingStages(promptText);
+    const activeIdx = elapsedSec >= 5 ? 2 : (elapsedSec >= 2 ? 1 : 0);
+    const stepsHtml = stages.map((label, idx) => {
+      const cls = idx < activeIdx ? "done" : (idx === activeIdx ? "now" : "wait");
+      return `<div class="m-think-step" data-idx="${idx}"><span class="m-step-dot ${cls}"></span><span>${escapeHtml(label)}</span></div>`;
+    }).join("");
+    box.innerHTML = `<div class="m-think-head">${buildMobileThinkingCatSvg()}<span class="m-think-title">小猫正在认真思考中</span><span class="m-think-dots"><span></span><span></span><span></span></span><span class="m-think-timer" id="mThinkTimerVal">已思考 ${elapsedSec}s</span></div><div class="m-think-steps">${stepsHtml}</div>`;
+    return box;
+  }
+
+  function escapeHtml(s) {
+    return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  function safeShotImageUrl(rawUrl) {
+    const s = String(rawUrl || "").trim();
+    if (s.length > 240000) return "";
+    return /^data:image\/(?:png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]{20,}$/i.test(s) ? s : "";
+  }
+
+  async function sendMobileTargetConfirm(pendingId, act, newTarget = "", onFailUnlock = null) {
+    if (!pendingId) return;
+    const cleanTgt = String(newTarget || "").trim();
+    if (act === "switch_target" && !cleanTgt) {
+      showToast("请先选择或输入要改发的群名或联系人");
+      if (typeof onFailUnlock === "function") onFailUnlock();
+      return;
+    }
+    try {
+      if (connMode === "cloud" && relayCred) {
+        const res = await sendRelayCommand("confirm_target", {
+          pending_id: pendingId,
+          action: act,
+          new_target: cleanTgt,
+        }, 12000);
+        const r = res && res.result;
+        showToast((r && r.message) || "已提交您的确认选择");
+        if (r && r.ok === false && typeof onFailUnlock === "function") onFailUnlock();
+        if (res && res.state) applyPcState(res.state);
+        else if (r && Array.isArray(r.history)) {
+          lastChatSeq = typeof r.chat_seq === "number" ? r.chat_seq : lastChatSeq + 1;
+          renderChats(r.history);
+        }
+      } else {
+        const r = await mApi("/api/mobile/confirm-target", "POST", {
+          pending_id: pendingId,
+          action: act,
+          new_target: cleanTgt,
+        });
+        showToast((r && r.message) || "已提交您的确认选择");
+        if (r && r.ok === false && typeof onFailUnlock === "function") onFailUnlock();
+        if (r && Array.isArray(r.history)) {
+          lastChatSeq = typeof r.chat_seq === "number" ? r.chat_seq : lastChatSeq + 1;
+          renderChats(r.history);
+        }
+        setTimeout(doPoll, 200);
+      }
+    } catch (_e) {
+      if (typeof onFailUnlock === "function") onFailUnlock();
+      showToast("提交确认失败，请稍后重试或直接在聊天框回复");
+    }
   }
 
   function buildBubbleNode(it) {
     const div = document.createElement("div");
     const isUser = it.role === "user";
     const isSpot = it.source === "data_spotlight";
+    const isConfirm = it.source === "target_confirm";
     const txt = formatMsgText(it.text || "");
-    const isErr = !isUser && (txt.startsWith("❌") || it.source === "on_demand_not_found" || txt.includes("发送失败") || txt.includes("未找到"));
+    const isErr = !isUser && !isConfirm && (txt.startsWith("\u274c") || it.source === "on_demand_not_found" || txt.includes("发送失败") || txt.includes("未找到"));
     div.className = `m-bubble ${isUser ? "user" : "model"}${isSpot ? " is-spot" : ""}${isErr ? " is-err" : ""}`;
+    if (!isUser && Array.isArray(it.thinking_steps) && it.thinking_steps.length) {
+      const det = document.createElement("details");
+      det.className = "m-thought-box";
+      const durTxt = (typeof it.elapsed_sec === "number") ? ` · 用时 ${it.elapsed_sec}s` : "";
+      const listHtml = it.thinking_steps.map((s, idx) => `<div>${idx + 1}. ${escapeHtml(s)}</div>`).join("");
+      det.innerHTML = `<summary>思考过程（共 ${it.thinking_steps.length} 步${escapeHtml(durTxt)}，点击查看）</summary><div class="m-thought-list">${listHtml}</div>`;
+      div.appendChild(det);
+    }
     const body = document.createElement("div");
     body.textContent = txt;
     div.appendChild(body);
+
+    const safeImg = !isUser ? safeShotImageUrl(it.image_data_url) : "";
+    if (safeImg) {
+      const wrap = document.createElement("div");
+      wrap.className = "m-shot-wrap";
+      const img = document.createElement("img");
+      img.className = "m-shot-img";
+      img.src = safeImg;
+      img.alt = "电脑钉钉现场截图";
+      const tip = document.createElement("div");
+      tip.className = "m-shot-tip";
+      tip.textContent = "电脑钉钉当前界面（点击放大查看清晰群名）";
+      wrap.appendChild(img);
+      wrap.appendChild(tip);
+      wrap.onclick = () => {
+        if ($("mImgZoomPreview") && $("mImgZoomMask")) {
+          $("mImgZoomPreview").src = safeImg;
+          $("mImgZoomMask").classList.add("show");
+        }
+      };
+      div.appendChild(wrap);
+    }
+
+    const cc = (!isUser && it.confirm_card && typeof it.confirm_card === "object") ? it.confirm_card : null;
+    if (cc) {
+      const isPend = cc.status === "pending";
+      const card = document.createElement("div");
+      card.className = "m-confirm-card" + (isPend ? "" : " done");
+      const hdr = document.createElement("div");
+      hdr.className = "m-confirm-hdr";
+      hdr.textContent = isPend
+        ? `待您确认：预设「${cc.target_name || ""}」 / 桌面看到「${cc.opened_name || ""}」`
+        : (cc.resolved_text || "已处理");
+      card.appendChild(hdr);
+
+      if (isPend) {
+        const btns = document.createElement("div");
+        btns.className = "m-confirm-btns";
+        const okBtn = document.createElement("button");
+        okBtn.type = "button";
+        okBtn.className = "m-confirm-btn primary";
+        okBtn.textContent = "确认仍发当前会话";
+        const cancelBtn = document.createElement("button");
+        cancelBtn.type = "button";
+        cancelBtn.className = "m-confirm-btn danger";
+        cancelBtn.textContent = "取消发送";
+
+        const inpRow = document.createElement("div");
+        inpRow.className = "m-confirm-input-row";
+        const inp = document.createElement("input");
+        inp.type = "text";
+        inp.placeholder = "输入其他群名或联系人后点改发";
+        const swBtn = document.createElement("button");
+        swBtn.type = "button";
+        swBtn.className = "m-confirm-btn";
+        swBtn.style.flex = "0 0 auto";
+        swBtn.textContent = "改发此对象";
+
+        const setBtnsBusy = (busyFlag) => {
+          okBtn.disabled = busyFlag;
+          cancelBtn.disabled = busyFlag;
+          swBtn.disabled = busyFlag;
+        };
+        okBtn.onclick = () => { setBtnsBusy(true); sendMobileTargetConfirm(cc.pending_id, "confirm_send", "", () => setBtnsBusy(false)); };
+        cancelBtn.onclick = () => { setBtnsBusy(true); sendMobileTargetConfirm(cc.pending_id, "cancel_send", "", () => setBtnsBusy(false)); };
+        swBtn.onclick = () => {
+          const val = inp.value.trim();
+          if (!val) { showToast("请先输入或点选一个发送对象"); inp.focus(); return; }
+          setBtnsBusy(true);
+          sendMobileTargetConfirm(cc.pending_id, "switch_target", val, () => setBtnsBusy(false));
+        };
+        btns.appendChild(okBtn);
+        btns.appendChild(cancelBtn);
+        card.appendChild(btns);
+
+        const cands = Array.isArray(cc.candidates) ? cc.candidates.filter(Boolean) : [];
+        if (cands.length) {
+          const chipBar = document.createElement("div");
+          chipBar.className = "m-confirm-chips";
+          for (const cname of cands) {
+            const cb = document.createElement("button");
+            cb.type = "button";
+            cb.className = "m-confirm-chip";
+            cb.textContent = `改发：${cname}`;
+            cb.onclick = () => {
+              inp.value = cname;
+              inp.focus();
+            };
+            chipBar.appendChild(cb);
+          }
+          card.appendChild(chipBar);
+        }
+        inpRow.appendChild(inp);
+        inpRow.appendChild(swBtn);
+        card.appendChild(inpRow);
+      } else {
+        const doneEl = document.createElement("div");
+        doneEl.className = "m-confirm-done";
+        doneEl.textContent = cc.resolved_text || "已处理";
+        card.appendChild(doneEl);
+      }
+      div.appendChild(card);
+    }
+
     const meta = document.createElement("div");
     meta.className = "m-b-meta";
     const viaTag = isUser ? (it.via === "mobile" ? "远程发出" : "电脑发出") : "智能管家";
     meta.textContent = [it.time, viaTag, it.shot_info].filter(Boolean).join(" · ");
     div.appendChild(meta);
     return div;
+  }
+
+  let mAiThinking = { active: false, prompt: "", startTs: 0, timerId: null };
+  function startMobileThinking(promptText) {
+    if (mAiThinking.timerId) clearInterval(mAiThinking.timerId);
+    mAiThinking = { active: true, prompt: String(promptText || ""), startTs: Date.now(), timerId: null };
+    mAiThinking.timerId = setInterval(() => {
+      if (!mAiThinking.active) return;
+      const elapsed = Math.max(0, Math.floor((Date.now() - mAiThinking.startTs) / 1000));
+      const tEl = $("mThinkTimerVal");
+      if (tEl) tEl.textContent = `已思考 ${elapsed}s`;
+      const bubble = $("mActiveThinkBubble");
+      if (bubble) {
+        const activeIdx = elapsed >= 5 ? 2 : (elapsed >= 2 ? 1 : 0);
+        for (const row of bubble.querySelectorAll(".m-think-step")) {
+          const idx = Number(row.dataset.idx);
+          const dot = row.querySelector(".m-step-dot");
+          if (dot) dot.className = "m-step-dot " + (idx < activeIdx ? "done" : (idx === activeIdx ? "now" : "wait"));
+        }
+      }
+    }, 1000);
+  }
+  function stopMobileThinking() {
+    mAiThinking.active = false;
+    if (mAiThinking.timerId) {
+      clearInterval(mAiThinking.timerId);
+      mAiThinking.timerId = null;
+    }
   }
 
   let _chatRenderRaf = 0;
@@ -1678,7 +2096,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       const feed = $("mChatFeed");
       const items = cachedChatHistory;
       const frag = document.createDocumentFragment();
-      if (!items.length && !pendingUserMsgs.length) {
+      if (!items.length && !pendingUserMsgs.length && !mAiThinking.active) {
         const welcome = document.createElement("div");
         welcome.className = "m-bubble model";
         const d = document.createElement("div");
@@ -1690,11 +2108,9 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         for (const pMsg of pendingUserMsgs) {
           frag.appendChild(buildBubbleNode({ role: "user", text: pMsg, time: "刚刚", via: "mobile", shot_info: "已发出" }));
         }
-        if (pendingUserMsgs.length) {
-          const waitDiv = document.createElement("div");
-          waitDiv.className = "m-bubble model";
-          waitDiv.innerHTML = `<div class="m-typing-dots"><span></span><span></span><span></span></div>`;
-          frag.appendChild(waitDiv);
+        if (pendingUserMsgs.length || mAiThinking.active) {
+          const elapsed = mAiThinking.startTs ? Math.max(0, Math.floor((Date.now() - mAiThinking.startTs) / 1000)) : 0;
+          frag.appendChild(buildMobileThinkingNode(mAiThinking.prompt || pendingUserMsgs[0] || "", elapsed));
         }
       }
       feed.innerHTML = "";
@@ -1707,7 +2123,18 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   function applyPcState(st) {
     if (!st || typeof st !== "object") return;
-    try { localStorage.setItem(LS_CACHE_STATE_KEY, JSON.stringify({ st, ts: Date.now() })); } catch (_e) {}
+    try {
+      const liteHist = Array.isArray(st.ai_history)
+        ? st.ai_history.map((m) => {
+            if (!m || typeof m !== "object") return m;
+            const c = Object.assign({}, m);
+            delete c.image_data_url;
+            return c;
+          })
+        : [];
+      const liteSt = Object.assign({}, st, { ai_history: liteHist, pending_target_confirm: null });
+      localStorage.setItem(LS_CACHE_STATE_KEY, JSON.stringify({ st: liteSt, ts: Date.now() }));
+    } catch (_e) {}
     const dot = $("mStatusDot");
     dot.className = "m-st-dot" + (st.busy ? " busy" : (st.status_level === "err" ? " err" : ""));
     $("mStepText").textContent = st.step_text || "空闲中";
@@ -1730,6 +2157,14 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       ho.classList.add("show");
     } else {
       ho.classList.remove("show");
+    }
+    const cfBar = $("mConfirmAlertBar");
+    const pendCf = st.pending_target_confirm && typeof st.pending_target_confirm === "object" ? st.pending_target_confirm : null;
+    if (cfBar) {
+      cfBar.classList.toggle("show", Boolean(pendCf && pendCf.pending_id));
+      if (pendCf && $("mConfirmAlertText")) {
+        $("mConfirmAlertText").textContent = `待确认对象：预设「${pendCf.target_name || ""}」 / 桌面「${pendCf.opened_name || ""}」`;
+      }
     }
     if (typeof st.chat_seq === "number" && st.chat_seq !== lastChatSeq) {
       lastChatSeq = st.chat_seq;
@@ -1853,22 +2288,28 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   async function doPoll() {
-    if (connMode === "cloud" && relayCred) {
-      if (!SMRelay.hasReady()) await startRelaySubscribe();
-      return;
-    }
-    if (!mobileToken) return;
+    if (pollInFlight) return;
+    pollInFlight = true;
     try {
-      const st = await mApi("/api/mobile/state");
-      if (st && st.auth_required) {
-        mobileToken = "";
-        localStorage.removeItem("sm_mobile_token");
-        clearInterval(pollTimer);
-        showLoginView("登录已失效，请重新输入唯一名字和远程密码");
+      if (connMode === "cloud" && relayCred) {
+        if (!SMRelay.hasReady()) await startRelaySubscribe();
         return;
       }
-      if (st && st.ok) applyPcState(st);
-    } catch (_e) {}
+      if (!mobileToken) return;
+      try {
+        const st = await mApi("/api/mobile/state");
+        if (st && st.auth_required) {
+          mobileToken = "";
+          localStorage.removeItem("sm_mobile_token");
+          clearInterval(pollTimer);
+          showLoginView("登录已失效，请重新输入唯一名字和远程密码");
+          return;
+        }
+        if (st && st.ok) applyPcState(st);
+      } catch (_e) {}
+    } finally {
+      pollInFlight = false;
+    }
   }
 
   async function sendChat(text) {
@@ -1877,12 +2318,15 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     if (!msg) return;
     if (text === undefined || inp.value.trim() === msg) inp.value = "";
     pendingUserMsgs.push(msg);
+    startMobileThinking(msg);
     renderChats(cachedChatHistory);
     try {
       if (connMode === "cloud" && relayCred) {
         const res = await sendRelayCommand("chat", { prompt: msg, style_id: "custom" }, 58000);
         const idx = pendingUserMsgs.indexOf(msg);
         if (idx >= 0) pendingUserMsgs.splice(idx, 1);
+        stopMobileThinking();
+        if (res && res.state) applyState(res.state);
         if (res && res.result) {
           const r = res.result;
           if (Array.isArray(r.history)) {
@@ -1898,9 +2342,11 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         const res = await mApi("/api/mobile/chat", "POST", { prompt: msg }, null, 65000);
         const idx = pendingUserMsgs.indexOf(msg);
         if (idx >= 0) pendingUserMsgs.splice(idx, 1);
+        stopMobileThinking();
         if (res && Array.isArray(res.history)) {
           lastChatSeq = typeof res.chat_seq === "number" ? res.chat_seq : lastChatSeq + 1;
           renderChats(res.history);
+          doPoll();
         } else if (res && res.reply) {
           renderChats(cachedChatHistory);
           doPoll();
@@ -1912,6 +2358,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     } catch (_e) {
       const idx = pendingUserMsgs.indexOf(msg);
       if (idx >= 0) pendingUserMsgs.splice(idx, 1);
+      stopMobileThinking();
       renderChats(cachedChatHistory);
       showToast("暂未收到电脑回应，请确认电脑软件处于开启状态");
     }
@@ -2026,6 +2473,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     connMode = "";
     relayCred = null;
     pendingUserMsgs = [];
+    stopMobileThinking();
     lastChatSeq = -1;
     closeRelayStream();
     localStorage.setItem(LS_AUTO_KEY, "0");
@@ -2152,6 +2600,35 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   if ($("mLogoutBtn")) $("mLogoutBtn").onclick = logoutCurrentSession;
 
+  if ($("mToggleCardBtn") && $("mStatusCard")) {
+    const syncCardCompact = (compact) => {
+      $("mStatusCard").classList.toggle("m-status-compact", !!compact);
+      $("mToggleCardBtn").textContent = compact ? "展开详情" : "收起";
+      try { localStorage.setItem("sm_m_card_compact", compact ? "1" : "0"); } catch (_e) {}
+    };
+    try {
+      if (localStorage.getItem("sm_m_card_compact") === "1") syncCardCompact(true);
+    } catch (_e) {}
+    $("mToggleCardBtn").onclick = () => {
+      syncCardCompact(!$("mStatusCard").classList.contains("m-status-compact"));
+    };
+  }
+
+  if ($("mImgZoomMask")) {
+    $("mImgZoomMask").onclick = () => $("mImgZoomMask").classList.remove("show");
+  }
+  if ($("mConfirmAlertBar")) {
+    $("mConfirmAlertBar").onclick = () => {
+      const feed = $("mChatFeed");
+      if (feed) feed.scrollTop = feed.scrollHeight;
+    };
+  }
+  window.addEventListener("pagehide", () => {
+    pollInFlight = false;
+    clearInterval(pollTimer);
+    stopMobileThinking();
+  });
+
   $("mSendBtn").onclick = () => sendChat();
   $("mChatInput").addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
@@ -2161,6 +2638,15 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   });
   for (const ch of $("mQuickChips").querySelectorAll("[data-mp]")) {
     ch.onclick = () => sendChat(ch.dataset.mp || "");
+  }
+  for (const tp of $("mQuickChips").querySelectorAll("[data-mtpl]")) {
+    tp.onclick = () => {
+      const inp = $("mChatInput");
+      if (!inp) return;
+      inp.value = tp.dataset.mtpl || "";
+      inp.focus();
+      showToast("已填入定时模板，改好时间与发送对象后点发送即可");
+    };
   }
   for (const ab of document.querySelectorAll("[data-mact]")) {
     ab.onclick = async () => {
@@ -2249,6 +2735,8 @@ class MobileBridgeManager:
         # 云桥加密实时双向状态（双节点 MQTT over TLS）
         self._relay_stop = threading.Event()
         self._push_wakeup = threading.Event()
+        self._force_push_flag = threading.Event()
+        self._relay_cmd_sem = threading.BoundedSemaphore(8)
         self._relay_threads = []
         self._relay_push_thread = None
         self._mqtt_conns = {}
@@ -2263,6 +2751,8 @@ class MobileBridgeManager:
         # 外网隧道状态
         self._tunnel_proc = None
         self._tunnel_running = False
+        self._tunnel_starting = False
+        self._tunnel_gen = 0
         self._public_url = ""
         self._tunnel_error = ""
         self._tunnel_kind = ""
@@ -2366,6 +2856,29 @@ class MobileBridgeManager:
             self._auth_fail_tracker.pop(client_id, None)
         return self.ctrl.verify_mobile_member_login(nick)
 
+    def _resolve_cors_origin(self, origin_hdr):
+        origin = str(origin_hdr or "").strip()
+        if not origin:
+            return ""
+        p = urlparse(origin)
+        if p.scheme not in ("http", "https") or not p.netloc:
+            return ""
+        allowed = {"https://sorenskr.github.io"}
+        with self._lock:
+            port = self._port
+            pub = str(self._public_url or "").strip()
+        if port:
+            allowed.add(f"http://127.0.0.1:{port}")
+            allowed.add(f"http://localhost:{port}")
+            for ip in _detect_lan_ipv4_list():
+                allowed.add(f"http://{ip}:{port}")
+        if pub:
+            pp = urlparse(pub)
+            if pp.scheme in ("http", "https") and pp.netloc:
+                allowed.add(f"{pp.scheme}://{pp.netloc}")
+        norm_origin = f"{p.scheme}://{p.netloc}"
+        return norm_origin if norm_origin in allowed else ""
+
     def start(self):
         with self._lock:
             if self._server is not None:
@@ -2373,14 +2886,24 @@ class MobileBridgeManager:
             mgr = self
 
             class MobileHandler(BaseHTTPRequestHandler):
+                def setup(self):
+                    super().setup()
+                    try:
+                        self.request.settimeout(15.0)
+                    except Exception:
+                        pass
+
                 def log_message(self, fmt, *args):
                     return
 
                 def _cors(self):
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Mobile-Token")
-                    self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                    self.send_header("Access-Control-Allow-Private-Network", "true")
+                    allowed_ori = mgr._resolve_cors_origin(self.headers.get("Origin"))
+                    if allowed_ori:
+                        self.send_header("Access-Control-Allow-Origin", allowed_ori)
+                        self.send_header("Vary", "Origin")
+                        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Mobile-Token")
+                        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                        self.send_header("Access-Control-Allow-Private-Network", "true")
 
                 def _send_security_headers(self):
                     self.send_header("X-Content-Type-Options", "nosniff")
@@ -2463,7 +2986,7 @@ class MobileBridgeManager:
                         nick = str(body.get("nickname") or "").strip()
                         pin = str(body.get("pin") or "").strip()
                         c_ip = str(self.client_address[0] if self.client_address else "local")
-                        if c_ip in ("127.0.0.1", "::1"):
+                        if c_ip in ("127.0.0.1", "::1") and mgr._tunnel_running:
                             cf_ip = str(self.headers.get("CF-Connecting-IP") or "").strip()
                             xff = str(self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
                             fwd = cf_ip or xff
@@ -2517,11 +3040,46 @@ class MobileBridgeManager:
                         self._send_json(r if isinstance(r, dict) else {"ok": True})
                         return
 
+                    if parsed.path == "/api/mobile/confirm-target":
+                        if hasattr(mgr.ctrl, "resolve_target_confirmation"):
+                            r = mgr.ctrl.resolve_target_confirmation(
+                                action=str(body.get("action") or "").strip(),
+                                new_target=str(body.get("new_target") or "").strip(),
+                                pending_id=str(body.get("pending_id") or "").strip(),
+                                source_device="mobile",
+                                speaker_name=u.get("nickname") or "",
+                            )
+                        else:
+                            r = {"ok": False, "message": "当前版本不支持远程看图确认"}
+                        self._send_json(r if isinstance(r, dict) else {"ok": False})
+                        return
+
                     self._send_json({"ok": False, "message": "Not Found"}, HTTPStatus.NOT_FOUND)
 
+            class _ExclusiveMobileHTTPServer(ThreadingHTTPServer):
+                allow_reuse_address = False
+
+                def server_bind(self):
+                    if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                        try:
+                            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                        except Exception:
+                            pass
+                    super().server_bind()
+
             for p in range(self.base_port, self.base_port + 20):
+                in_use = False
                 try:
-                    srv = ThreadingHTTPServer(("0.0.0.0", p), MobileHandler)
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                        probe.settimeout(0.08)
+                        if probe.connect_ex(("127.0.0.1", p)) == 0:
+                            in_use = True
+                except Exception:
+                    in_use = False
+                if in_use:
+                    continue
+                try:
+                    srv = _ExclusiveMobileHTTPServer(("0.0.0.0", p), MobileHandler)
                     srv.daemon_threads = True
                     threading.Thread(target=srv.serve_forever, daemon=True, name="SheetMateMobileServer").start()
                     self._server = srv
@@ -2533,6 +3091,25 @@ class MobileBridgeManager:
             return False, 0
 
     def _pack_mobile_state(self, st):
+        hist_raw = list(st.get("ai_history") or [])[-30:]
+        hist_packed = []
+        img_kept = 0
+        for item in reversed(hist_raw):
+            if not isinstance(item, dict):
+                continue
+            cp = dict(item)
+            if cp.get("image_data_url"):
+                img_kept += 1
+                if img_kept > 2:
+                    cp.pop("image_data_url", None)
+            hist_packed.append(cp)
+        hist_packed.reverse()
+        pend = st.get("pending_target_confirm")
+        if isinstance(pend, dict):
+            pend_out = dict(pend)
+            pend_out.pop("image_data_url", None)
+        else:
+            pend_out = None
         return {
             "ok": True,
             "busy": st.get("busy"),
@@ -2545,8 +3122,9 @@ class MobileBridgeManager:
             "last_run_str": st.get("last_run_str"),
             "next_run_str": st.get("next_run_str"),
             "data_brief": st.get("data_brief"),
+            "pending_target_confirm": pend_out,
             "chat_seq": st.get("chat_seq", 0),
-            "ai_history": (st.get("ai_history") or [])[-40:],
+            "ai_history": hist_packed,
             "logs": (st.get("logs") or [])[-15:],
         }
 
@@ -2556,12 +3134,14 @@ class MobileBridgeManager:
         if act == "run_capture":
             return self.ctrl.start_capture_only()
         if act == "pause":
-            return self.ctrl.pause_current_task()
+            r = self.ctrl.pause_current_task()
+            return {"ok": bool(r[0]), "message": r[1]} if isinstance(r, tuple) else r
         if act == "resume":
             r = self.ctrl.resume_current_task("continue")
             return {"ok": bool(r[0]), "message": r[1]} if isinstance(r, tuple) else r
         if act == "stop":
-            return self.ctrl.stop_current_task()
+            r = self.ctrl.stop_current_task()
+            return {"ok": bool(r[0]), "message": r[1]} if isinstance(r, tuple) else r
         return {"ok": False, "message": f"未知动作：{act}"}
 
     def notify_credentials_changed(self):
@@ -2669,10 +3249,31 @@ class MobileBridgeManager:
                 "result": r,
                 "state": self._pack_mobile_state(st),
             })
+        elif cmd == "confirm_target":
+            if hasattr(self.ctrl, "resolve_target_confirmation"):
+                r = self.ctrl.resolve_target_confirmation(
+                    action=str(params.get("action") or ""),
+                    new_target=str(params.get("new_target") or ""),
+                    pending_id=str(params.get("pending_id") or ""),
+                    source_device="mobile",
+                    speaker_name=nick,
+                )
+            else:
+                r = {"ok": False, "message": "当前版本不支持远程看图确认"}
+            st = self.ctrl.get_state(since=0)
+            self._relay_last_pushed_seq = int(st.get("chat_seq") or 0)
+            self._send_relay_down_packet(down_topic, master_key, {
+                "ok": True,
+                "req_id": req_id,
+                "result": r,
+                "state": self._pack_mobile_state(st),
+            })
 
-    def notify_state_changed(self):
+    def notify_state_changed(self, force_push=False):
         """电脑端聊天或运行状态变化时，立即唤醒云中继推流线程做 0 延迟推送。"""
         try:
+            if force_push:
+                self._force_push_flag.set()
             self._push_wakeup.set()
         except Exception:
             pass
@@ -2680,7 +3281,9 @@ class MobileBridgeManager:
     def _cloud_state_push_loop(self):
         while not self._relay_stop.is_set():
             try:
-                if self.cloud_relay_enabled and (time.time() - self._relay_last_active_ts) < 600:
+                has_pending = bool(getattr(self.ctrl, "_pending_target_confirm", None))
+                recent_active = (time.time() - self._relay_last_active_ts) < 3600
+                if self.cloud_relay_enabled and (recent_active or self._force_push_flag.is_set() or has_pending):
                     nick = self._get_local_nick()
                     if nick:
                         seq_now = int(getattr(self.ctrl, "_chat_seq", 0))
@@ -2692,6 +3295,7 @@ class MobileBridgeManager:
                                 "ok": True,
                                 "state": self._pack_mobile_state(st),
                             })
+                    self._force_push_flag.clear()
             except Exception:
                 pass
             self._push_wakeup.wait(timeout=0.7)
@@ -2761,10 +3365,15 @@ class MobileBridgeManager:
                                 raw_txt,
                                 seen_nonces=self._relay_seen_nonces,
                             )
-                        if obj is not None:
+                        if obj is not None and self._relay_cmd_sem.acquire(blocking=False):
+                            def _run_cmd(_o=obj):
+                                try:
+                                    self._handle_relay_command(_o, nick, down_topic, master_key)
+                                finally:
+                                    self._relay_cmd_sem.release()
+
                             threading.Thread(
-                                target=self._handle_relay_command,
-                                args=(obj, nick, down_topic, master_key),
+                                target=_run_cmd,
                                 daemon=True,
                             ).start()
             except Exception as exc:
@@ -2808,12 +3417,17 @@ class MobileBridgeManager:
         with self._lock:
             if self._tunnel_running and self._tunnel_proc is not None and self._tunnel_proc.poll() is None:
                 return {"ok": True, "running": True, "public_url": self._public_url}
+            if self._tunnel_starting:
+                return {"ok": True, "running": True, "message": "正在打通外网直连隧道，约需 2~5 秒…"}
             port = self._port
             if not port:
                 return {"ok": False, "message": "本地手机端口未就绪"}
+            self._tunnel_starting = True
             self._tunnel_error = ""
             self._public_url = ""
+            gen_snap = self._tunnel_gen
 
+        try:
             cf_exe = shutil.which("cloudflared")
             ssh_exe = shutil.which("ssh")
             if cf_exe:
@@ -2831,8 +3445,11 @@ class MobileBridgeManager:
                 ]
                 kind = "ssh"
             else:
-                self._tunnel_error = "当前系统未找到 ssh 或 cloudflared，推荐直接用 GitHub 全球远程网址或局域网访问"
-                return {"ok": False, "message": self._tunnel_error}
+                with self._lock:
+                    self._tunnel_starting = False
+                    self._tunnel_error = "当前系统未找到 ssh 或 cloudflared，推荐直接用 GitHub 全球远程网址或局域网访问"
+                    msg = self._tunnel_error
+                return {"ok": False, "message": msg}
 
             creation = subprocess.CREATE_NO_WINDOW if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW") else 0
             try:
@@ -2847,12 +3464,37 @@ class MobileBridgeManager:
                     creationflags=creation,
                 )
             except Exception as exc:
-                self._tunnel_error = f"启动公网穿透失败：{exc}"
-                return {"ok": False, "message": self._tunnel_error}
+                with self._lock:
+                    self._tunnel_starting = False
+                    self._tunnel_error = f"启动公网穿透失败：{exc}"
+                    msg = self._tunnel_error
+                return {"ok": False, "message": msg}
 
-            self._tunnel_proc = proc
-            self._tunnel_running = True
-            self._tunnel_kind = kind
+            with self._lock:
+                self._tunnel_starting = False
+                if gen_snap != self._tunnel_gen:
+                    proc_aborted = True
+                else:
+                    proc_aborted = False
+                    self._tunnel_proc = proc
+                    self._tunnel_running = True
+                    self._tunnel_kind = kind
+
+            if proc_aborted:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+                return {"ok": False, "running": False, "message": "穿透隧道启动已取消"}
 
             def _watch_stream():
                 url_pat = re.compile(r"https://[A-Za-z0-9.\-]+\.(?:trycloudflare\.com|lhr\.life|localhost\.run)")
@@ -2879,9 +3521,16 @@ class MobileBridgeManager:
 
             threading.Thread(target=_watch_stream, daemon=True).start()
             return {"ok": True, "running": True, "kind": kind, "message": "正在打通外网直连隧道，约需 2~5 秒…"}
+        except Exception as exc:
+            with self._lock:
+                self._tunnel_starting = False
+                self._tunnel_error = f"启动公网穿透失败：{exc}"
+            return {"ok": False, "message": self._tunnel_error}
 
     def stop_tunnel(self):
         with self._lock:
+            self._tunnel_gen += 1
+            self._tunnel_starting = False
             proc = self._tunnel_proc
             self._tunnel_proc = None
             self._tunnel_running = False

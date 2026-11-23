@@ -7,7 +7,6 @@ from ctypes import wintypes
 import os
 from pathlib import Path
 import queue
-import re
 import subprocess
 import sys
 import tempfile
@@ -185,8 +184,11 @@ def set_clipboard_text(text):
     """用 Win32 原生 CF_UNICODETEXT 写入 UTF-16LE（带空终止符），杜绝 clip.exe 把短中文误判成 GBK 乱码。"""
     s = "" if text is None else str(text)
     if os.name != "nt":
-        subprocess.run(["clip"], input=b"\xff\xfe" + s.encode("utf-16-le"), check=False, creationflags=_no_window_flags())
-        return True
+        try:
+            subprocess.run(["clip"], input=b"\xff\xfe" + s.encode("utf-16-le"), check=False, timeout=5, creationflags=_no_window_flags())
+            return True
+        except Exception:
+            return False
     u32 = ctypes.WinDLL("user32", use_last_error=True)
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     u32.OpenClipboard.argtypes = [wintypes.HWND]
@@ -232,7 +234,10 @@ def set_clipboard_text(text):
                         pass
                 u32.CloseClipboard()
         time.sleep(0.08)
-    subprocess.run(["clip"], input=b"\xff\xfe" + s.encode("utf-16-le"), check=False, creationflags=_no_window_flags())
+    try:
+        subprocess.run(["clip"], input=b"\xff\xfe" + s.encode("utf-16-le"), check=False, timeout=5, creationflags=_no_window_flags())
+    except Exception:
+        pass
     return False
 
 
@@ -699,23 +704,51 @@ class DingTalkSilentTester:
             import pyautogui  # type: ignore[import-not-found]
             from PIL import ImageOps
             pyautogui.FAILSAFE = False
-            scr = pyautogui.screenshot().convert("L")
-            tpl = Image.open(tpl_file).convert("L")
-            for base_t in (tpl, ImageOps.invert(tpl)):
-                for sc in (1.0, 1.5, 1.25, 2.0, 1.75, 1.875, 0.85):
-                    nw, nh = max(8, int(base_t.width * sc)), max(6, int(base_t.height * sc))
-                    if nw >= scr.width or nh >= scr.height:
-                        continue
-                    rsz = base_t if abs(sc - 1.0) < 0.02 else base_t.resize((nw, nh), Image.Resampling.LANCZOS)
-                    for conf in (0.82, 0.74):
+            scr = None
+            tpl = None
+            tpl_inv = None
+            try:
+                scr_raw = pyautogui.screenshot()
+                try:
+                    scr = scr_raw.convert("L")
+                finally:
+                    try:
+                        scr_raw.close()
+                    except Exception:
+                        pass
+                with Image.open(tpl_file) as raw_tpl:
+                    tpl = raw_tpl.convert("L")
+                tpl_inv = ImageOps.invert(tpl)
+                for base_t in (tpl, tpl_inv):
+                    for sc in (1.0, 1.5, 1.25, 2.0, 1.75, 1.875, 0.85):
+                        nw, nh = max(8, int(base_t.width * sc)), max(6, int(base_t.height * sc))
+                        if nw >= scr.width or nh >= scr.height:
+                            continue
+                        is_copy = abs(sc - 1.0) >= 0.02
+                        rsz = base_t.resize((nw, nh), Image.Resampling.LANCZOS) if is_copy else base_t
                         try:
-                            box = pyautogui.locate(rsz, scr, grayscale=True, confidence=conf)
-                            if box is not None:
-                                cx, cy = pyautogui.center(box)
-                                self.log(f"✅ 图像模板匹配命中「设为静音」（scale={sc} conf={conf}），点击")
-                                pyautogui.click(cx, cy)
-                                time.sleep(0.25)
-                                return True
+                            for conf in (0.82, 0.74):
+                                try:
+                                    box = pyautogui.locate(rsz, scr, grayscale=True, confidence=conf)
+                                    if box is not None:
+                                        cx, cy = pyautogui.center(box)
+                                        self.log(f"✅ 图像模板匹配命中「设为静音」（scale={sc} conf={conf}），点击")
+                                        pyautogui.click(cx, cy)
+                                        time.sleep(0.25)
+                                        return True
+                                except Exception:
+                                    pass
+                        finally:
+                            if is_copy:
+                                try:
+                                    rsz.close()
+                                except Exception:
+                                    pass
+            finally:
+                for im_obj in (tpl_inv, tpl, scr):
+                    if im_obj is not None:
+                        try:
+                            im_obj.close()
                         except Exception:
                             pass
 

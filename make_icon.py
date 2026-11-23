@@ -246,23 +246,30 @@ def _build_dingtalk_liquid_badge(wing_path, size=310):
 
     # 4) 嵌入居中钉钉纯白立体翼标
     if wing_path and Path(wing_path).exists():
-        wing = Image.open(wing_path).convert("RGBA")
-        target_w = int(size * 0.72)
-        wing = wing.resize((target_w, target_w), Image.Resampling.LANCZOS)
-        wx = (W - target_w) // 2 + int(size * 0.015)
-        wy = (W - target_w) // 2 + int(size * 0.015)
+        with Image.open(wing_path) as raw_wing:
+            wing = raw_wing.convert("RGBA")
+        try:
+            target_w = int(size * 0.72)
+            wing_rsz = wing.resize((target_w, target_w), Image.Resampling.LANCZOS)
+            try:
+                wx = (W - target_w) // 2 + int(size * 0.015)
+                wy = (W - target_w) // 2 + int(size * 0.015)
 
-        w_alpha = wing.getchannel("A")
-        w_shadow_alpha = Image.new("L", (W, W), 0)
-        w_shadow_alpha.paste(ImageChops.multiply(w_alpha, Image.new("L", wing.size, 110)), (wx, wy + 5))
-        w_shadow_alpha = w_shadow_alpha.filter(ImageFilter.GaussianBlur(5))
-        w_shadow_fill = Image.new("RGBA", (W, W), (6, 48, 146, 255))
-        w_shadow_fill.putalpha(w_shadow_alpha)
-        out_im = Image.alpha_composite(out_im, w_shadow_fill)
+                w_alpha = wing_rsz.getchannel("A")
+                w_shadow_alpha = Image.new("L", (W, W), 0)
+                w_shadow_alpha.paste(ImageChops.multiply(w_alpha, Image.new("L", wing_rsz.size, 110)), (wx, wy + 5))
+                w_shadow_alpha = w_shadow_alpha.filter(ImageFilter.GaussianBlur(5))
+                w_shadow_fill = Image.new("RGBA", (W, W), (6, 48, 146, 255))
+                w_shadow_fill.putalpha(w_shadow_alpha)
+                out_im = Image.alpha_composite(out_im, w_shadow_fill)
 
-        wing_layer = Image.new("RGBA", (W, W), (0, 0, 0, 0))
-        wing_layer.paste(wing, (wx, wy), wing)
-        out_im = Image.alpha_composite(out_im, wing_layer)
+                wing_layer = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+                wing_layer.paste(wing_rsz, (wx, wy), wing_rsz)
+                out_im = Image.alpha_composite(out_im, wing_layer)
+            finally:
+                wing_rsz.close()
+        finally:
+            wing.close()
 
     return out_im
 

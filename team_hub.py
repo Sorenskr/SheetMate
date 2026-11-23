@@ -11,11 +11,12 @@
 
 import base64
 import copy
-from datetime import datetime, timedelta
+from datetime import datetime
 import hashlib
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,7 @@ import threading
 import time
 import unicodedata
 import urllib.error
+from urllib.parse import urlparse
 import urllib.request
 import uuid
 import zlib
@@ -264,6 +266,257 @@ PERMISSION_META = [
 ]
 
 DEFAULT_PERMISSIONS = {k: True for k, _t, _d in PERMISSION_META}
+
+ANNOUNCEMENT_EFFECTS = ("marquee", "gradient", "pulse", "glow", "typewriter", "static")
+ANNOUNCEMENT_THEMES = ("ocean", "amber", "emerald", "rose", "violet", "obsidian")
+ANNOUNCEMENT_SIZES = ("sm", "md", "lg")
+ANNOUNCEMENT_SPEEDS = ("slow", "normal", "fast")
+ANNOUNCEMENT_MEDIA_MODES = ("none", "loop_one", "loop_all")
+ANNOUNCEMENT_MEDIA_TYPES = ("video", "gif", "image", "anim")
+ANNOUNCEMENT_ANIM_PRESETS = ("aurora", "pulse_wave", "gold_ribbon")
+ANNOUNCEMENT_TEXT_OVERLAYS = ("overlay", "hide")
+ANNOUNCEMENT_MEDIA_FITS = ("cover", "contain")
+ANNOUNCEMENT_HEIGHTS = ("normal", "tall", "cinema")
+MAX_ANNOUNCEMENT_MEDIA_ITEMS = 8
+MAX_ANNOUNCEMENT_MEDIA_URL_LEN = 2048
+MAX_ANNOUNCEMENT_MEDIA_DATA_URL_LEN = 700_000
+MAX_ANNOUNCEMENT_TOTAL_MEDIA_DATA_LEN = 1_100_000
+
+_MANAGED_ANN_MEDIA_RE = re.compile(r"^/api/ann-media/[a-f0-9]{24}\.(?:mp4|webm|gif|webp|png|jpg|jpeg)$", re.IGNORECASE)
+_DATA_ANN_MEDIA_RE = re.compile(r"^data:(image/(?:gif|webp|png|jpeg)|video/(?:mp4|webm));base64,([A-Za-z0-9+/=]+)$")
+_ANIM_ANN_MEDIA_RE = re.compile(r"^anim:(aurora|pulse_wave|gold_ribbon)$", re.IGNORECASE)
+
+
+def sanitize_announcement_media_src(src, kind=""):
+    """严格清洗公告栏横幅媒体地址：拦截 XSS、路径穿越、私网 SSRF 与超大内联包，返回 (clean_src, inferred_kind)。"""
+    raw = str(src or "").strip()
+    if not raw or any(ord(ch) < 32 for ch in raw):
+        return "", ""
+
+    m_anim = _ANIM_ANN_MEDIA_RE.fullmatch(raw)
+    if m_anim:
+        return f"anim:{m_anim.group(1).lower()}", "anim"
+
+    if _MANAGED_ANN_MEDIA_RE.fullmatch(raw):
+        norm_src = "/api/ann-media/" + raw[len("/api/ann-media/"):].lower()
+        ext = norm_src.rsplit(".", 1)[-1]
+        inferred = "video" if ext in ("mp4", "webm") else ("gif" if ext in ("gif", "webp") else "image")
+        return norm_src, inferred
+
+    if raw.startswith("data:"):
+        if len(raw) > MAX_ANNOUNCEMENT_MEDIA_DATA_URL_LEN:
+            return "", ""
+        m_data = _DATA_ANN_MEDIA_RE.fullmatch(raw)
+        if not m_data:
+            return "", ""
+        mime = m_data.group(1).lower()
+        if mime.startswith("video/"):
+            inferred = "video"
+        elif mime in ("image/gif", "image/webp"):
+            inferred = "gif"
+        else:
+            inferred = "image"
+        return raw, inferred
+
+    if len(raw) > MAX_ANNOUNCEMENT_MEDIA_URL_LEN:
+        return "", ""
+    try:
+        u = urlparse(raw)
+    except Exception:
+        return "", ""
+    if u.scheme.lower() not in ("http", "https") or not u.netloc or not u.hostname:
+        return "", ""
+    if u.username or u.password:
+        return "", ""
+    host = u.hostname.strip(".").lower()
+    if not host or host in ("localhost", "localhost.localdomain") or host.endswith((".localhost", ".local", ".internal", ".arpa")):
+        return "", ""
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_reserved
+            or ip_obj.is_multicast
+            or ip_obj.is_unspecified
+        ):
+            return "", ""
+    except ValueError:
+        pass
+
+    path_l = (u.path or "").lower()
+    k_clean = str(kind or "").strip().lower()
+    if path_l.endswith((".mp4", ".webm", ".m4v", ".mov")):
+        inferred = "video"
+    elif path_l.endswith((".gif", ".webp")):
+        inferred = "gif"
+    elif path_l.endswith((".png", ".jpg", ".jpeg", ".bmp")):
+        inferred = "image"
+    else:
+        inferred = k_clean if k_clean in ("video", "gif", "image") else "video"
+    return raw, inferred
+
+
+DEFAULT_ANNOUNCEMENT = {
+    "enabled": True,
+    "badge": "全员公告",
+    "text": "欢迎使用暗号表助手！超级管理员可在总控后台实时编辑全员公告与文字动态效果，所有电脑将自动同步显示。",
+    "effect": "gradient",
+    "theme": "ocean",
+    "font_size": "md",
+    "speed": "normal",
+    "media_mode": "none",        # none | loop_one | loop_all
+    "media_active_idx": 0,
+    "media_muted": True,         # 默认静音播放
+    "media_fit": "cover",        # cover | contain
+    "banner_height": "normal",   # normal | tall | cinema
+    "text_overlay": "overlay",   # overlay | hide
+    "media_items": [],           # [{"id": ..., "kind": "video|gif|image|anim", "title": ..., "src": ..., "duration_sec": 8}]
+    "rev": 0,
+    "updated_ts": 0.0,
+    "updated_at": "",
+    "updated_by": "",
+}
+
+
+def normalize_announcement(raw, base=None):
+    """规范化并严格校验全员顶部公告配置（含横幅动画/视频/GIF列表），防止 XSS、SSRF 或非法样式参数注入。"""
+    src_base = base if isinstance(base, dict) else DEFAULT_ANNOUNCEMENT
+    out = copy.deepcopy(DEFAULT_ANNOUNCEMENT)
+    for k in out:
+        if k in src_base:
+            out[k] = copy.deepcopy(src_base[k])
+    if isinstance(raw, dict):
+        if "enabled" in raw:
+            out["enabled"] = bool(raw["enabled"])
+        if "badge" in raw:
+            badge_s = " ".join(str(raw.get("badge") or "").replace("\r", " ").replace("\n", " ").split()).strip()
+            out["badge"] = (badge_s[:12] or "全员公告")
+        if "text" in raw:
+            lines = [ln.strip() for ln in str(raw.get("text") or "").replace("\r", "").split("\n") if ln.strip()]
+            out["text"] = "   |   ".join(lines)[:300]
+        if "effect" in raw:
+            ef = str(raw.get("effect") or "").strip().lower()
+            if ef in ANNOUNCEMENT_EFFECTS:
+                out["effect"] = ef
+        if "theme" in raw:
+            th = str(raw.get("theme") or "").strip().lower()
+            if th in ANNOUNCEMENT_THEMES:
+                out["theme"] = th
+        if "font_size" in raw:
+            fs = str(raw.get("font_size") or "").strip().lower()
+            if fs in ANNOUNCEMENT_SIZES:
+                out["font_size"] = fs
+        if "speed" in raw:
+            sp = str(raw.get("speed") or "").strip().lower()
+            if sp in ANNOUNCEMENT_SPEEDS:
+                out["speed"] = sp
+        if "media_mode" in raw:
+            mm = str(raw.get("media_mode") or "").strip().lower()
+            if mm in ANNOUNCEMENT_MEDIA_MODES:
+                out["media_mode"] = mm
+        if "media_active_idx" in raw:
+            try:
+                out["media_active_idx"] = max(0, int(raw.get("media_active_idx") or 0))
+            except Exception:
+                pass
+        if "media_muted" in raw:
+            out["media_muted"] = bool(raw["media_muted"])
+        if "media_fit" in raw:
+            mf = str(raw.get("media_fit") or "").strip().lower()
+            if mf in ANNOUNCEMENT_MEDIA_FITS:
+                out["media_fit"] = mf
+        if "banner_height" in raw:
+            bh = str(raw.get("banner_height") or "").strip().lower()
+            if bh in ANNOUNCEMENT_HEIGHTS:
+                out["banner_height"] = bh
+        if "text_overlay" in raw:
+            to = str(raw.get("text_overlay") or "").strip().lower()
+            if to in ANNOUNCEMENT_TEXT_OVERLAYS:
+                out["text_overlay"] = to
+        if "media_items" in raw and isinstance(raw.get("media_items"), list):
+            out["media_items"] = list(raw.get("media_items") or [])
+        if "rev" in raw:
+            try:
+                out["rev"] = max(0, int(raw.get("rev") or 0))
+            except Exception:
+                pass
+        if "updated_ts" in raw:
+            try:
+                out["updated_ts"] = max(0.0, float(raw.get("updated_ts") or 0.0))
+            except Exception:
+                pass
+        if "updated_at" in raw:
+            out["updated_at"] = " ".join(str(raw.get("updated_at") or "").split())[:32]
+        if "updated_by" in raw:
+            out["updated_by"] = " ".join(str(raw.get("updated_by") or "").split())[:32]
+    if out.get("effect") not in ANNOUNCEMENT_EFFECTS:
+        out["effect"] = DEFAULT_ANNOUNCEMENT["effect"]
+    if out.get("theme") not in ANNOUNCEMENT_THEMES:
+        out["theme"] = DEFAULT_ANNOUNCEMENT["theme"]
+    if out.get("font_size") not in ANNOUNCEMENT_SIZES:
+        out["font_size"] = DEFAULT_ANNOUNCEMENT["font_size"]
+    if out.get("speed") not in ANNOUNCEMENT_SPEEDS:
+        out["speed"] = DEFAULT_ANNOUNCEMENT["speed"]
+    if out.get("media_mode") not in ANNOUNCEMENT_MEDIA_MODES:
+        out["media_mode"] = "none"
+    if out.get("media_fit") not in ANNOUNCEMENT_MEDIA_FITS:
+        out["media_fit"] = "cover"
+    if out.get("banner_height") not in ANNOUNCEMENT_HEIGHTS:
+        out["banner_height"] = "normal"
+    if out.get("text_overlay") not in ANNOUNCEMENT_TEXT_OVERLAYS:
+        out["text_overlay"] = "overlay"
+    out["media_muted"] = bool(out.get("media_muted", True))
+
+    clean_items = []
+    total_data_len = 0
+    seen_ids = set()
+    for idx_m, item in enumerate(out.get("media_items") if isinstance(out.get("media_items"), list) else []):
+        if not isinstance(item, dict):
+            continue
+        c_src, inferred_kind = sanitize_announcement_media_src(item.get("src"), item.get("kind", ""))
+        if not c_src or inferred_kind not in ANNOUNCEMENT_MEDIA_TYPES:
+            continue
+        if c_src.startswith("data:"):
+            if total_data_len + len(c_src) > MAX_ANNOUNCEMENT_TOTAL_MEDIA_DATA_LEN:
+                continue
+            total_data_len += len(c_src)
+        raw_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(item.get("id") or ""))[:24]
+        if not raw_id or raw_id in seen_ids:
+            raw_id = f"m_{idx_m + 1}_{hashlib.sha1(c_src.encode('utf-8', 'ignore')).hexdigest()[:8]}"[:24]
+        seen_ids.add(raw_id)
+        title_s = " ".join(str(item.get("title") or "").replace("\r", " ").replace("\n", " ").split()).strip()[:36]
+        if not title_s:
+            title_s = {
+                "anim": "内置横幅动画",
+                "video": "横幅视频",
+                "gif": "横幅动图",
+                "image": "横幅图片",
+            }.get(inferred_kind, "横幅媒体")
+        try:
+            dur_s = max(3, min(60, int(item.get("duration_sec", 8) or 8)))
+        except Exception:
+            dur_s = 8
+        clean_items.append({
+            "id": raw_id,
+            "kind": inferred_kind,
+            "title": title_s,
+            "src": c_src,
+            "duration_sec": dur_s,
+        })
+        if len(clean_items) >= MAX_ANNOUNCEMENT_MEDIA_ITEMS:
+            break
+
+    out["media_items"] = clean_items
+    try:
+        a_idx = int(out.get("media_active_idx") or 0)
+    except Exception:
+        a_idx = 0
+    out["media_active_idx"] = max(0, min(a_idx, len(clean_items) - 1)) if clean_items else 0
+    out["badge"] = str(out.get("badge") or "全员公告")[:12] or "全员公告"
+    out["text"] = str(out.get("text") or "")[:300]
+    return out
 
 
 MAX_HUB_BODY_BYTES = 2 * 1024 * 1024
@@ -601,7 +854,8 @@ def safe_read_json_body(rfile, headers, max_bytes=MAX_HUB_BODY_BYTES):
         raise ValueError("PayloadTooLarge")
     raw = rfile.read(ln)
     try:
-        return json.loads(raw.decode("utf-8"))
+        obj = json.loads(raw.decode("utf-8"))
+        return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
 
@@ -706,13 +960,14 @@ def check_config_edit_permission(old_cfg, new_cfg, perms):
             "enable_dingtalk", "dt_auto_send", "dt_clear_before_send", "dt_silent_send",
             "dt_search", "dt_targets", "dt_suffix", "dt_time_mode", "dt_date_fmt",
             "dt_day_offset", "dt_cutoff_enabled", "dt_cutoff_hm", "dt_before_cutoff_offset",
-            "suffix_rules",
+            "dt_use_actual_clock", "dt_ai_screen_verify", "suffix_rules",
         )),
         ("can_edit_cells", "修改表格截图与自定义单元格规则", (
             "enable_capture", "summary_presets", "update_time_cell",
         )),
         ("can_edit_schedule", "修改定时自动排期计划", (
-            "day_mode", "custom_days", "day", "night", "night_enabled", "point_overrides", "capture_plan",
+            "day_mode", "custom_days", "day", "night", "night_enabled", "extra_points",
+            "point_overrides", "capture_plan", "raw_sync",
         )),
         ("can_edit_accounts", "修改 WPS 链接或 Luya 后台账号密码", (
             "wps_url", "luya_user", "luya_pass",
@@ -1152,6 +1407,7 @@ class TeamHubManager:
                 "enforce_silent_order": "",
                 "enforce_minimize_after_send": None,
                 "default_permissions": dict(DEFAULT_PERMISSIONS),
+                "announcement": copy.deepcopy(DEFAULT_ANNOUNCEMENT),
                 "global_ai_api": {
                     "provider": "gemini",
                     "api_base": "",
@@ -1232,6 +1488,9 @@ class TeamHubManager:
             self._state["global_logic"].setdefault(sk, sv)
         self._state["global_logic"]["default_permissions"] = normalize_permissions(
             self._state["global_logic"].get("default_permissions")
+        )
+        self._state["global_logic"]["announcement"] = normalize_announcement(
+            self._state["global_logic"].get("announcement")
         )
         for sk, sv in d["sync_settings"].items():
             self._state["sync_settings"].setdefault(sk, sv)
@@ -1330,7 +1589,18 @@ class TeamHubManager:
                     remote = self._fetch_remote_state_unlocked(sync_snap)
                     if isinstance(remote, dict):
                         with self._lock:
+                            old_ann = normalize_announcement(
+                                (self._state.get("global_logic") or {}).get("announcement")
+                            )
                             self._merge_remote_state(remote)
+                            new_ann = normalize_announcement(
+                                (self._state.get("global_logic") or {}).get("announcement")
+                            )
+                            if (int(new_ann.get("rev") or 0), float(new_ann.get("updated_ts") or 0.0)) > (
+                                int(old_ann.get("rev") or 0),
+                                float(old_ann.get("updated_ts") or 0.0),
+                            ):
+                                self._save_state_local_and_push(push_remote=False)
                 except Exception:
                     pass
                 finally:
@@ -1359,6 +1629,32 @@ class TeamHubManager:
         # 所有网络拉取全部走后台异步线程，绝不在持锁状态阻塞前端接口与按钮点击
         self._schedule_async_remote_pull(force=force)
         return False
+
+    def _merge_global_logic_locked(self, incoming_gl, from_public=False):
+        """安全合并远端全局逻辑：公共云隔离 AI 接口防投毒，公告栏严格按高版本优先防回滚。"""
+        if not isinstance(incoming_gl, dict):
+            return
+        old_gl = self._state.get("global_logic") if isinstance(self._state.get("global_logic"), dict) else {}
+        new_gl = copy.deepcopy(incoming_gl)
+        old_ai = old_gl.get("global_ai_api") if isinstance(old_gl.get("global_ai_api"), dict) else {}
+        if from_public:
+            # 公共云频道禁止改写全局 AI 接口与 api_base，防止接口地址投毒重定向
+            new_gl["global_ai_api"] = copy.deepcopy(old_ai) if old_ai else {
+                "provider": "gemini", "api_base": "", "api_key": "", "model": "",
+            }
+        else:
+            new_ai = new_gl.get("global_ai_api") if isinstance(new_gl.get("global_ai_api"), dict) else {}
+            if not new_ai.get("api_key") and old_ai.get("api_key"):
+                new_gl.setdefault("global_ai_api", {})["api_key"] = old_ai["api_key"]
+        old_ann = normalize_announcement(old_gl.get("announcement"))
+        if isinstance(incoming_gl.get("announcement"), dict):
+            cand_ann = normalize_announcement(incoming_gl.get("announcement"))
+            old_ver = (int(old_ann.get("rev") or 0), float(old_ann.get("updated_ts") or 0.0))
+            new_ver = (int(cand_ann.get("rev") or 0), float(cand_ann.get("updated_ts") or 0.0))
+            new_gl["announcement"] = cand_ann if new_ver > old_ver else old_ann
+        else:
+            new_gl["announcement"] = old_ann
+        self._state["global_logic"] = new_gl
 
     def _merge_remote_state(self, remote):
         if not isinstance(remote, dict):
@@ -1405,19 +1701,7 @@ class TeamHubManager:
             if isinstance(remote.get("queue"), list):
                 self._state["queue"] = remote["queue"]
             if isinstance(remote.get("global_logic"), dict):
-                old_gl = self._state.get("global_logic") if isinstance(self._state.get("global_logic"), dict) else {}
-                new_gl = copy.deepcopy(remote["global_logic"])
-                old_ai = old_gl.get("global_ai_api") if isinstance(old_gl.get("global_ai_api"), dict) else {}
-                if from_public:
-                    # 公共云频道禁止改写全局 AI 接口与 api_base，防止接口地址投毒重定向
-                    new_gl["global_ai_api"] = copy.deepcopy(old_ai) if old_ai else {
-                        "provider": "gemini", "api_base": "", "api_key": "", "model": "",
-                    }
-                else:
-                    new_ai = new_gl.get("global_ai_api") if isinstance(new_gl.get("global_ai_api"), dict) else {}
-                    if not new_ai.get("api_key") and old_ai.get("api_key"):
-                        new_gl.setdefault("global_ai_api", {})["api_key"] = old_ai["api_key"]
-                self._state["global_logic"] = new_gl
+                self._merge_global_logic_locked(remote["global_logic"], from_public=from_public)
             if isinstance(remote.get("members"), dict):
                 mems = self._state.setdefault("members", {})
                 for uid, rmem in remote["members"].items():
@@ -1467,6 +1751,8 @@ class TeamHubManager:
                                     mem_c["avatar"] = sanitize_avatar_url(upgrade_legacy_avatar(mem_c.get("avatar")))
                                 clean_mems[uid] = mem_c
                         self._state[k] = clean_mems
+                    elif k == "global_logic":
+                        self._merge_global_logic_locked(remote[k], from_public=False)
                     else:
                         self._state[k] = copy.deepcopy(remote[k])
             if isinstance(remote.get("admin_auth"), dict) and remote["admin_auth"].get("custom_set") is True:
@@ -2276,9 +2562,13 @@ class TeamHubManager:
                     }
                 return {"ok": False, "message": "管理员姓名或密码不正确"}
             self._admin_fail_tracker.pop(client_id, None)
-            # 清理已过期 Token，防止内存增长
+            # 清理已过期 Token，并限制容量上限防止内存无界增长
             for k in [tk for tk, exp_t in self._admin_tokens.items() if exp_t <= now]:
                 self._admin_tokens.pop(k, None)
+            if len(self._admin_tokens) >= 64:
+                oldest = sorted(self._admin_tokens.items(), key=lambda it: it[1])[: len(self._admin_tokens) - 63]
+                for k, _ in oldest:
+                    self._admin_tokens.pop(k, None)
             tok = secrets.token_urlsafe(24)
             self._admin_tokens[tok] = now + 12 * 3600
             return {"ok": True, "admin_token": tok, "message": "已进入超级管理员后台"}
@@ -2383,6 +2673,7 @@ class TeamHubManager:
 
     def admin_update_global_logic(self, patch):
         p = patch if isinstance(patch, dict) else {}
+        ann_only = set(p.keys()) == {"announcement"}
         with self._lock:
             self._sync_pull_if_needed()
             gl = self._state.setdefault("global_logic", {})
@@ -2414,8 +2705,19 @@ class TeamHubManager:
                     "api_key": str(ga.get("api_key") or "").strip(),
                     "model": str(ga.get("model") or "").strip(),
                 }
+            if isinstance(p.get("announcement"), dict):
+                cur_ann = normalize_announcement(gl.get("announcement"))
+                next_ann = normalize_announcement(p["announcement"], base=cur_ann)
+                next_ann["rev"] = max(int(cur_ann.get("rev") or 0), int(next_ann.get("rev") or 0)) + 1
+                next_ann["updated_ts"] = time.time()
+                next_ann["updated_at"] = time.strftime("%m-%d %H:%M")
+                prof = self._profile if isinstance(self._profile, dict) else {}
+                who = str(prof.get("nickname") or prof.get("display_name") or prof.get("member_code") or "管理员").strip()[:24]
+                next_ann["updated_by"] = who or "管理员"
+                gl["announcement"] = next_ann
             self._save_state_local_and_push()
-            return {"ok": True, "global_logic": dict(gl), "message": "全局软件运行逻辑与 AI 接口已更新并下发"}
+            msg = "全员顶部公告已保存并同步推送到所有电脑" if ann_only else "全局软件运行逻辑与 AI 接口已更新并下发"
+            return {"ok": True, "global_logic": copy.deepcopy(gl), "message": msg}
 
     def force_cloud_sync(self):
         """立即执行一次云端异地数据拉取并同步上传本机快照。"""
@@ -2536,6 +2838,13 @@ class TeamHubManager:
             mgr = self
 
             class HubHandler(BaseHTTPRequestHandler):
+                def setup(self):
+                    super().setup()
+                    try:
+                        self.request.settimeout(15.0)
+                    except Exception:
+                        pass
+
                 def log_message(self, fmt, *args):
                     return
 
@@ -2547,6 +2856,8 @@ class TeamHubManager:
                 def _json(self, obj, code=HTTPStatus.OK):
                     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
                     self.send_response(code)
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Cache-Control", "no-store")
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
@@ -2582,8 +2893,28 @@ class TeamHubManager:
                         return
                     self._json({"ok": False}, HTTPStatus.NOT_FOUND)
 
+            class _ExclusiveHubHTTPServer(ThreadingHTTPServer):
+                allow_reuse_address = False
+
+                def server_bind(self):
+                    if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                        try:
+                            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                        except Exception:
+                            pass
+                    super().server_bind()
+
             try:
-                srv = ThreadingHTTPServer(("0.0.0.0", int(port)), HubHandler)
+                p_int = int(port)
+                if p_int > 0:
+                    try:
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                            probe.settimeout(0.08)
+                            if probe.connect_ex(("127.0.0.1", p_int)) == 0:
+                                return False, 0
+                    except Exception:
+                        pass
+                srv = _ExclusiveHubHTTPServer(("0.0.0.0", p_int), HubHandler)
                 srv.daemon_threads = True
                 threading.Thread(target=srv.serve_forever, daemon=True, name="SheetMateTeamHubServer").start()
                 self._server = srv

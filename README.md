@@ -1,6 +1,6 @@
-# 暗号表助手（SheetMate）v2.9.5
+# 暗号表助手（SheetMate）v2.9.6
 
-[![最新版本](https://img.shields.io/badge/Release-v2.9.5-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
+[![最新版本](https://img.shields.io/badge/Release-v2.9.6-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![运行平台](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-34C759?style=flat-square&logo=windows)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![云端远程入口](https://img.shields.io/badge/Cloud%20Web-点击打开远程控制台-5856D6?style=flat-square&logo=googlechrome)](https://sorenskr.github.io/SheetMate/)
 
@@ -20,7 +20,18 @@
 
 ---
 
-## ✨ v2.9.5 核心功能一览
+## ✨ v2.9.6 核心功能一览
+
+- **运行期间 AI 随时暂停 / 继续 / 取消（桌面与手机双端零阻塞直控）**
+  - 软件跑表或发钉钉期间，随时直接在桌面 AI 对话框或手机远程网页对 AI 说「暂停运行」「先停一下」「继续运行」「取消当前任务」「停掉」或点快捷指令胶囊，AI 毫秒级挂起/恢复进度或安全停止任务并释放团队锁定，同时即时刷新灵动岛与手机端控制状态。
+- **顶部冻结公告栏横幅动画 / 视频 / GIF 多模式播放 + 默认静音**
+  - 顶部全局冻结公告栏支持上传本地横幅视频（`.mp4`/`.webm`）、动图（`.gif`/`.webp`）、图片或一键开启 3 款零流量纯 CSS 流光动效，支持常规/中/大三种横幅高度，默认静音并可在右下角随时切换「有声/已静音」。
+  - 后台可自由选择「无需播放」「循环播放一条」「循环播放所有」，支持空文案纯媒体横幅或「文字在视频上层」，小体积素材与公网直链全员电脑自动同步。
+- **全能定时排期自定义节点 + 每 40 分钟后台自动刷三表仅写 R4**
+  - 排期总览支持自由新增/删除自定义时间点，每个时间点均可独立设置发/不发钉钉、发送目标群/人、查询前一天/当天数据、仅发年月日或日期+时分、静音与结尾词覆盖，并支持 AI 自然语言实时增删排期与快捷短语。
+  - 新增「每 40 分钟定时更新三份底表」后台模式：自动从后台拉取三份数据表粘贴至 WPS 表格，**跳过数据汇总其余预设格位保持原样**，仅向 `(🌟数据汇总) R4` 写入精确粘贴时间（如 `2026年11月24日01:59:13`），临近正式发群前 5 分钟自动避让。
+- **AI 桌面视觉识屏双核对 + 全流程默认自动同意**
+  - 发送前支持由 AI 自动识别钉钉搜索目标姓名与预期发送对象是否一致，一致继续执行；非登录类确认与重试选择全流程默认自动同意确定，减少人工打断。
 
 - **AI 总结全链路提速防超时（体积直降 73% + 永不 500）**
   - 高清汇总截图智能缩放并择优编码为轻量图片（约缩减 **73%** 传输体积），纯软件操作咨询自动免传大图极速响应。

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.9.5 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.9.6 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
+import base64
 import copy
 import ctypes
 from ctypes import wintypes
@@ -21,6 +22,39 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 MAX_UI_BODY_BYTES = 2 * 1024 * 1024
+MAX_ANN_MEDIA_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_ANN_MEDIA_INLINE_BYTES = 500 * 1024
+MAX_ANN_MEDIA_DISK_KEEP = 20
+_ANN_MEDIA_FNAME_RE = re.compile(r"^([a-f0-9]{24})\.(mp4|webm|gif|webp|png|jpg|jpeg)$", re.IGNORECASE)
+_ANN_MEDIA_EXT_MIME = {
+    "mp4": ("video/mp4", "video"),
+    "webm": ("video/webm", "video"),
+    "gif": ("image/gif", "gif"),
+    "webp": ("image/webp", "gif"),
+    "png": ("image/png", "image"),
+    "jpg": ("image/jpeg", "image"),
+    "jpeg": ("image/jpeg", "image"),
+}
+
+
+def _validate_ann_media_bytes(raw_bytes):
+    """通过二进制魔数严格核验上传的横幅媒体格式，拦截伪装 HTML/SVG/脚本等危险载荷。"""
+    if not isinstance(raw_bytes, (bytes, bytearray)) or len(raw_bytes) < 6:
+        return "", "", ""
+    head = bytes(raw_bytes[:16])
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "gif", "image/gif", "gif"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp", "image/webp", "gif"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png", "image/png", "image"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "jpg", "image/jpeg", "image"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "mp4", "video/mp4", "video"
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        return "webm", "video/webm", "video"
+    return "", "", ""
 
 
 def _safe_int(val, default=0):
@@ -222,6 +256,11 @@ class _SheetMateController:
         self.last_run_str = "—"
         self.next_run_str = "—"
         self.next_run_ts = 0.0
+        self.next_raw_sync_str = "—"
+        self.next_raw_sync_ts = 0.0
+        self._last_paste_done_ts = 0.0
+        self._schedule_started_ts = 0.0
+        self._last_raw_skip_log = 0.0
         self.last_heartbeat = time.time()
         self.close_requested_at = 0.0
 
@@ -236,6 +275,9 @@ class _SheetMateController:
         self._vault_dirty = False
         self._applying_account_pull = False
         self._pending_ui_config_reload = False
+        self._pending_target_confirm = None
+        self._target_confirm_result = None
+        self._target_confirm_cond = threading.Condition(self._lock)
         self._run_started_at = 0.0
         self._run_mode = "full"
         self._run_trigger_type = "manual"
@@ -275,6 +317,8 @@ class _SheetMateController:
             app.set_spotlight_callback(self._on_data_spotlight)
         if hasattr(app, "set_training_summary_callback"):
             app.set_training_summary_callback(self._on_training_summary)
+        if hasattr(app, "set_target_confirm_callback"):
+            app.set_target_confirm_callback(self._on_wait_target_confirmation)
         self.attach_glass(glass, tk_root)
 
         threading.Thread(target=self._check_privilege_startup, daemon=True).start()
@@ -452,6 +496,7 @@ class _SheetMateController:
             self.ai_chat_history.append(dict(spot_item))
             if len(self.ai_chat_history) > 25:
                 self.ai_chat_history = self.ai_chat_history[-25:]
+            self._prune_old_chat_images_locked(2)
             self._chat_seq += 1
         if hasattr(self.app, "append_ai_chat_turn"):
             try:
@@ -465,6 +510,11 @@ class _SheetMateController:
                 )
             except Exception:
                 pass
+        if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+            try:
+                self.mobile_bridge.notify_state_changed(force_push=True)
+            except TypeError:
+                self.mobile_bridge.notify_state_changed()
         if spot.get("summary_line"):
             self._on_log(f"数据变化播报：{spot['summary_line']}")
 
@@ -488,6 +538,7 @@ class _SheetMateController:
             self.ai_chat_history.append(dict(item))
             if len(self.ai_chat_history) > 25:
                 self.ai_chat_history = self.ai_chat_history[-25:]
+            self._prune_old_chat_images_locked(2)
             self._chat_seq += 1
         if hasattr(self.app, "append_ai_chat_turn"):
             try:
@@ -501,6 +552,11 @@ class _SheetMateController:
                 )
             except Exception:
                 pass
+        if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+            try:
+                self.mobile_bridge.notify_state_changed(force_push=True)
+            except TypeError:
+                self.mobile_bridge.notify_state_changed()
 
     @staticmethod
     def _sanitize_config_for_client(cfg_dict):
@@ -767,10 +823,199 @@ class _SheetMateController:
             resumed, resume_msg = self.resume_current_task(act_id)
         return {
             "ok": True,
-            "config": saved,
+            "config": self._sanitize_config_for_client(saved),
             "applied": use_patch,
             "resumed": resumed,
             "message": f"已自调模块顺序并立即重试（{resume_msg}）" if resumed else "已自调内部模块顺序与等待秒数，下次运行立即生效",
+        }
+
+    def _prune_old_chat_images_locked(self, keep_max=2):
+        """仅保留最新若干条聊天消息中的截图 data URL，控制内存与跨端云中继包体体积。"""
+        kept = 0
+        for msg in reversed(self.ai_chat_history):
+            if isinstance(msg, dict) and msg.get("image_data_url"):
+                kept += 1
+                if kept > keep_max:
+                    msg.pop("image_data_url", None)
+
+    @staticmethod
+    def _sanitize_confirm_shot_url(raw_url):
+        s = str(raw_url or "").strip()
+        if len(s) > 140000:
+            return ""
+        if re.match(r"^data:image/(?:png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]{20,}$", s):
+            return s
+        return ""
+
+    def _on_wait_target_confirmation(self, info, timeout_sec=600):
+        """AI 桌面核对发现目标不一致时，向桌面和手机 AI 对话框推图并阻塞等待本人确认或换群。"""
+        inf = info if isinstance(info, dict) else {}
+        target_name = str(inf.get("target_name") or "").strip() or "目标对象"
+        opened_name = str(inf.get("opened_name") or "").strip() or "未能自动确认的会话"
+        reason = str(inf.get("reason") or "").strip() or "桌面钉钉对象与预设发送对象不一致"
+        cands = [str(c).strip() for c in (inf.get("candidates") or []) if str(c or "").strip()][:10]
+        shot_url = self._sanitize_confirm_shot_url(inf.get("image_data_url"))
+        pending_id = f"tc_{int(time.time() * 1000)}_{secrets.token_hex(3)}"
+        t_str = time.strftime("%H:%M:%S")
+        cand_hint = f"\n可选其他群/联系人：{'、'.join(cands[:6])}" if cands else ""
+        msg_txt = (
+            f"AI 桌面识屏发现钉钉对象可能不一致，请您本人看图确认：\n"
+            f"- 设定发送目标：「{target_name}」\n"
+            f"- 桌面当前看到：「{opened_name}」\n"
+            f"- 原因说明：{reason}{cand_hint}\n\n"
+            f"请直接点击下方按钮选择【确认仍发当前会话】、【改发其他群或个人】或【取消发送】；"
+            f"也可以直接在聊天框回复“确认发送”、“改发给 某群名”或“取消发送”。"
+        )
+        confirm_card = {
+            "pending_id": pending_id,
+            "target_name": target_name,
+            "opened_name": opened_name,
+            "reason": reason,
+            "candidates": cands,
+            "status": "pending",
+            "resolved_text": "",
+        }
+        with self._lock:
+            self._pending_target_confirm = {
+                "pending_id": pending_id,
+                "target_name": target_name,
+                "opened_name": opened_name,
+                "reason": reason,
+                "candidates": cands,
+                "image_data_url": shot_url,
+                "created_ts": time.time(),
+            }
+            self._target_confirm_result = None
+            prev_status = self.status_level
+            self.status_level = "paused"
+            self.step_text = f"等待本人看图确认钉钉对象：{target_name}"
+            chat_item = {
+                "role": "model",
+                "text": msg_txt,
+                "time": t_str,
+                "model": "",
+                "source": "target_confirm",
+                "shot_info": f"待确认：{target_name}",
+                "via": "pc",
+                "confirm_card": dict(confirm_card),
+            }
+            if shot_url:
+                chat_item["image_data_url"] = shot_url
+            self.ai_chat_history.append(chat_item)
+            if len(self.ai_chat_history) > 25:
+                self.ai_chat_history = self.ai_chat_history[-25:]
+            self._prune_old_chat_images_locked(2)
+            self._chat_seq += 1
+
+        if hasattr(self.app, "append_ai_chat_turn"):
+            try:
+                self.app.append_ai_chat_turn(
+                    "model",
+                    msg_txt,
+                    time_str=t_str,
+                    source="target_confirm",
+                    shot_info=f"待确认：{target_name}",
+                    via="pc",
+                )
+            except Exception:
+                pass
+        if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+            try:
+                self.mobile_bridge.notify_state_changed(force_push=True)
+            except TypeError:
+                self.mobile_bridge.notify_state_changed()
+
+        deadline = time.monotonic() + max(15.0, float(timeout_sec or 600))
+        final_res = {"action": "cancel_send", "reason": "timeout"}
+        with self._target_confirm_cond:
+            while time.monotonic() < deadline:
+                if self.stop_flag or getattr(self.app, "_stop_requested", False):
+                    final_res = {"action": "cancel_send", "reason": "stopped"}
+                    break
+                cur_res = self._target_confirm_result
+                if isinstance(cur_res, dict) and cur_res.get("pending_id") == pending_id:
+                    final_res = dict(cur_res)
+                    break
+                self._target_confirm_cond.wait(timeout=0.4)
+            if (self._pending_target_confirm or {}).get("pending_id") == pending_id:
+                self._pending_target_confirm = None
+                self._target_confirm_result = None
+                status_word = "stopped" if final_res.get("reason") == "stopped" else "cancelled"
+                resolved_desc = "任务已停止，自动取消待确认发送" if status_word == "stopped" else "等待确认超时，已自动取消本次发送"
+                for m in reversed(self.ai_chat_history):
+                    cc = m.get("confirm_card") if isinstance(m, dict) else None
+                    if isinstance(cc, dict) and cc.get("pending_id") == pending_id:
+                        cc["status"] = status_word
+                        cc["resolved_text"] = resolved_desc
+                        break
+                self._chat_seq += 1
+            if self.status_level == "paused" and not getattr(self.app, "_stop_requested", False):
+                self.status_level = "running" if (self.job_running or self.capture_running) else prev_status
+        if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+            try:
+                self.mobile_bridge.notify_state_changed(force_push=True)
+            except TypeError:
+                self.mobile_bridge.notify_state_changed()
+        return final_res
+
+    def resolve_target_confirmation(self, action, new_target="", pending_id="", source_device="pc", speaker_name=""):
+        act = str(action or "").strip()
+        if act not in ("confirm_send", "switch_target", "cancel_send"):
+            return {"ok": False, "message": "无效的确认操作类型"}
+        ntgt = str(new_target or "").strip()[:80]
+        if act == "switch_target" and not ntgt:
+            return {"ok": False, "message": "请先选择或输入要改发的群聊或联系人名称"}
+        dev_label = "手机端" if source_device == "mobile" else "电脑端"
+        who = f"{dev_label}{' · ' + speaker_name if speaker_name else ''}"
+        with self._target_confirm_cond:
+            pend = self._pending_target_confirm
+            if not isinstance(pend, dict) or not pend.get("pending_id"):
+                return {"ok": False, "message": "当前没有等待确认的钉钉发送核对"}
+            pid = str(pend["pending_id"])
+            if pending_id and str(pending_id).strip() != pid:
+                return {"ok": False, "message": "该确认卡片已处理或已过期"}
+            if act == "confirm_send":
+                st_tag = "confirmed"
+                res_txt = f"已由{who}确认：继续发往当前钉钉会话"
+                ret_msg = "已确认继续发送，正在继续执行粘贴与投递…"
+            elif act == "switch_target":
+                st_tag = "switched"
+                res_txt = f"已由{who}改发至：「{ntgt}」，正在重新搜索并核对"
+                ret_msg = f"已切换发送目标为「{ntgt}」，正在重搜并核对…"
+            else:
+                st_tag = "cancelled"
+                res_txt = f"已由{who}取消本次发送"
+                ret_msg = "已取消本次钉钉发送"
+            for m in reversed(self.ai_chat_history):
+                cc = m.get("confirm_card") if isinstance(m, dict) else None
+                if isinstance(cc, dict) and cc.get("pending_id") == pid:
+                    cc["status"] = st_tag
+                    cc["resolved_text"] = res_txt
+                    if act == "switch_target":
+                        cc["switched_to"] = ntgt
+                    break
+            self._target_confirm_result = {"pending_id": pid, "action": act, "new_target": ntgt}
+            self._pending_target_confirm = None
+            self.status_level = "running" if (self.job_running or self.capture_running) else "idle"
+            self.step_text = res_txt
+            self._chat_seq += 1
+            hist_snap = list(self.ai_chat_history)
+            seq_now = self._chat_seq
+            self._target_confirm_cond.notify_all()
+        self._on_log(f"👁️ [双端本人确认] {res_txt}")
+        if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+            try:
+                self.mobile_bridge.notify_state_changed(force_push=True)
+            except TypeError:
+                self.mobile_bridge.notify_state_changed()
+        return {
+            "ok": True,
+            "pending_id": pid,
+            "action": act,
+            "new_target": ntgt,
+            "message": ret_msg,
+            "history": hist_snap,
+            "chat_seq": seq_now,
         }
 
     def _append_chat_notice(self, text, source="task_done", shot_info="远程指令回执", meta=None):
@@ -861,6 +1106,59 @@ class _SheetMateController:
     def execute_ai_on_demand_task(self, cmd_res, speaker_name=""):
         if not isinstance(cmd_res, dict) or not cmd_res.get("handled"):
             return {"ok": False, "message": "无效指令"}
+        action = str(cmd_res.get("action") or "capture_send").strip()
+        if action in ("start_schedule", "stop_schedule"):
+            if action == "start_schedule" and self.hub is not None:
+                perms = self.hub.get_my_permissions()
+                if not perms.get("can_run", True):
+                    return {"ok": False, "message": "当前团队设置暂未开放本机启动运行权限"}
+            ok_s, msg_s, running_s = self.toggle_schedule(enable=(action == "start_schedule"))
+            return {"ok": bool(ok_s), "message": str(msg_s or ""), "schedule_running": bool(running_s)}
+
+        def _push_runtime_to_mobile():
+            if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+                try:
+                    self.mobile_bridge.notify_state_changed(force_push=True)
+                except TypeError:
+                    self.mobile_bridge.notify_state_changed()
+                except Exception:
+                    pass
+
+        if action == "pause_task":
+            ok_p, msg_p = self.pause_current_task()
+            if ok_p:
+                _push_runtime_to_mobile()
+            return {"ok": True, "runtime_changed": bool(ok_p), "paused": bool(ok_p), "message": str(msg_p or "")}
+
+        if action == "resume_task":
+            if self.hub is not None:
+                perms = self.hub.get_my_permissions()
+                if not perms.get("can_run", True):
+                    return {"ok": False, "message": "当前团队设置暂未开放本机启动运行权限"}
+            ok_r, msg_r = self.resume_current_task("continue")
+            if ok_r:
+                _push_runtime_to_mobile()
+            return {"ok": True, "runtime_changed": bool(ok_r), "resumed": bool(ok_r), "message": str(msg_r or "")}
+
+        if action == "cancel_task":
+            with self._lock:
+                was_active = bool(self.job_running or self.capture_running or self._pending_target_confirm)
+            if not was_active:
+                return {
+                    "ok": True,
+                    "runtime_changed": False,
+                    "cancelled": False,
+                    "message": "当前没有正在运行的任务，无需取消（如需关闭定时值守请说「停止自动值守」）。",
+                }
+            ok_c, msg_c = self.stop_current_task()
+            _push_runtime_to_mobile()
+            return {
+                "ok": True,
+                "runtime_changed": bool(ok_c),
+                "cancelled": bool(ok_c),
+                "message": str(msg_c or "已立即取消本轮任务"),
+            }
+
         if self.hub is not None:
             perms = self.hub.get_my_permissions()
             if not perms.get("can_run", True):
@@ -871,13 +1169,17 @@ class _SheetMateController:
             if not self._task_lock.acquire(blocking=False):
                 return {"ok": False, "message": "电脑当前正在执行任务，请稍候"}
 
-        action = cmd_res.get("action") or "capture_send"
         run_cfg = cmd_res.get("run_cfg") or self.get_config()
         targets = list(cmd_res.get("targets") or [])
         date_lbl = (cmd_res.get("date_spec") or {}).get("label") or "当前日期"
 
         if self.hub is not None:
-            lres = self.hub.acquire_run_lock(mode_label="AI即时指令", step_text=f"准备执行并发送到 {'、'.join(targets) or '钉钉'}…")
+            lock_step = (
+                f"准备执行并发送到 {'、'.join(targets)}…"
+                if targets
+                else "准备执行全流程抓数与写表…"
+            )
+            lres = self.hub.acquire_run_lock(mode_label="AI即时指令", step_text=lock_step)
             if not lres.get("ok"):
                 try:
                     self._task_lock.release()
@@ -887,7 +1189,22 @@ class _SheetMateController:
                 return {"ok": False, "message": f"「{holder.get('display_name') or '同事'}」正在使用表格，为防混乱已为您暂缓"}
 
         def _done_cb(ok_flag, err_tip=""):
-            tgt_txt = "、".join(targets) if targets else "指定会话"
+            tgt_txt = "、".join(targets)
+            if not tgt_txt:
+                if ok_flag:
+                    self._append_chat_notice(
+                        f"✅ 抓数与写表完成（{date_lbl}，未启用钉钉投递）。",
+                        source="task_done",
+                        shot_info="抓数写表完成",
+                        meta={"targets": [], "action": action},
+                    )
+                else:
+                    self._append_chat_notice(
+                        f"❌ 执行失败：{err_tip or '流程执行中断'}",
+                        source="task_done",
+                        shot_info="执行失败",
+                    )
+                return
             if ok_flag:
                 self._append_chat_notice(
                     f"✅ 已发送到钉钉「{tgt_txt}」（{date_lbl}）。",
@@ -935,7 +1252,11 @@ class _SheetMateController:
             if action == "run_full":
                 self.job_running = True
                 self._run_mode = "full"
-                self.step_text = f"AI 正在启动全流程跑表（目标：{'、'.join(targets)}）…"
+                self.step_text = (
+                    f"AI 正在启动全流程跑表（目标：{'、'.join(targets)}）…"
+                    if targets
+                    else "AI 正在启动全流程抓数与写表…"
+                )
                 worker_fn = self._run_once_worker
                 worker_args = ("即时", True, run_cfg, None, None, ep, _done_cb)
             else:
@@ -1023,8 +1344,52 @@ class _SheetMateController:
                 except Exception:
                     pass
             if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
-                self.mobile_bridge.notify_state_changed()
+                try:
+                    self.mobile_bridge.notify_state_changed(force_push=True)
+                except TypeError:
+                    self.mobile_bridge.notify_state_changed()
 
+        with self._lock:
+            has_pending_cfm = bool(self._pending_target_confirm)
+        if action == "send" and has_pending_cfm and clean_prompt and hasattr(self.app, "parse_target_confirm_chat_reply"):
+            cfm_cmd = self.app.parse_target_confirm_chat_reply(clean_prompt)
+            if isinstance(cfm_cmd, dict):
+                r_cfm = self.resolve_target_confirmation(
+                    cfm_cmd.get("action"),
+                    new_target=cfm_cmd.get("new_target", ""),
+                    source_device=source_device,
+                    speaker_name=eff_speaker,
+                )
+                if r_cfm.get("ok"):
+                    rep_cfm = r_cfm.get("message") or "已收到您的确认。"
+                    m_t = time.strftime("%H:%M:%S")
+                    with self._lock:
+                        self.ai_chat_history.append({
+                            "role": "model",
+                            "text": rep_cfm,
+                            "time": m_t,
+                            "model": "",
+                            "source": "target_confirm_reply",
+                            "shot_info": "双端看图确认回执",
+                            "via": "pc",
+                        })
+                        if len(self.ai_chat_history) > 25:
+                            self.ai_chat_history = self.ai_chat_history[-25:]
+                        self._prune_old_chat_images_locked(2)
+                        self._chat_seq += 1
+                        hist_out = list(self.ai_chat_history)
+                        seq_out = self._chat_seq
+                    return {
+                        "ok": True,
+                        "source": "target_confirm_reply",
+                        "model": "",
+                        "shot_info": "双端看图确认回执",
+                        "reply": rep_cfm,
+                        "history": hist_out,
+                        "chat_seq": seq_out,
+                    }
+
+        t_cmd_start = time.monotonic()
         on_demand_res = (
             self.app.try_handle_ai_on_demand_task(
                 clean_prompt,
@@ -1038,35 +1403,65 @@ class _SheetMateController:
             else {"handled": False}
         )
         if on_demand_res.get("handled"):
+            base_steps = list(on_demand_res.get("thinking_steps") or [])
+            el_now = round(max(0.0, time.monotonic() - t_cmd_start), 1)
             if on_demand_res.get("action") == "error_only":
                 res = {
                     "ok": True,
                     "source": "on_demand_not_found",
                     "model": "",
                     "shot_info": "未找到一对一联系人",
+                    "thinking_steps": base_steps or ["识别为即时执行指令，校验收信人失败并安全拦截"],
+                    "elapsed_sec": el_now,
                     "reply": on_demand_res["reply"],
                 }
             else:
                 exec_r = self.execute_ai_on_demand_task(on_demand_res, speaker_name=eff_speaker)
+                act_kind = str(on_demand_res.get("action") or "capture_send")
+                tgts = list(on_demand_res.get("targets") or [])
+                el_after = round(max(0.0, time.monotonic() - t_cmd_start), 1)
                 if exec_r.get("ok"):
+                    if act_kind in ("start_schedule", "stop_schedule"):
+                        shot_desc = "自动值守已开启" if exec_r.get("schedule_running") else "自动值守已停止"
+                        rep_txt = f"✅ {exec_r.get('message') or on_demand_res['reply']}"
+                    elif act_kind == "pause_task":
+                        shot_desc = "任务已暂停" if exec_r.get("paused") else "当前空闲"
+                        msg_u = exec_r.get("message") or on_demand_res["reply"]
+                        rep_txt = f"⏸ {msg_u}" if exec_r.get("paused") else f"ℹ️ {msg_u}"
+                    elif act_kind == "resume_task":
+                        shot_desc = "已恢复运行" if exec_r.get("resumed") else "当前空闲"
+                        msg_u = exec_r.get("message") or on_demand_res["reply"]
+                        rep_txt = f"▶ {msg_u}" if exec_r.get("resumed") else f"ℹ️ {msg_u}"
+                    elif act_kind == "cancel_task":
+                        shot_desc = "任务已取消" if exec_r.get("cancelled") else "当前空闲"
+                        msg_u = exec_r.get("message") or on_demand_res["reply"]
+                        rep_txt = f"🛑 {msg_u}" if exec_r.get("cancelled") else f"ℹ️ {msg_u}"
+                    else:
+                        shot_desc = f"已锁定 -> {'、'.join(tgts)}" if tgts else "已启动抓数与写表"
+                        rep_txt = on_demand_res["reply"]
                     res = {
                         "ok": True,
                         "source": "on_demand_task",
                         "model": "",
-                        "shot_info": f"已锁定 -> {'、'.join(on_demand_res.get('targets') or [])}",
-                        "reply": on_demand_res["reply"],
+                        "shot_info": shot_desc,
+                        "thinking_steps": (base_steps or [f"识别执行指令：{act_kind}"]) + [f"已真实拉起底层控制：{shot_desc}"],
+                        "elapsed_sec": el_after,
+                        "reply": rep_txt,
                         "on_demand_meta": {
-                            "targets": list(on_demand_res.get("targets") or []),
-                            "action": on_demand_res.get("action") or "capture_send",
+                            "targets": tgts,
+                            "action": act_kind,
                         },
                     }
                 else:
+                    blk_msg = exec_r.get("message", "当前有任务运行中")
                     res = {
                         "ok": True,
                         "source": "on_demand_blocked",
                         "model": "",
                         "shot_info": "任务暂缓",
-                        "reply": f"暂时未能启动：{exec_r.get('message', '当前有任务运行中')}",
+                        "thinking_steps": (base_steps or ["识别执行指令"]) + [f"触发前置拦截：{blk_msg}"],
+                        "elapsed_sec": el_after,
+                        "reply": f"暂时未能启动：{blk_msg}",
                     }
         else:
             cmd_res = (
@@ -1076,12 +1471,15 @@ class _SheetMateController:
             )
             if cmd_res.get("handled"):
                 save_out = self.save_config_checked(cmd_res["new_cfg"])
+                el_cfg = round(max(0.0, time.monotonic() - t_cmd_start), 1)
                 if save_out.get("ok"):
                     res = {
                         "ok": True,
                         "source": "config_setter",
                         "model": "",
                         "shot_info": "已修改配置 · 请核对下方确认",
+                        "thinking_steps": ["识别自然语言配置修改指令", "已自动解析排期与投递参数并写入保存"],
+                        "elapsed_sec": el_cfg,
                         "reply": cmd_res["reply"],
                         "updated_config": save_out["config"],
                         "updated_timetable": save_out["timetable"],
@@ -1093,6 +1491,8 @@ class _SheetMateController:
                         "source": "guardrail",
                         "model": "",
                         "shot_info": "团队标准设置保护",
+                        "thinking_steps": ["识别配置修改指令", "触发团队标准设置保护校验"],
+                        "elapsed_sec": el_cfg,
                         "reply": f"⚠️ {save_out.get('message', '当前该项采用团队标准设置，暂无需手动调整。')}\n\n如确需调整，可点击右上角【反馈】说明您的排期需求。",
                     }
             else:
@@ -1107,11 +1507,14 @@ class _SheetMateController:
                     else {"handled": False}
                 )
                 if mem_res.get("handled"):
+                    el_mem = round(max(0.0, time.monotonic() - t_cmd_start), 1)
                     res = {
                         "ok": True,
                         "source": mem_res.get("source") or "habit_memory",
                         "model": "",
                         "shot_info": mem_res.get("shot_info") or "本机长期记忆",
+                        "thinking_steps": ["识别个人长期偏好记忆指令", "已更新并持久化本机习惯档案"],
+                        "elapsed_sec": el_mem,
                         "reply": mem_res["reply"],
                     }
                 else:
@@ -1131,6 +1534,61 @@ class _SheetMateController:
                         chat_history=hist_snap,
                     ))
                     res["model"] = ""
+                    ai_act = res.pop("ai_action", None)
+                    if isinstance(ai_act, dict) and hasattr(self.app, "build_on_demand_task_from_ai_action"):
+                        act_cmd = self.app.build_on_demand_task_from_ai_action(
+                            ai_act,
+                            cfg_snap,
+                            speaker_name=eff_speaker,
+                            extra_roster=roster,
+                            is_local_speaker=is_local_speaker,
+                            chat_history=hist_snap,
+                        )
+                        cur_steps = list(res.get("thinking_steps") or [])
+                        cur_reply = str(res.get("reply") or "").strip()
+                        if act_cmd.get("handled"):
+                            if act_cmd.get("action") == "error_only":
+                                cur_steps.append("大模型触发执行动作，但联系人核验未通过已安全拦截")
+                                err_note = str(act_cmd.get("reply") or "未找到一对一匹配的发送对象").strip()
+                                res["reply"] = f"{cur_reply}\n\n{err_note}".strip()
+                                res["shot_info"] = "未找到一对一联系人"
+                            else:
+                                exec_r = self.execute_ai_on_demand_task(act_cmd, speaker_name=eff_speaker)
+                                act_k = str(act_cmd.get("action") or "run_full")
+                                tgts = list(act_cmd.get("targets") or [])
+                                if exec_r.get("ok"):
+                                    if act_k in ("start_schedule", "stop_schedule"):
+                                        exec_tip = f"✅ {exec_r.get('message') or ('已开启自动值守' if act_k == 'start_schedule' else '已停止自动值守')}"
+                                        res["shot_info"] = "自动值守已开启" if exec_r.get("schedule_running") else "自动值守已停止"
+                                    elif act_k == "pause_task":
+                                        msg_u = exec_r.get("message") or "已暂停当前任务"
+                                        exec_tip = f"⏸ {msg_u}" if exec_r.get("paused") else f"ℹ️ {msg_u}"
+                                        res["shot_info"] = "任务已暂停" if exec_r.get("paused") else "当前空闲"
+                                    elif act_k == "resume_task":
+                                        msg_u = exec_r.get("message") or "已恢复执行"
+                                        exec_tip = f"▶ {msg_u}" if exec_r.get("resumed") else f"ℹ️ {msg_u}"
+                                        res["shot_info"] = "已恢复运行" if exec_r.get("resumed") else "当前空闲"
+                                    elif act_k == "cancel_task":
+                                        msg_u = exec_r.get("message") or "已立即取消本轮任务"
+                                        exec_tip = f"🛑 {msg_u}" if exec_r.get("cancelled") else f"ℹ️ {msg_u}"
+                                        res["shot_info"] = "任务已取消" if exec_r.get("cancelled") else "当前空闲"
+                                    elif tgts:
+                                        tgt_label = "、".join(tgts)
+                                        exec_tip = f"⚡ 已正式拉起底层执行引擎（发送目标：{tgt_label}）。"
+                                        res["shot_info"] = f"已锁定 -> {tgt_label}"
+                                    else:
+                                        exec_tip = "⚡ 已正式拉起底层执行引擎（全流程抓数与写表）。"
+                                        res["shot_info"] = "已启动抓数与写表"
+                                    res["on_demand_meta"] = {"targets": tgts, "action": act_k}
+                                    cur_steps.append(f"通过动作协议真实启动：{act_k}")
+                                    res["reply"] = f"{cur_reply}\n\n{exec_tip}".strip() if cur_reply else exec_tip
+                                else:
+                                    blk_msg = exec_r.get("message") or "当前有任务运行中"
+                                    cur_steps.append(f"触发执行保护：{blk_msg}")
+                                    res["reply"] = f"{cur_reply}\n\n⚠️ 暂时未能启动：{blk_msg}".strip() if cur_reply else f"⚠️ 暂时未能启动：{blk_msg}"
+                                    res["shot_info"] = "任务暂缓"
+                            res["thinking_steps"] = cur_steps
+                            res["elapsed_sec"] = round(max(0.0, time.monotonic() - t_cmd_start), 1)
         reply_txt = str(res.get("reply") or "").strip()
         if self.hub is not None and reply_txt:
             try:
@@ -1140,6 +1598,8 @@ class _SheetMateController:
                 pass
         if reply_txt:
             m_time_str = time.strftime("%H:%M:%S")
+            t_steps = list(res.get("thinking_steps") or []) if isinstance(res.get("thinking_steps"), list) else []
+            e_sec = res.get("elapsed_sec")
             with self._lock:
                 model_msg = {
                     "role": "model",
@@ -1150,6 +1610,10 @@ class _SheetMateController:
                     "shot_info": res.get("shot_info", ""),
                     "via": "pc",
                 }
+                if t_steps:
+                    model_msg["thinking_steps"] = t_steps
+                if e_sec is not None:
+                    model_msg["elapsed_sec"] = e_sec
                 if isinstance(res.get("on_demand_meta"), dict):
                     model_msg["on_demand_meta"] = res["on_demand_meta"]
                 self.ai_chat_history.append(model_msg)
@@ -1168,12 +1632,68 @@ class _SheetMateController:
                         shot_info=res.get("shot_info", ""),
                         via="pc",
                         on_demand_meta=res.get("on_demand_meta") if isinstance(res.get("on_demand_meta"), dict) else None,
+                        thinking_steps=t_steps or None,
+                        elapsed_sec=e_sec,
                     )
                 except Exception:
                     pass
             if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
                 self.mobile_bridge.notify_state_changed()
         return res
+
+    def verify_dingtalk_target(self, target_name):
+        name_s = str(target_name or "").strip()
+        if not name_s:
+            return {"ok": False, "matched": False, "message": "请先输入要发送的群名或联系人名称"}
+        with self._lock:
+            if self.job_running or self.capture_running:
+                return {"ok": False, "matched": False, "message": "当前正在执行跑表或发送任务，请稍候完成后再试"}
+        if not hasattr(self.app, "verify_dingtalk_target_on_desktop"):
+            return {"ok": False, "matched": False, "message": "当前版本暂不支持 AI 桌面识屏核对"}
+        try:
+            res = self.app.verify_dingtalk_target_on_desktop(name_s, cfg=self.get_config(), close_search_after=True)
+            if isinstance(res, dict) and res.get("ok"):
+                if res.get("matched"):
+                    self._on_log(
+                        f"👁️ [AI 桌面识屏核对一致] 输入「{name_s}」→ 钉钉桌面确认「{res.get('matched_name') or name_s}」（关键词：{res.get('used_keyword') or name_s}）"
+                    )
+                else:
+                    self._on_log(
+                        f"👁️ [AI 桌面识屏核对未命中] 输入「{name_s}」→ {res.get('reason') or '钉钉搜索结果未见一致对象'}"
+                    )
+                    shot_p = self._sanitize_confirm_shot_url(res.get("preview_image_data_url"))
+                    if shot_p:
+                        cands_p = [str(x).strip() for x in (res.get("candidates") or []) if str(x or "").strip()]
+                        msg_p = (
+                            f"AI 识屏核对预检未命中「{name_s}」：\n"
+                            f"- 识别结果：{res.get('reason') or '搜索框未见一致对象'}\n"
+                            + (f"- 桌面看到的候选：{'、'.join(cands_p[:6])}\n" if cands_p else "")
+                            + "您可核对下方钉钉截图，改填上方准确的群名或点击候选名称替换。"
+                        )
+                        with self._lock:
+                            it_p = {
+                                "role": "model",
+                                "text": msg_p,
+                                "time": time.strftime("%H:%M:%S"),
+                                "model": "",
+                                "source": "target_verify_preview",
+                                "shot_info": f"核对预检：{name_s}",
+                                "via": "pc",
+                                "image_data_url": shot_p,
+                            }
+                            self.ai_chat_history.append(it_p)
+                            if len(self.ai_chat_history) > 25:
+                                self.ai_chat_history = self.ai_chat_history[-25:]
+                            self._prune_old_chat_images_locked(2)
+                            self._chat_seq += 1
+                        if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+                            try:
+                                self.mobile_bridge.notify_state_changed(force_push=True)
+                            except TypeError:
+                                self.mobile_bridge.notify_state_changed()
+            return res if isinstance(res, dict) else {"ok": False, "matched": False, "message": "识屏核对返回格式异常"}
+        except Exception as exc:
+            return {"ok": False, "matched": False, "message": f"识屏核对失败：{exc}"}
 
     def get_config(self):
         with self._lock:
@@ -1613,6 +2133,8 @@ class _SheetMateController:
                                 self._on_log("排队已轮到您，正在自动接棒开始执行…")
                                 if rtype == "capture":
                                     self.start_capture_only()
+                                elif rtype == "raw_sync":
+                                    self.start_raw_sync_now()
                                 else:
                                     self.start_run_now()
                             finally:
@@ -1801,6 +2323,15 @@ class _SheetMateController:
         b = body if isinstance(body, dict) else {}
         return self.hub.update_admin_credentials(b.get("passcode", ""), b.get("password", ""))
 
+    @staticmethod
+    def _public_global_logic(gl_dict):
+        """剥离超管下发中的 global_ai_api.api_key 等敏感凭据，安全透传公告栏等公共策略。"""
+        out = copy.deepcopy(gl_dict) if isinstance(gl_dict, dict) else {}
+        ai_blk = out.get("global_ai_api")
+        if isinstance(ai_blk, dict):
+            ai_blk.pop("api_key", None)
+        return out
+
     def get_state(self, since=0):
         remote_pulled = False
         bundle = None
@@ -1856,23 +2387,27 @@ class _SheetMateController:
                 "last_run_str": self.last_run_str,
                 "next_run_str": self.next_run_str,
                 "next_run_ts": self.next_run_ts,
+                "next_raw_sync_str": self.next_raw_sync_str,
+                "next_raw_sync_ts": self.next_raw_sync_ts,
                 "server_now": time.time(),
                 "log_seq": self._log_seq,
                 "logs": delta,
                 "update_info": self.update_info,
-                "data_brief": self.get_data_brief(),
                 "remote_config_pulled": remote_pulled,
                 "spotlight_seq": self._spotlight_seq,
                 "latest_spotlight": self.latest_spotlight,
                 "chat_seq": self._chat_seq,
-                "ai_history": list(self.ai_chat_history),
-                "mobile_info": self.mobile_bridge.get_brief_info() if self.mobile_bridge is not None else {"running": False},
-                "cloud_account": self.get_account_status_payload(),
+                "ai_history": [dict(x) if isinstance(x, dict) else x for x in self.ai_chat_history],
+                "pending_target_confirm": copy.deepcopy(self._pending_target_confirm),
             }
+        # 锁外计算磁盘统计/跨锁状态，彻底避免持 ctrl._lock 时读写磁盘或嵌套获取 mobile_bridge._lock
+        state_out["data_brief"] = self.get_data_brief()
+        state_out["mobile_info"] = self.mobile_bridge.get_brief_info() if self.mobile_bridge is not None else {"running": False}
+        state_out["cloud_account"] = self.get_account_status_payload()
         if isinstance(bundle, dict):
             state_out["member_profile"] = bundle.get("member_profile") or {}
             state_out["permissions"] = bundle.get("permissions") or {}
-            state_out["global_logic"] = bundle.get("global_logic") or {}
+            state_out["global_logic"] = self._public_global_logic(bundle.get("global_logic") or {})
             state_out["lock_status"] = bundle.get("lock_status") or {}
             state_out["queue_status"] = bundle.get("queue_status") or {}
             state_out["sync_settings"] = bundle.get("sync_settings") or {}
@@ -1880,7 +2415,7 @@ class _SheetMateController:
             try:
                 state_out["member_profile"] = self.hub.get_profile()
                 state_out["permissions"] = self.hub.get_my_permissions()
-                state_out["global_logic"] = self.hub.get_effective_global_overrides()
+                state_out["global_logic"] = self._public_global_logic(self.hub.get_effective_global_overrides())
                 state_out["lock_status"] = self.hub.get_lock_status()
                 state_out["queue_status"] = self.hub.poll_queue_turn()
                 state_out["sync_settings"] = self.hub.get_sync_settings()
@@ -1976,17 +2511,69 @@ class _SheetMateController:
         threading.Thread(target=self._capture_only_worker, args=(ep,), daemon=True).start()
         return {"ok": True, "message": "已开始仅截图发送"}
 
-    def _run_once_worker(self, round_name, owns_lock=True, run_cfg_override=None, trigger_lt=None, trigger_hm=None, run_epoch=None, on_done=None):
+    def start_raw_sync_now(self):
+        self._refresh_operator_name()
+        if self.hub is not None:
+            perms = self.hub.get_my_permissions()
+            if not perms.get("can_run", True):
+                return {"ok": False, "message": "当前团队设置暂未开放本机启动运行，如有需要请点右上角【反馈】提交说明"}
+        with self._lock:
+            if self.job_running or self.capture_running:
+                return {"ok": False, "message": "当前已有任务正在运行，请稍候"}
+            if not self._task_lock.acquire(blocking=False):
+                return {"ok": False, "message": "当前已有任务正在运行，请稍候"}
+        if self.hub is not None:
+            lres = self.hub.acquire_run_lock(mode_label="刷底表(仅三表+R4)", step_text="正在更新三份底表与 R4…")
+            if not lres.get("ok"):
+                try:
+                    self._task_lock.release()
+                except Exception:
+                    pass
+                holder = lres.get("locked_by") or {}
+                hname = holder.get("display_name") or "其他成员"
+                return {
+                    "ok": False,
+                    "locked": True,
+                    "locked_by": holder,
+                    "queue": lres.get("queue", []),
+                    "message": f"「{hname}」正在操作表格，为防撞车已为您暂缓",
+                }
+        rs_cfg = self.get_config()
+        rs_cfg["enable_capture"] = False
+        rs_cfg["enable_dingtalk"] = False
+        with self._lock:
+            self._run_epoch += 1
+            ep = self._run_epoch
+            self.job_running = True
+            self._holds_team_lock = True
+            self._run_started_at = time.time()
+            self._run_mode = "raw_sync"
+            self._run_trigger_type = "manual"
+            self.error_text = ""
+            self.error_detail = None
+            self.ai_result = None
+            self.status_level = "running"
+            self.progress = 0.02
+            self.step_text = "正在刷底表（仅三表+R4）…"
+        threading.Thread(
+            target=self._run_once_worker,
+            args=("手动刷底表", True, rs_cfg, None, None, ep, None, True),
+            daemon=True,
+        ).start()
+        return {"ok": True, "message": "已开始刷新三份底表并仅更新 R4（保留数据汇总其他格位）"}
+
+    def _run_once_worker(self, round_name, owns_lock=True, run_cfg_override=None, trigger_lt=None, trigger_hm=None, run_epoch=None, on_done=None, raw_sync_only=False):
         with self._lock:
             my_epoch = self._run_epoch if run_epoch is None else run_epoch
             started_ts = self._run_started_at or time.time()
             trig_type = self._run_trigger_type or ("schedule" if isinstance(round_name, int) else "manual")
         if self.glass is not None:
             self.glass.show()
-            self.glass.update_step(f"正在运行第 {round_name} 轮…", 0.02)
+            self.glass.update_step("正在刷新三份底表与 R4…" if raw_sync_only else f"正在运行第 {round_name} 轮…", 0.02)
         run_cfg = None
         ok_cb = False
         err_cb = ""
+        ev_mode = "raw_sync" if raw_sync_only else "full"
         try:
             if run_cfg_override is not None:
                 run_cfg = self._build_runtime_ai_cfg(self._apply_global_logic_to_cfg(run_cfg_override))
@@ -1995,12 +2582,20 @@ class _SheetMateController:
                 if isinstance(round_name, int) and not self.app.capture_allowed_now(run_cfg):
                     run_cfg["enable_capture"] = False
                     run_cfg["enable_dingtalk"] = False
-            if isinstance(round_name, int) and not run_cfg.get("enable_capture") and not run_cfg.get("enable_dingtalk"):
+            if raw_sync_only:
+                run_cfg["enable_capture"] = False
+                run_cfg["enable_dingtalk"] = False
+                self._on_step("正在刷新三份底表并写入 R4…")
+            elif isinstance(round_name, int) and not run_cfg.get("enable_capture") and not run_cfg.get("enable_dingtalk"):
                 self.app.log("  当前时间点按排期设置为仅更新表格（不截图发钉钉）")
                 self._on_step("按排期仅更新表格")
-            self.app.run_once(round_name, run_cfg, trigger_lt=trigger_lt, trigger_hm=trigger_hm)
+            self.app.run_once(round_name, run_cfg, trigger_lt=trigger_lt, trigger_hm=trigger_hm, raw_sync_only=raw_sync_only)
             ok_cb = True
-            done_text = "手动任务已完成" if not isinstance(round_name, int) else f"第 {round_name} 轮已完成"
+            self._last_paste_done_ts = time.time()
+            if raw_sync_only:
+                done_text = "三份底表与 R4 已更新"
+            else:
+                done_text = "手动任务已完成" if not isinstance(round_name, int) else f"第 {round_name} 轮已完成"
             with self._lock:
                 if self._run_epoch == my_epoch:
                     self.status_level = "ok"
@@ -2010,11 +2605,11 @@ class _SheetMateController:
                     self.error_detail = None
             if self.hub is not None and self._run_epoch == my_epoch:
                 try:
-                    self.hub.record_run_event(mode="full", trigger_type=trig_type, status="ok", duration_sec=max(1, int(time.time() - started_ts)))
+                    self.hub.record_run_event(mode=ev_mode, trigger_type=trig_type, status="ok", duration_sec=max(1, int(time.time() - started_ts)))
                 except Exception:
                     pass
             if self.glass is not None and self._run_epoch == my_epoch:
-                self.glass.finish("本轮已完成")
+                self.glass.finish(done_text if raw_sync_only else "本轮已完成")
                 self.glass.close(1100)
         except Exception as exc:
             err_cb = _strip_symbols(self.app.human_error(exc))
@@ -2327,6 +2922,15 @@ class _SheetMateController:
             self._task_lock = threading.Lock()
             if hasattr(self.app, "get_runtime_state"):
                 self.runtime_state = self.app.get_runtime_state()
+            if isinstance(self._pending_target_confirm, dict):
+                self._target_confirm_result = {
+                    "pending_id": self._pending_target_confirm.get("pending_id", ""),
+                    "action": "cancel_send",
+                    "reason": "stopped",
+                }
+                self._pending_target_confirm = None
+                self._chat_seq += 1
+            self._target_confirm_cond.notify_all()
         if rel_hub and self.hub is not None:
             try:
                 if was_running:
@@ -2369,8 +2973,9 @@ class _SheetMateController:
             night_gap = cfg["night"]["ih"] * 60 + cfg["night"]["im"]
             if day_gap < 1 or (cfg.get("night_enabled", True) and night_gap < 1):
                 return False, "白天或夜间的执行间隔不能为 0 分钟", False
-            if not self.app.build_daily_timetable(cfg):
-                return False, "当前未生成任何执行时间点，请检查时段配置", False
+            rs_on = bool((cfg.get("raw_sync") or {}).get("enabled"))
+            if not self.app.build_daily_timetable(cfg) and not rs_on:
+                return False, "当前未生成任何执行时间点且未开启定时刷底表，请检查配置", False
 
             self.schedule_running = True
             self.stop_flag = False
@@ -2407,7 +3012,10 @@ class _SheetMateController:
     def _schedule_loop(self):
         WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
         round_num = 1
+        raw_round_num = 1
         fired_keys = set()
+        if not self._schedule_started_ts:
+            self._schedule_started_ts = time.time()
         try:
             while not self.stop_flag:
                 cfg = self.get_config()
@@ -2419,7 +3027,27 @@ class _SheetMateController:
                 fired_keys = {k for k in fired_keys if k.startswith(today_prefix)}
 
                 found = self._compute_next_point(cfg, now_ts, fired_keys)
-                if found is None:
+                next_send_ts = found[0] if found else 0.0
+                rs_due = (
+                    self.app.compute_raw_sync_due(
+                        cfg,
+                        now_ts=now_ts,
+                        last_paste_ts=self._last_paste_done_ts,
+                        next_send_ts=next_send_ts,
+                        schedule_started_ts=self._schedule_started_ts,
+                    )
+                    if hasattr(self.app, "compute_raw_sync_due")
+                    else {"enabled": False, "due": False, "next_ts": 0.0, "interval_min": 40, "skipped_reason": ""}
+                )
+                with self._lock:
+                    if rs_due.get("enabled") and rs_due.get("next_ts", 0.0) > 0:
+                        self.next_raw_sync_ts = float(rs_due["next_ts"])
+                        self.next_raw_sync_str = time.strftime("%H:%M", time.localtime(self.next_raw_sync_ts))
+                    else:
+                        self.next_raw_sync_ts = 0.0
+                        self.next_raw_sync_str = "—"
+
+                if found is None and not rs_due.get("enabled"):
                     with self._lock:
                         if not self.job_running and not self.capture_running:
                             self.status_level = "idle"
@@ -2432,8 +3060,8 @@ class _SheetMateController:
                         time.sleep(1)
                     continue
 
-                pt_ts, date_key, pt, ready, day_off = found
-                if ready and not self.job_running and not self.capture_running:
+                pt_ts, date_key, pt, ready, day_off = found if found is not None else (0.0, "", {}, False, 0)
+                if found is not None and ready and not self.job_running and not self.capture_running:
                     can_run = True if self.hub is None else self.hub.get_my_permissions().get("can_run", True)
                     if not can_run:
                         if time.time() - self._last_sched_busy_log > 45:
@@ -2459,6 +3087,19 @@ class _SheetMateController:
                             run_cfg["enable_capture"] = bool(pt.get("do_capture", True))
                             run_cfg["enable_dingtalk"] = bool(pt.get("do_dingtalk", False))
                             run_cfg["dt_silent_send"] = bool(pt.get("do_silent", run_cfg.get("dt_silent_send", True)))
+                            pt_tgts = pt.get("targets_override")
+                            if isinstance(pt_tgts, list) and pt_tgts:
+                                clean_pt_tgts = [
+                                    {"name": str(t).strip(), "enabled": True}
+                                    for t in pt_tgts
+                                    if str(t or "").strip()
+                                ]
+                                if clean_pt_tgts:
+                                    run_cfg["dt_targets"] = clean_pt_tgts
+                                    run_cfg["dt_search"] = clean_pt_tgts[0]["name"]
+                                    self._on_log(
+                                        f"定时点 {pt['time']} 启用单点定向发送目标：{'、'.join(x['name'] for x in clean_pt_tgts)}"
+                                    )
 
                             nxt_after = self._compute_next_point(cfg, now_ts, fired_keys)
                             with self._lock:
@@ -2486,19 +3127,76 @@ class _SheetMateController:
                             round_num += 1
                             continue
 
-                pt_lt = time.localtime(pt_ts)
+                if rs_due.get("due") and not self.job_running and not self.capture_running:
+                    can_run_rs = True if self.hub is None else self.hub.get_my_permissions().get("can_run", True)
+                    if can_run_rs and self._task_lock.acquire(blocking=False):
+                        hub_ok_rs = True
+                        if self.hub is not None:
+                            lres_rs = self.hub.acquire_run_lock(
+                                mode_label=f"定时刷底表({raw_round_num})",
+                                step_text="定时刷新三份底表并仅写 R4…",
+                            )
+                            if not lres_rs.get("ok"):
+                                hub_ok_rs = False
+                                try:
+                                    self._task_lock.release()
+                                except Exception:
+                                    pass
+                        if hub_ok_rs:
+                            rs_run_cfg = self.get_config()
+                            rs_run_cfg["enable_capture"] = False
+                            rs_run_cfg["enable_dingtalk"] = False
+                            self._on_log(
+                                f"到达第 {raw_round_num} 次定时刷底表周期（间隔 {rs_due.get('interval_min', 40)} 分钟），开始仅更新三表与 R4（不动数据汇总其他格位）…"
+                            )
+                            with self._lock:
+                                self.job_running = True
+                                self._holds_team_lock = True
+                                self._run_started_at = time.time()
+                                self._run_mode = "raw_sync"
+                                self._run_trigger_type = "schedule"
+                                self.status_level = "running"
+                                self.progress = 0.02
+                                self.error_text = ""
+                                self.error_detail = None
+                                self.step_text = "定时刷底表中（仅三表+R4）…"
+                            self._run_once_worker(
+                                f"刷底表{raw_round_num}",
+                                owns_lock=True,
+                                run_cfg_override=rs_run_cfg,
+                                trigger_lt=now_lt,
+                                trigger_hm=time.strftime("%H:%M", now_lt),
+                                raw_sync_only=True,
+                            )
+                            raw_round_num += 1
+                            continue
+                elif rs_due.get("skipped_reason") and rs_due.get("enabled") and not self.job_running:
+                    if time.time() - self._last_raw_skip_log > 180:
+                        self._on_log(f"后台刷底表跳过说明：{rs_due['skipped_reason']}")
+                        self._last_raw_skip_log = time.time()
+
                 day_ok = self.app.is_run_day_allowed(cfg, now_lt)
-                with self._lock:
-                    if not self.job_running and not self.capture_running:
-                        self.status_level = "idle"
-                        if not day_ok:
-                            self.step_text = "今日不在运行周期，静默休眠中"
-                        elif day_off == 0:
-                            self.step_text = f"自动值守中（下一轮 {pt['time']}）"
-                        else:
-                            self.step_text = f"今日排期已结束（下轮 {WEEKDAYS[pt_lt.tm_wday]} {pt['time']}）"
-                    self.next_run_ts = pt_ts
-                    self.next_run_str = pt["time"] if day_off == 0 else f"{WEEKDAYS[pt_lt.tm_wday]} {pt['time']}"
+                rs_hint = f" · 刷底表约 {self.next_raw_sync_str}" if (rs_due.get("enabled") and self.next_raw_sync_str != "—") else ""
+                if found is None:
+                    with self._lock:
+                        if not self.job_running and not self.capture_running:
+                            self.status_level = "idle"
+                            self.step_text = f"定时刷底表值守中（下轮约 {self.next_raw_sync_str}）" if day_ok else "今日不在运行周期，静默休眠中"
+                        self.next_run_ts = self.next_raw_sync_ts
+                        self.next_run_str = self.next_raw_sync_str
+                else:
+                    pt_lt = time.localtime(pt_ts)
+                    with self._lock:
+                        if not self.job_running and not self.capture_running:
+                            self.status_level = "idle"
+                            if not day_ok:
+                                self.step_text = "今日不在运行周期，静默休眠中"
+                            elif day_off == 0:
+                                self.step_text = f"自动值守中（下一轮发群 {pt['time']}{rs_hint}）"
+                            else:
+                                self.step_text = f"今日发群已结束（下轮 {WEEKDAYS[pt_lt.tm_wday]} {pt['time']}{rs_hint}）"
+                        self.next_run_ts = pt_ts
+                        self.next_run_str = pt["time"] if day_off == 0 else f"{WEEKDAYS[pt_lt.tm_wday]} {pt['time']}"
 
                 for _ in range(5):
                     if self.stop_flag:
@@ -2512,6 +3210,9 @@ class _SheetMateController:
             self.schedule_running = False
             self.next_run_ts = 0.0
             self.next_run_str = "—"
+            self.next_raw_sync_ts = 0.0
+            self.next_raw_sync_str = "—"
+            self._schedule_started_ts = 0.0
             if not self.job_running and not self.capture_running:
                 self.status_level = "stopped"
                 self.step_text = "自动值守已停止"
@@ -2523,8 +3224,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/png" href="/icon.png?v=2.9.5" />
-<link rel="shortcut icon" href="/favicon.ico?v=2.9.5" />
+<link rel="icon" type="image/png" href="/icon.png?v=2.9.6" />
+<link rel="shortcut icon" href="/favicon.ico?v=2.9.6" />
 <style>
   :root {
     --bg: #EAF0F8;
@@ -2532,7 +3233,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                radial-gradient(780px 460px at 88% 4%, rgba(88, 86, 214, 0.11), transparent 64%),
                radial-gradient(740px 460px at 50% 108%, rgba(50, 173, 230, 0.10), transparent 62%);
     --shell-bg: rgba(255, 255, 255, 0.56);
-    --nav: rgba(247, 249, 254, 0.96);
+    --stage-sticky-bg: #F4F7FC;
+    --nav: rgba(247, 249, 254, 0.98);
     --tabbar: rgba(250, 251, 255, 0.96);
     --card: rgba(255, 255, 255, 0.96);
     --card-solid: #FFFFFF;
@@ -2569,7 +3271,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                radial-gradient(760px 440px at 88% 4%, rgba(94, 92, 230, 0.18), transparent 64%),
                radial-gradient(700px 460px at 50% 108%, rgba(50, 173, 230, 0.10), transparent 62%);
     --shell-bg: rgba(20, 24, 34, 0.78);
-    --nav: rgba(18, 22, 32, 0.96);
+    --stage-sticky-bg: #111622;
+    --nav: rgba(18, 22, 32, 0.98);
     --tabbar: rgba(24, 28, 38, 0.96);
     --card: rgba(26, 31, 44, 0.96);
     --card-solid: #1E222D;
@@ -2642,27 +3345,43 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
   }
 
-  /* 顶部固定导航 + 灵动岛（移除重开销高斯模糊，保证高刷零延迟点击） */
-  .top-header {
+  /* 统一顶部冻结区：主导航 + 全局模块直达 + 全员动效公告栏 */
+  .app-frozen-top {
     position: relative;
     flex-shrink: 0;
     z-index: 60;
-    padding: 12px 18px 10px;
     background: var(--nav);
-    border-bottom: 0.5px solid var(--sep);
-    border-radius: 26px 26px 0 0;
-    box-shadow: 0 3px 12px rgba(15, 32, 68, 0.05);
+    border-radius: 24px 24px 0 0;
+    border-bottom: 1px solid var(--sep);
+    box-shadow: 0 6px 18px rgba(15, 32, 68, 0.07);
     display: flex;
     flex-direction: column;
-    gap: 8px;
+  }
+  [data-theme="dark"] .app-frozen-top {
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.36);
+  }
+  .top-header {
+    position: relative;
+    flex-shrink: 0;
+    padding: 10px 18px 8px;
+    border-bottom: 0.5px solid var(--sep);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .frozen-bars-dock {
+    padding: 7px 18px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
   }
 
-  /* 下方独立滚动内容舞台 */
+  /* 下方独立滚动内容舞台（x 用 clip 防破坏 sticky 定位） */
   .scroll-stage {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    overflow-x: hidden;
+    overflow-x: clip;
     overscroll-behavior: contain;
     display: flex;
     flex-direction: column;
@@ -2952,7 +3671,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   /* 结构化报错大白话排障卡片（置顶可见） */
   .error-diag-card {
     display: none;
-    margin: 12px 18px 0;
+    margin: 10px 18px 0;
+    flex-shrink: 0;
     padding: 13px 15px;
     border-radius: 18px;
     background: linear-gradient(135deg, rgba(255, 59, 48, 0.08), rgba(255, 149, 0, 0.06));
@@ -3091,14 +3811,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   /* 主内容区域 & 双列 Bento 网格 */
   .main-content {
     flex: 1;
-    padding: 14px 18px 104px;
+    padding: 0 18px 104px;
+  }
+  @keyframes pane-fade-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
   }
   .tab-pane {
     display: none;
     flex-direction: column;
     gap: 14px;
   }
-  .tab-pane.active { display: flex; }
+  .tab-pane.active {
+    display: flex;
+    animation: pane-fade-in 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  #pane-home { padding-top: 12px; }
 
   .bento-grid {
     display: grid;
@@ -3151,6 +3879,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     gap: 14px;
     min-width: 0;
   }
+  .home-ai-col {
+    position: sticky;
+    top: 10px;
+    align-self: start;
+  }
   @media (max-width: 900px) {
     .kpi-ribbon-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .bento-grid.home-split { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
@@ -3158,6 +3891,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   @media (max-width: 680px) {
     .bento-grid, .bento-grid.home-split { grid-template-columns: 1fr; }
     .diag-cols { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 680px), (max-height: 620px) {
+    .home-ai-col { position: static; }
   }
 
   .ios-group, .cc-tile, .mini-stat-card, .ai-chat-card {
@@ -3752,22 +4488,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 10px;
-    padding: 8px 12px;
+    gap: 8px;
+    padding: 5px 10px;
     background: linear-gradient(125deg, rgba(48, 209, 88, 0.08), rgba(10, 132, 255, 0.08));
     border-bottom: 0.5px solid var(--sep);
-    font-size: 11.5px;
-    line-height: 1.48;
+    font-size: 11px;
+    line-height: 1.35;
     color: var(--text);
   }
   .remote-guide-strip strong { color: var(--blue); font-weight: 700; }
   .remote-guide-strip code {
     font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
     background: var(--fill-2);
-    padding: 1px 5px;
+    padding: 1px 4px;
     border-radius: 5px;
-    font-size: 11px;
+    font-size: 10.5px;
     color: var(--text);
+  }
+  .remote-guide-strip .mini-pill {
+    padding: 3px 8px;
+    font-size: 10.5px;
   }
   .ai-bubble.is-spotlight {
     background: linear-gradient(135deg, rgba(52, 199, 89, 0.14), rgba(10, 132, 255, 0.12));
@@ -3787,11 +4527,63 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     text-overflow: ellipsis;
     align-self: flex-start;
   }
+  .ai-card-hdr,
+  .ai-greeting-banner,
+  .remote-guide-strip,
+  .ai-team-bar,
+  .ai-resize-handle,
+  .ai-shortcuts-dock,
+  .ai-input-bar {
+    flex-shrink: 0;
+  }
+  .ai-shortcuts-dock {
+    background: var(--fill-2);
+    border-top: 0.5px solid var(--sep);
+  }
+  .ai-shortcuts-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--sub);
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .ai-shortcuts-head:hover { background: rgba(120, 130, 150, 0.08); color: var(--text); }
+  .ai-shortcuts-head-left { display: inline-flex; align-items: center; gap: 6px; }
+  .ai-shortcuts-chev {
+    width: 13px;
+    height: 13px;
+    transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+    transform: rotate(180deg);
+  }
+  .ai-shortcuts-dock.collapsed .ai-shortcuts-chev { transform: rotate(0deg); }
+  .ai-shortcuts-anim {
+    display: grid;
+    grid-template-rows: 1fr;
+    opacity: 1;
+    transition: grid-template-rows 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease;
+  }
+  .ai-shortcuts-dock.collapsed .ai-shortcuts-anim {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+  .ai-shortcuts-body {
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+    max-height: 185px;
+    border-top: 0.5px solid var(--sep);
+  }
+  .ai-shortcuts-dock.collapsed .ai-shortcuts-body { border-top-color: transparent; }
   .ai-style-bar {
-    padding: 9px 11px 7px;
+    padding: 5px 10px 4px;
     display: flex;
     flex-wrap: wrap;
-    gap: 6px;
+    gap: 5px;
     border-bottom: 0.5px solid var(--sep);
   }
   .ai-style-chip {
@@ -3799,9 +4591,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     background: var(--fill);
     color: var(--text);
     font-family: inherit;
-    font-size: 11.5px;
+    font-size: 11px;
     font-weight: 600;
-    padding: 5px 10px;
+    padding: 4px 9px;
     border-radius: 999px;
     cursor: pointer;
     transition: transform 0.16s var(--spring), background 0.16s, color 0.16s;
@@ -3811,16 +4603,55 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .ai-style-chip.accent { background: var(--pill-indigo); color: var(--indigo); }
 
   .ai-chat-feed {
-    height: 300px;
+    flex: 1 1 0;
+    min-height: 130px;
     overflow-y: auto;
     padding: 11px 13px;
     display: flex;
     flex-direction: column;
     gap: 9px;
     user-select: text;
+    scroll-behavior: smooth;
+  }
+  @media (max-width: 680px), (max-height: 620px) {
+    .ai-chat-card { overflow: visible !important; height: auto !important; }
+    .ai-chat-feed { flex: none; height: 320px; max-height: 460px; }
+    .ai-input-bar {
+      position: sticky;
+      bottom: 76px;
+      z-index: 32;
+      background: var(--card-solid) !important;
+      border-radius: 0 0 18px 18px;
+      box-shadow: 0 -6px 18px rgba(15, 32, 68, 0.12);
+    }
+  }
+  .ai-resize-handle {
+    height: 11px;
+    cursor: ns-resize;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--fill-2);
+    border-top: 0.5px solid var(--sep);
+    border-bottom: 0.5px solid var(--sep);
+    user-select: none;
+  }
+  .ai-resize-grip {
+    width: 38px;
+    height: 3px;
+    border-radius: 999px;
+    background: var(--sub);
+    opacity: 0.35;
+    transition: opacity 0.15s, background 0.15s, width 0.15s;
+  }
+  .ai-resize-handle:hover .ai-resize-grip,
+  .ai-resize-handle.dragging .ai-resize-grip {
+    opacity: 0.85;
+    background: var(--blue);
+    width: 56px;
   }
   .ai-qa-bar {
-    padding: 6px 11px 8px;
+    padding: 4px 10px 5px;
     display: flex;
     flex-wrap: wrap;
     gap: 5px;
@@ -3981,6 +4812,119 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .typing-dots span:nth-child(3) { animation-delay: 0.32s; }
   @keyframes typing-bounce { 0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; } 40% { transform: scale(1.0); opacity: 1; } }
 
+  .ai-bubble.thinking {
+    max-width: 94%;
+    background: linear-gradient(135deg, rgba(10, 132, 255, 0.08), rgba(88, 86, 214, 0.08));
+    border: 1px solid rgba(10, 132, 255, 0.25);
+    padding: 10px 12px;
+    animation: ai-think-glow 2.2s ease-in-out infinite;
+  }
+  @keyframes ai-think-glow {
+    0%, 100% { border-color: rgba(10, 132, 255, 0.22); }
+    50% { border-color: rgba(88, 86, 214, 0.48); }
+  }
+  .ai-think-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ai-think-cat {
+    width: 28px; height: 28px; flex-shrink: 0;
+    animation: ai-cat-hop 1.4s ease-in-out infinite;
+  }
+  .ai-think-cat .ai-ear-wiggle {
+    transform-origin: center;
+    animation: ai-ear-pop 1.4s ease-in-out infinite;
+  }
+  @keyframes ai-cat-hop {
+    0%, 100% { transform: translateY(0) rotate(0deg); }
+    45% { transform: translateY(-3px) rotate(-3deg); }
+    75% { transform: translateY(-1px) rotate(3deg); }
+  }
+  @keyframes ai-ear-pop {
+    0%, 100% { transform: scaleY(1); }
+    50% { transform: scaleY(1.07); }
+  }
+  .ai-think-title { font-size: 12.5px; font-weight: 700; color: var(--blue); }
+  .ai-think-dots { display: inline-flex; align-items: center; gap: 4px; }
+  .ai-think-dots span {
+    width: 6px; height: 6px; border-radius: 50%;
+    animation: typing-bounce 1.05s infinite ease-in-out;
+  }
+  .ai-think-dots span:nth-child(1) { background: #0A84FF; }
+  .ai-think-dots span:nth-child(2) { background: #5856D6; animation-delay: 0.16s; }
+  .ai-think-dots span:nth-child(3) { background: #30B0C7; animation-delay: 0.32s; }
+  .ai-think-timer {
+    margin-left: auto; font-size: 10.5px; font-weight: 700;
+    color: var(--sub); background: var(--fill);
+    padding: 2px 8px; border-radius: 999px;
+  }
+  .ai-think-steps {
+    margin-top: 7px; padding-top: 6px; border-top: 0.5px dashed rgba(10, 132, 255, 0.22);
+    display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--sub);
+  }
+  .ai-think-step { display: flex; align-items: center; gap: 6px; line-height: 1.38; }
+  .step-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .step-dot.step-done { background: var(--green); }
+  .step-dot.step-now { background: var(--blue); animation: ai-pulse-dot 1.1s infinite ease-in-out; }
+  .step-dot.step-wait { background: rgba(120, 120, 128, 0.35); }
+  @keyframes ai-pulse-dot { 0%, 100% { opacity: 0.45; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1.22); } }
+
+  .ai-thought-box {
+    margin-bottom: 7px; border-radius: 9px;
+    background: rgba(10, 132, 255, 0.06); border: 0.5px solid rgba(10, 132, 255, 0.18);
+    padding: 5px 9px; font-size: 11px;
+  }
+  .ai-thought-box summary {
+    cursor: pointer; list-style: none; display: flex; align-items: center; gap: 5px;
+    font-weight: 700; color: var(--blue); user-select: none; outline: none;
+  }
+  .ai-thought-box summary::-webkit-details-marker { display: none; }
+  .ai-thought-list {
+    margin-top: 5px; padding-top: 5px; border-top: 0.5px dashed rgba(10, 132, 255, 0.2);
+    display: flex; flex-direction: column; gap: 3px; color: var(--sub); line-height: 1.4;
+  }
+
+  .ai-popout-mask {
+    position: fixed; inset: 0; z-index: 940;
+    background: rgba(15, 23, 42, 0.42);
+    display: none; align-items: center; justify-content: center; padding: 14px;
+  }
+  .ai-popout-mask.show { display: flex; }
+  .ai-popout-win {
+    width: min(940px, 88vw); height: min(760px, 86vh);
+    min-width: 500px; min-height: 380px; max-width: 96vw; max-height: 94vh;
+    resize: both; overflow: hidden; display: flex; flex-direction: column;
+    border-radius: 18px; background: var(--card-solid);
+    box-shadow: 0 24px 64px rgba(15, 23, 42, 0.28);
+    border: 1px solid var(--sep); position: relative;
+  }
+  .ai-popout-win.is-max {
+    width: 96vw !important; height: 93vh !important;
+    transform: none !important; left: auto !important; top: auto !important;
+  }
+  .ai-popout-head {
+    padding: 10px 14px; display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; border-bottom: 0.5px solid var(--sep); background: var(--fill-2);
+    cursor: move; user-select: none; flex-shrink: 0;
+  }
+  .ai-popout-feed {
+    flex: 1; min-height: 140px; overflow-y: auto; padding: 14px 16px;
+    display: flex; flex-direction: column; gap: 10px; user-select: text;
+  }
+  .ai-popout-foot {
+    padding: 9px 12px; border-top: 0.5px solid var(--sep); background: var(--fill-2);
+    display: flex; flex-direction: column; gap: 6px; flex-shrink: 0;
+  }
+  .ai-popout-input-row { display: flex; align-items: flex-end; gap: 8px; }
+  .ai-popout-textarea {
+    flex: 1; min-width: 0; min-height: 38px; max-height: 140px; resize: vertical;
+    border: 0.5px solid var(--sep); outline: none; background: var(--card-solid);
+    color: var(--text); font-family: inherit; font-size: 13px; line-height: 1.45;
+    padding: 8px 11px; border-radius: 12px; user-select: text;
+  }
+  .ai-popout-resize-hint {
+    position: absolute; right: 3px; bottom: 2px; width: 10px; height: 10px;
+    pointer-events: none; opacity: 0.35;
+    background: linear-gradient(135deg, transparent 45%, var(--sub) 45%, var(--sub) 55%, transparent 55%, transparent 72%, var(--sub) 72%, var(--sub) 82%, transparent 82%);
+  }
+
   .ai-input-bar {
     padding: 8px 10px;
     border-top: 0.5px solid var(--sep);
@@ -4120,10 +5064,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tt-pill.dt-on { background: rgba(0, 122, 255, 0.12); color: var(--blue); }
   .tt-pill.suf-on { background: rgba(88, 86, 214, 0.13); color: var(--indigo); }
   .tt-pill.date-on { background: rgba(50, 173, 230, 0.15); color: #0B78A8; }
+  .tt-pill.tgt-on { background: rgba(255, 149, 0, 0.14); color: #C26700; }
   .tt-pill.off { background: var(--fill-2); color: var(--sub); }
   [data-theme="dark"] .tt-pill.cap-on { color: #30D158; }
   [data-theme="dark"] .tt-pill.suf-on { color: #9E9CFA; }
   [data-theme="dark"] .tt-pill.date-on { color: #64D2FF; }
+  [data-theme="dark"] .tt-pill.tgt-on { color: #FFB340; }
+  .tt-next-tag.extra { background: var(--purple); }
+  .tt-del-btn {
+    border: none;
+    background: rgba(255, 59, 48, 0.11);
+    color: var(--red);
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    font-size: 13px;
+    line-height: 1;
+    font-weight: 700;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: transform 0.15s var(--spring), background 0.15s;
+  }
+  .tt-del-btn:hover { background: rgba(255, 59, 48, 0.22); transform: scale(1.08); }
+  .tt-del-btn:active { transform: scale(0.9); }
 
   .tt-right-ctrl { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
   .tt-sil-wrap {
@@ -4193,7 +5159,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     padding: 0;
   }
   .tt-head-tools { display: flex; align-items: center; gap: 8px; }
-  .target-item-row { position: relative; display: flex; align-items: center; gap: 9px; padding: 8px 13px; }
+  .target-item-row { position: relative; display: flex; flex-direction: column; gap: 6px; padding: 8px 13px; }
+  .target-item-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .target-item-row + .target-item-row::before, .target-item-row + .ios-row::before, #dtTargetsList + .ios-row::before {
     content: "";
     position: absolute;
@@ -4215,6 +5182,49 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     font-weight: 600;
     user-select: text;
   }
+  .target-verify-btn {
+    border: none;
+    background: rgba(10, 132, 255, 0.12);
+    color: var(--blue);
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 5px 9px;
+    border-radius: 999px;
+    cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .target-verify-btn:hover { background: rgba(10, 132, 255, 0.20); }
+  .target-verify-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .target-verify-status {
+    margin-left: 48px;
+    padding: 6px 10px;
+    border-radius: 9px;
+    font-size: 11px;
+    line-height: 1.45;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    background: var(--fill-2);
+    color: var(--sub);
+  }
+  .target-verify-status.ok { background: rgba(52, 199, 89, 0.12); color: #1F8B4D; }
+  .target-verify-status.warn { background: rgba(255, 149, 0, 0.12); color: #B45309; }
+  .target-verify-status.loading { background: rgba(10, 132, 255, 0.10); color: var(--blue); }
+  .target-cand-chip {
+    border: 0.5px solid rgba(10, 132, 255, 0.35);
+    background: var(--card-solid);
+    color: var(--blue);
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .target-cand-chip:hover { background: rgba(10, 132, 255, 0.12); }
   .rule-card-row { position: relative; padding: 10px 13px; display: flex; flex-direction: column; gap: 7px; }
   .rule-card-row + .rule-card-row::before, .rule-card-row + .ios-row::before, .ios-row + .rule-card-row::before {
     content: "";
@@ -4329,7 +5339,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     pointer-events: auto;
     position: relative;
     width: 100%;
-    max-width: 520px;
+    max-width: 620px;
     height: 58px;
     padding: 5px 7px;
     border-radius: 999px;
@@ -4337,7 +5347,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     border: 0.5px solid var(--sep-strong);
     box-shadow: 0 8px 22px rgba(15, 32, 68, 0.14);
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, 1fr);
     align-items: center;
   }
   .tab-pill-bg {
@@ -4345,10 +5355,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     top: 5px;
     bottom: 5px;
     left: 7px;
-    width: calc((100% - 14px) / 4);
+    width: calc((100% - 14px) / 5);
     border-radius: 999px;
     background: var(--pill-blue);
-    transition: transform 0.18s var(--ease);
+    transition: transform 0.28s cubic-bezier(0.22, 1, 0.36, 1);
     pointer-events: none;
   }
   .tab-btn {
@@ -4372,6 +5382,662 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tab-btn.active svg { transform: translateY(-1px) scale(1.06); }
   .tab-btn span { font-size: 10.5px; font-weight: 600; }
   .tab-btn.active { color: var(--blue); }
+
+  /* ==================== 全局快捷定位条 + 冻结云同步公告栏 + 粘性子导航 & 图解页 ==================== */
+  .global-qnav-wrap {
+    margin: 0;
+    padding: 5px 10px;
+    border-radius: 13px;
+    background: var(--card);
+    border: 0.5px solid var(--sep);
+    box-shadow: 0 2px 8px rgba(15, 32, 68, 0.04);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    flex-shrink: 0;
+  }
+  .global-qnav-wrap::-webkit-scrollbar { display: none; }
+  .qnav-lbl {
+    font-size: 11px;
+    font-weight: 800;
+    color: var(--blue);
+    white-space: nowrap;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: var(--pill-blue);
+    flex-shrink: 0;
+  }
+  .qnav-list { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; }
+  .qnav-pill {
+    border: 0.5px solid var(--sep);
+    background: var(--fill-2);
+    color: var(--text-2);
+    font-family: inherit;
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 999px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.16s, color 0.16s, border-color 0.16s, transform 0.16s var(--spring);
+  }
+  .qnav-pill:hover { background: var(--pill-blue); color: var(--blue); border-color: rgba(0, 122, 255, 0.35); transform: translateY(-1px); }
+  .qnav-pill.guide-accent { background: rgba(255, 149, 0, 0.12); color: var(--orange); border-color: rgba(255, 149, 0, 0.32); }
+
+  /* 顶部全员冻结多效公告栏 */
+  .ann-bar {
+    --ann-bg: linear-gradient(125deg, rgba(10, 132, 255, 0.12), rgba(88, 86, 214, 0.09));
+    --ann-border: rgba(10, 132, 255, 0.30);
+    --ann-badge-bg: linear-gradient(135deg, #007AFF, #4F46E5);
+    --ann-badge-fg: #FFFFFF;
+    --ann-fg: #0F2557;
+    --ann-grad: linear-gradient(90deg, #0055D4 0%, #0EA5E9 35%, #6366F1 68%, #0055D4 100%);
+    --ann-glow: rgba(10, 132, 255, 0.48);
+    --ann-dur: 4.2s;
+    --ann-marquee-dur: 18s;
+    position: relative;
+    min-height: 44px;
+    padding: 8px 14px;
+    border-radius: 14px;
+    background: var(--ann-bg);
+    border: 1px solid var(--ann-border);
+    box-shadow: 0 4px 14px rgba(15, 32, 68, 0.06);
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    overflow: hidden;
+    transition: background 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+  }
+  [data-theme="dark"] .ann-bar {
+    --ann-fg: #E0ECFF;
+    --ann-grad: linear-gradient(90deg, #60A5FA 0%, #38BDF8 35%, #A78BFA 68%, #60A5FA 100%);
+  }
+  .ann-bar.ann-hidden { display: none; }
+  .ann-bar.ann-is-disabled-preview { opacity: 0.56; }
+
+  .ann-theme-amber {
+    --ann-bg: linear-gradient(125deg, rgba(255, 149, 0, 0.14), rgba(245, 158, 11, 0.09));
+    --ann-border: rgba(245, 158, 11, 0.36);
+    --ann-badge-bg: linear-gradient(135deg, #F59E0B, #EA580C);
+    --ann-fg: #7C2D12;
+    --ann-grad: linear-gradient(90deg, #B45309 0%, #F59E0B 35%, #EA580C 68%, #B45309 100%);
+    --ann-glow: rgba(245, 158, 11, 0.52);
+  }
+  [data-theme="dark"] .ann-theme-amber {
+    --ann-fg: #FEF3C7;
+    --ann-grad: linear-gradient(90deg, #FCD34D 0%, #FB923C 45%, #FDE68A 75%, #FCD34D 100%);
+  }
+  .ann-theme-emerald {
+    --ann-bg: linear-gradient(125deg, rgba(16, 185, 129, 0.13), rgba(20, 184, 166, 0.09));
+    --ann-border: rgba(16, 185, 129, 0.35);
+    --ann-badge-bg: linear-gradient(135deg, #10B981, #0D9488);
+    --ann-fg: #064E3B;
+    --ann-grad: linear-gradient(90deg, #047857 0%, #10B981 36%, #0D9488 70%, #047857 100%);
+    --ann-glow: rgba(16, 185, 129, 0.48);
+  }
+  [data-theme="dark"] .ann-theme-emerald {
+    --ann-fg: #D1FAE5;
+    --ann-grad: linear-gradient(90deg, #34D399 0%, #2DD4BF 45%, #6EE7B7 75%, #34D399 100%);
+  }
+  .ann-theme-rose {
+    --ann-bg: linear-gradient(125deg, rgba(244, 63, 94, 0.13), rgba(251, 113, 133, 0.09));
+    --ann-border: rgba(244, 63, 94, 0.36);
+    --ann-badge-bg: linear-gradient(135deg, #F43F5E, #E11D48);
+    --ann-fg: #881337;
+    --ann-grad: linear-gradient(90deg, #BE123C 0%, #F43F5E 38%, #EC4899 72%, #BE123C 100%);
+    --ann-glow: rgba(244, 63, 94, 0.50);
+  }
+  [data-theme="dark"] .ann-theme-rose {
+    --ann-fg: #FFE4E6;
+    --ann-grad: linear-gradient(90deg, #FDA4AF 0%, #FB7185 45%, #F472B6 75%, #FDA4AF 100%);
+  }
+  .ann-theme-violet {
+    --ann-bg: linear-gradient(125deg, rgba(139, 92, 246, 0.14), rgba(168, 85, 247, 0.09));
+    --ann-border: rgba(139, 92, 246, 0.35);
+    --ann-badge-bg: linear-gradient(135deg, #8B5CF6, #7C3AED);
+    --ann-fg: #4C1D95;
+    --ann-grad: linear-gradient(90deg, #6D28D9 0%, #A855F7 38%, #EC4899 72%, #6D28D9 100%);
+    --ann-glow: rgba(139, 92, 246, 0.50);
+  }
+  [data-theme="dark"] .ann-theme-violet {
+    --ann-fg: #EDE9FE;
+    --ann-grad: linear-gradient(90deg, #C4B5FD 0%, #E879F9 45%, #F472B6 75%, #C4B5FD 100%);
+  }
+  .ann-theme-obsidian {
+    --ann-bg: linear-gradient(125deg, #161C2C, #232B42);
+    --ann-border: rgba(251, 191, 36, 0.42);
+    --ann-badge-bg: linear-gradient(135deg, #F59E0B, #D97706);
+    --ann-badge-fg: #111827;
+    --ann-fg: #FEF3C7;
+    --ann-grad: linear-gradient(90deg, #FDE68A 0%, #FBBF24 38%, #FFFFFF 68%, #FDE68A 100%);
+    --ann-glow: rgba(251, 191, 36, 0.62);
+  }
+
+  .ann-size-sm .ann-text-seg { font-size: 12.5px; }
+  .ann-size-md .ann-text-seg { font-size: 14px; }
+  .ann-size-lg .ann-text-seg { font-size: 15.5px; }
+
+  .ann-speed-slow { --ann-dur: 7s; --ann-marquee-dur: 26s; }
+  .ann-speed-normal { --ann-dur: 4.2s; --ann-marquee-dur: 17s; }
+  .ann-speed-fast { --ann-dur: 2.3s; --ann-marquee-dur: 10s; }
+
+  .ann-h-normal { min-height: 46px; }
+  .ann-h-tall { min-height: 74px; }
+  .ann-h-cinema { min-height: 108px; }
+
+  .ann-media-layer {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    border-radius: inherit;
+    pointer-events: none;
+    display: none;
+    background: #0B1220;
+  }
+  .ann-bar.ann-has-media .ann-media-layer { display: block; }
+  .ann-media-item {
+    width: 100%;
+    height: 100%;
+    display: block;
+    object-fit: cover;
+  }
+  .ann-bar.ann-fit-contain .ann-media-item { object-fit: contain; }
+
+  .ann-media-scrim {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    border-radius: inherit;
+    pointer-events: none;
+    display: none;
+    background: linear-gradient(90deg, rgba(8, 14, 28, 0.64) 0%, rgba(8, 14, 28, 0.34) 50%, rgba(8, 14, 28, 0.54) 100%);
+  }
+  .ann-bar.ann-has-media.ann-text-overlay .ann-media-scrim { display: block; }
+  .ann-bar.ann-has-media.ann-text-overlay {
+    border-color: rgba(255, 255, 255, 0.24);
+  }
+  .ann-bar.ann-has-media.ann-text-overlay .ann-text-seg,
+  .ann-bar.ann-has-media.ann-text-overlay .ann-meta {
+    color: #FFFFFF;
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.72);
+    -webkit-text-fill-color: #FFFFFF;
+  }
+  .ann-bar.ann-has-media.ann-text-overlay.ann-fx-gradient .ann-text-seg {
+    background-image: linear-gradient(90deg, #FFFFFF 0%, #BAE6FD 40%, #FDE68A 72%, #FFFFFF 100%);
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    text-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  }
+  .ann-bar.ann-text-hide .ann-left,
+  .ann-bar.ann-text-hide .ann-viewport,
+  .ann-bar.ann-text-hide .ann-meta {
+    display: none;
+  }
+  .ann-bar.ann-has-media.ann-text-hide {
+    padding: 0;
+  }
+
+  .ann-mute-btn {
+    position: relative;
+    z-index: 3;
+    flex-shrink: 0;
+    display: none;
+    align-items: center;
+    gap: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    background: rgba(15, 23, 42, 0.76);
+    color: #FFFFFF;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 3px 9px;
+    border-radius: 999px;
+    cursor: pointer;
+    pointer-events: auto;
+  }
+  .ann-mute-btn.show { display: inline-flex; }
+  .ann-bar.ann-text-hide .ann-mute-btn.show {
+    position: absolute;
+    right: 10px;
+    bottom: 8px;
+  }
+  .ann-mute-btn svg { width: 12px; height: 12px; }
+
+  /* 3 款免流量纯 CSS 横幅动态背景（纯 GPU 合成，零磨砂滤镜开销） */
+  @keyframes ann-bg-pan-kf {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
+  @keyframes ann-wave-slide-kf {
+    0% { transform: translate3d(-35%, 0, 0) scaleY(1); opacity: 0.48; }
+    50% { transform: translate3d(15%, 0, 0) scaleY(1.06); opacity: 0.85; }
+    100% { transform: translate3d(-35%, 0, 0) scaleY(1); opacity: 0.48; }
+  }
+  .ann-anim-canvas {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    overflow: hidden;
+  }
+  .ann-anim-aurora {
+    background: linear-gradient(115deg, #071936 0%, #0EA5E9 28%, #4F46E5 56%, #10B981 82%, #071936 100%);
+    background-size: 260% 260%;
+    animation: ann-bg-pan-kf 9s ease infinite;
+  }
+  .ann-anim-aurora::after {
+    content: "";
+    position: absolute;
+    inset: -20% -30%;
+    background: radial-gradient(ellipse at center, rgba(186, 230, 253, 0.36) 0%, transparent 62%);
+    animation: ann-wave-slide-kf 7s ease-in-out infinite;
+  }
+  .ann-anim-pulse_wave {
+    background: linear-gradient(120deg, #1E1B4B 0%, #6D28D9 35%, #EC4899 68%, #1E1B4B 100%);
+    background-size: 240% 240%;
+    animation: ann-bg-pan-kf 7.5s ease infinite;
+  }
+  .ann-anim-pulse_wave::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.22) 50%, transparent 100%);
+    animation: ann-wave-slide-kf 5.2s linear infinite;
+  }
+  .ann-anim-gold_ribbon {
+    background: linear-gradient(115deg, #0F172A 0%, #78350F 28%, #F59E0B 52%, #92400E 78%, #0F172A 100%);
+    background-size: 260% 260%;
+    animation: ann-bg-pan-kf 8s ease infinite;
+  }
+  .ann-anim-gold_ribbon::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(105deg, transparent 25%, rgba(254, 240, 138, 0.30) 50%, transparent 75%);
+    animation: ann-wave-slide-kf 6s ease-in-out infinite;
+  }
+
+  .ann-left { position: relative; z-index: 2; display: inline-flex; align-items: center; gap: 7px; flex-shrink: 0; }
+  .ann-icon-wrap {
+    width: 24px;
+    height: 24px;
+    border-radius: 8px;
+    background: var(--ann-badge-bg);
+    color: var(--ann-badge-fg);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .ann-icon-wrap svg { width: 13px; height: 13px; }
+  .ann-badge {
+    font-size: 11px;
+    font-weight: 800;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: var(--ann-badge-bg);
+    color: var(--ann-badge-fg);
+    letter-spacing: 0.2px;
+    white-space: nowrap;
+  }
+  .ann-viewport {
+    position: relative;
+    z-index: 2;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+  }
+  .ann-track {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-width: 0;
+  }
+  .ann-text-seg {
+    font-weight: 700;
+    line-height: 1.45;
+    color: var(--ann-fg);
+    word-break: break-word;
+    user-select: text;
+  }
+  .ann-meta {
+    position: relative;
+    z-index: 2;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--ann-fg);
+    opacity: 0.68;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  /* 6种动态文字效果 */
+  @keyframes ann-marquee-kf {
+    0% { transform: translate3d(0, 0, 0); }
+    100% { transform: translate3d(-50%, 0, 0); }
+  }
+  .ann-fx-marquee .ann-track {
+    width: max-content;
+    white-space: nowrap;
+    animation: ann-marquee-kf var(--ann-marquee-dur) linear infinite;
+    will-change: transform;
+  }
+  .ann-fx-marquee:hover .ann-track { animation-play-state: paused; }
+  .ann-fx-marquee .ann-text-seg {
+    white-space: nowrap;
+    flex-shrink: 0;
+    min-width: 280px;
+    padding-right: 64px;
+  }
+
+  @keyframes ann-grad-kf {
+    0% { background-position: 0% 50%; }
+    100% { background-position: 200% 50%; }
+  }
+  .ann-fx-gradient .ann-text-seg {
+    background-image: var(--ann-grad);
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    animation: ann-grad-kf var(--ann-dur) linear infinite;
+  }
+
+  @keyframes ann-pulse-kf {
+    0%, 100% { opacity: 0.72; transform: scale(0.992); }
+    50% { opacity: 1; transform: scale(1.012); }
+  }
+  .ann-fx-pulse .ann-text-seg {
+    transform-origin: left center;
+    animation: ann-pulse-kf var(--ann-dur) ease-in-out infinite;
+  }
+  .ann-fx-pulse .ann-icon-wrap {
+    animation: ann-pulse-kf var(--ann-dur) ease-in-out infinite;
+  }
+
+  @keyframes ann-glow-kf {
+    0%, 100% { text-shadow: 0 0 2px transparent; opacity: 0.88; }
+    50% { text-shadow: 0 0 12px var(--ann-glow), 0 0 22px var(--ann-glow); opacity: 1; }
+  }
+  .ann-fx-glow .ann-text-seg {
+    animation: ann-glow-kf var(--ann-dur) ease-in-out infinite;
+  }
+
+  @keyframes ann-typewriter-kf {
+    0% { clip-path: inset(0 100% 0 0); opacity: 0.92; }
+    52%, 90% { clip-path: inset(0 0 0 0); opacity: 1; }
+    100% { clip-path: inset(0 100% 0 0); opacity: 0.88; }
+  }
+  .ann-fx-typewriter .ann-text-seg {
+    display: inline-block;
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    border-right: 2px solid var(--ann-fg);
+    padding-right: 4px;
+    animation: ann-typewriter-kf var(--ann-dur) ease-in-out infinite;
+  }
+
+  /* 子页粘性本页快跳栏（钉钉投递 / 定时计划 / 记录账号） */
+  .sub-qnav-sticky {
+    position: sticky;
+    top: 0;
+    z-index: 35;
+    margin: 0 -18px;
+    padding: 10px 18px 8px;
+    background: var(--stage-sticky-bg);
+  }
+  .sub-qnav-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 7px 11px;
+    border-radius: 13px;
+    background: var(--card);
+    border: 0.5px solid var(--sep);
+    box-shadow: 0 4px 12px rgba(15, 32, 68, 0.06);
+  }
+  .sub-qnav-bar .qnav-lbl { font-size: 11px; }
+  @media (max-width: 720px) { .ann-meta { display: none; } }
+  @keyframes focus-pulse-ring {
+    0% { box-shadow: 0 0 0 0 rgba(0, 122, 255, 0.55); }
+    65% { box-shadow: 0 0 0 6px rgba(0, 122, 255, 0.10); }
+    100% { box-shadow: 0 0 0 0 rgba(0, 122, 255, 0); }
+  }
+  .module-focus-pulse {
+    outline: 2px solid var(--blue) !important;
+    outline-offset: 2px;
+    border-radius: 16px;
+    animation: focus-pulse-ring 1.1s ease-out 2;
+  }
+  .ios-row:focus-within, .rule-input-box:focus-within, .field-inline:focus-within, .target-input-wrap:focus-within {
+    box-shadow: inset 0 0 0 1.5px rgba(0, 122, 255, 0.36);
+    border-radius: 10px;
+  }
+  .top-notice-banner.confirm-wait {
+    background: linear-gradient(90deg, rgba(255, 149, 0, 0.18), rgba(255, 204, 0, 0.12));
+    border: 1px solid rgba(255, 149, 0, 0.55);
+    color: var(--text);
+  }
+  .ai-shot-wrap {
+    margin: 8px 0 4px;
+    border-radius: 11px;
+    overflow: hidden;
+    border: 1px solid rgba(0, 122, 255, 0.28);
+    background: #0F172A;
+    cursor: pointer;
+    transition: transform 0.16s var(--spring), box-shadow 0.16s;
+  }
+  .ai-shot-wrap:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(0, 122, 255, 0.18); }
+  .ai-shot-img { display: block; width: 100%; max-height: 220px; object-fit: contain; background: #0F172A; }
+  .ai-shot-cap {
+    padding: 4px 9px;
+    font-size: 11px;
+    color: #E2E8F0;
+    background: rgba(15, 23, 42, 0.90);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .ai-confirm-card {
+    margin-top: 8px;
+    padding: 10px 11px;
+    border-radius: 12px;
+    background: rgba(255, 149, 0, 0.10);
+    border: 1px solid rgba(255, 149, 0, 0.38);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .ai-confirm-card.done {
+    background: rgba(40, 205, 65, 0.08);
+    border-color: rgba(40, 205, 65, 0.30);
+  }
+  .ai-confirm-hdr { font-size: 12px; font-weight: 700; color: var(--orange); }
+  .ai-confirm-card.done .ai-confirm-hdr { color: var(--green); }
+  .ai-confirm-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+  .ai-confirm-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .ai-confirm-chip {
+    border: 0.5px solid rgba(0, 122, 255, 0.35);
+    background: var(--pill-blue);
+    color: var(--blue);
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .ai-confirm-row { display: flex; gap: 6px; align-items: center; }
+  .ai-confirm-row input {
+    flex: 1;
+    min-width: 0;
+    border: 0.5px solid var(--sep-strong);
+    background: var(--card-solid);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 6px 9px;
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+  }
+  .img-zoom-mask {
+    position: fixed;
+    inset: 0;
+    z-index: 160;
+    background: rgba(8, 12, 20, 0.90);
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+    gap: 10px;
+  }
+  .img-zoom-mask.show { display: flex; }
+  .img-zoom-img {
+    max-width: 92vw;
+    max-height: 82vh;
+    border-radius: 14px;
+    object-fit: contain;
+    box-shadow: 0 20px 46px rgba(0, 0, 0, 0.55);
+    background: #0F172A;
+  }
+  .img-zoom-tip { color: #E2E8F0; font-size: 12.5px; }
+
+  /* 手绘图解与新手上手页面样式 + 顶部三步冻结条 */
+  .guide-sticky-header {
+    position: sticky;
+    top: 0;
+    z-index: 35;
+    margin: 0 -18px;
+    padding: 10px 18px 10px;
+    background: var(--stage-sticky-bg);
+    border-bottom: 1px solid var(--sep);
+    box-shadow: 0 6px 16px rgba(15, 32, 68, 0.06);
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+  [data-theme="dark"] .guide-sticky-header {
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.36);
+  }
+  .sketch-board {
+    border-radius: 20px;
+    padding: 15px;
+    background-color: var(--card);
+    background-image: radial-gradient(rgba(100, 116, 139, 0.18) 1px, transparent 1px);
+    background-size: 16px 16px;
+    border: 1.5px dashed rgba(0, 122, 255, 0.32);
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .sketch-hero {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding-bottom: 8px;
+    border-bottom: 1.5px dashed var(--sep-strong);
+  }
+  .sketch-title { font-size: 16.5px; font-weight: 800; color: var(--text); letter-spacing: -0.3px; }
+  .sketch-sub { font-size: 12px; color: var(--sub); margin-top: 2px; }
+  .sketch-3steps {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 9px;
+  }
+  @media (max-width: 780px) {
+    .sketch-3steps { grid-template-columns: 1fr; }
+    .guide-sticky-header { position: static; margin: 0; padding: 10px 0 8px; box-shadow: none; }
+  }
+  @media (max-height: 660px) {
+    .guide-sticky-header { position: static; }
+  }
+  .sketch-step-note {
+    background: var(--card-solid);
+    border: 1.5px solid var(--sep-strong);
+    border-radius: 14px;
+    padding: 9px 11px;
+    box-shadow: 3px 3px 0 rgba(0, 122, 255, 0.12);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .sketch-step-note.warm { box-shadow: 3px 3px 0 rgba(255, 149, 0, 0.15); }
+  .sketch-step-note.mint { box-shadow: 3px 3px 0 rgba(40, 205, 65, 0.15); }
+  .sketch-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 9px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 800;
+    background: var(--pill-blue);
+    color: var(--blue);
+    align-self: flex-start;
+  }
+  .sketch-svg-box {
+    width: 100%;
+    overflow-x: auto;
+    border-radius: 16px;
+    border: 1.5px dashed rgba(88, 86, 214, 0.34);
+    background: var(--card-solid);
+    padding: 10px;
+  }
+  .sketch-svg-node { cursor: pointer; transition: opacity 0.15s; }
+  .sketch-svg-node:hover { opacity: 0.86; }
+  .sketch-grid-cards {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+  @media (max-width: 760px) { .sketch-grid-cards { grid-template-columns: 1fr; } }
+  .sketch-mod-card {
+    background: var(--card-solid);
+    border: 1.5px solid var(--sep-strong);
+    border-radius: 16px;
+    padding: 13px 14px;
+    box-shadow: 3px 4px 0 rgba(15, 32, 68, 0.08);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .sketch-mod-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .sketch-mod-left { display: flex; align-items: center; gap: 9px; }
+  .sketch-mod-ico {
+    width: 34px;
+    height: 34px;
+    border-radius: 11px;
+    border: 1.5px dashed rgba(0, 122, 255, 0.45);
+    background: var(--pill-blue);
+    color: var(--blue);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .sketch-mod-list {
+    margin: 0;
+    padding-left: 16px;
+    font-size: 12px;
+    color: var(--text-2);
+    line-height: 1.6;
+  }
 
   /* 弹窗、双轮选择器、双列单点微调弹窗（零重负载模糊） */
   .sheet-mask {
@@ -4582,7 +6248,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     justify-content: space-between;
     gap: 12px;
     padding: 10px 14px;
-    margin-bottom: 10px;
+    margin: 10px 18px 0;
+    flex-shrink: 0;
     border-radius: 15px;
     border: 0.5px solid var(--sep);
     background: var(--card);
@@ -4675,7 +6342,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     width: 8px;
     height: 8px;
     border-radius: 999px;
-    background: var(--sub2);
+    background: var(--sub-2);
     flex-shrink: 0;
     transition: background .2s ease;
   }
@@ -4886,13 +6553,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div class="shell">
-    <!-- 顶部粘性导航 + 灵动岛（固定不滚动） -->
+    <!-- 全局顶部冻结区（主导航 + 模块直达 + 全员云同步动效公告栏，所有页签永不随页面下滑） -->
+    <div class="app-frozen-top" id="appFrozenTop">
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.9.5" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.9.6" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.9.5</span>
+          <span class="ver-pill" id="verBadge">v2.9.6</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -4972,6 +6640,45 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
     </header>
+    <div class="frozen-bars-dock">
+      <!-- 全局全模块直达快捷导航条 -->
+      <div class="global-qnav-wrap" id="globalQuickNavBar">
+        <span class="qnav-lbl">模块直达</span>
+        <div class="qnav-list">
+          <button type="button" class="qnav-pill" data-mjump="home" data-mtarget="#homeControlCard">运行总控</button>
+          <button type="button" class="qnav-pill" data-mjump="home" data-mtarget="#aiCardBox" data-mfocus="#aiChatInput">AI 管家对话</button>
+          <button type="button" class="qnav-pill" data-mjump="dingtalk" data-mtarget="#dtTargetsCard" data-mfocus="#dtTargetsList input[type=text]">钉钉目标群</button>
+          <button type="button" class="qnav-pill" data-mjump="dingtalk" data-mtarget="#dtMsgCard" data-mfocus="#dtSuffix">文案与后缀</button>
+          <button type="button" class="qnav-pill" data-mjump="dingtalk" data-mtarget="#summaryPresetsSection" data-mfocus="#utCellInput">格位与日期</button>
+          <button type="button" class="qnav-pill" data-mjump="dingtalk" data-mtarget="#dtPolicyCard">贴等与静音开关</button>
+          <button type="button" class="qnav-pill" data-mjump="schedule" data-mtarget="#scheduleSlotCard">值守排期</button>
+          <button type="button" class="qnav-pill" data-mjump="schedule" data-mtarget="#timetableCard">今日时间表</button>
+          <button type="button" class="qnav-pill" data-mjump="more" data-mtarget="#sourceAccountCard" data-mfocus="#wpsUrl">表格与账号</button>
+          <button type="button" class="qnav-pill" data-mjump="more" data-mtarget="#logCardBox">运行日志</button>
+          <button type="button" class="qnav-pill guide-accent" data-mjump="guide" data-mtarget="#pane-guide">手绘图解教程</button>
+        </div>
+      </div>
+
+      <!-- 全员云同步多效顶部公告栏（后台更新后全员所有电脑同步展示） -->
+      <div class="ann-bar ann-theme-ocean ann-fx-gradient ann-size-md ann-speed-normal ann-h-normal" id="globalAnnouncementBar" role="region" aria-label="全员公告栏">
+        <div class="ann-media-layer" id="globalAnnMediaLayer"></div>
+        <div class="ann-media-scrim" id="globalAnnScrim"></div>
+        <div class="ann-left">
+          <span class="ann-icon-wrap" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-9.33-4.98L4 6.5v11l4.67 3.48A6 6 0 0 0 18 16"/><path d="M4 9.5H2.5a1.5 1.5 0 0 0 0 3H4"/><path d="M18 10.5c1 .9 1 2.1 0 3"/></svg>
+          </span>
+          <span class="ann-badge" id="globalAnnBadge">全员公告</span>
+        </div>
+        <div class="ann-viewport" id="globalAnnViewport">
+          <div class="ann-track" id="globalAnnTrack">
+            <span class="ann-text-seg" id="globalAnnTextA">欢迎使用暗号表助手！超级管理员可在总控后台实时编辑全员公告与文字动态效果，所有电脑将自动同步显示。</span>
+          </div>
+        </div>
+        <span class="ann-meta" id="globalAnnMeta"></span>
+        <button type="button" class="ann-mute-btn" id="globalAnnMuteBtn" title="切换横幅视频静音状态">已静音</button>
+      </div>
+    </div>
+    </div>
 
     <div class="scroll-stage" id="scrollStage">
     <!-- 超级管理员预览他人页面横幅 -->
@@ -5014,6 +6721,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- AI 识屏不一致等待本人看图确认横幅 -->
+    <div class="top-notice-banner confirm-wait" id="targetConfirmBanner">
+      <div class="notice-left">
+        <span class="ver-pill" style="background:rgba(255,149,0,0.25);color:#FF9500;font-weight:800;">看图确认</span>
+        <div>
+          <strong id="targetConfirmBannerTitle">AI 桌面识屏发现钉钉对象可能不一致，请您确认</strong>
+          <div style="font-size:11.5px;color:var(--sub);" id="targetConfirmBannerSub">已截取桌面钉钉画面发送到桌面 AI 对话框及手机网页端</div>
+        </div>
+      </div>
+      <div class="notice-actions">
+        <button class="mini-pill active" id="targetConfirmJumpBtn" type="button">立即看图确认</button>
+      </div>
+    </div>
+
     <!-- 结构化错误码 + 大白话修障卡片（仅遇错/待恢复时自动弹出） -->
     <div class="error-diag-card" id="errorDiagCard">
       <div class="diag-head">
@@ -5052,7 +6773,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <main class="main-content">
       <!-- Tab 1: 控制台（顶部4列全景数据看板 · 左列执行与格位矩阵 · 右列全能AI管家） -->
       <section class="tab-pane active" id="pane-home">
-        <div class="kpi-ribbon-4">
+        <div class="kpi-ribbon-4" id="homeKpiRibbon">
           <div class="kpi-card" id="kpiRegCard">
             <div class="mini-stat-top">
               <span class="mini-stat-title">数据概览</span>
@@ -5099,7 +6820,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
 
         <div class="bento-grid home-split">
-          <div class="bento-col">
+          <div class="bento-col" id="homeControlCard">
             <button class="hero-action" id="btnNow">
               <div class="hero-copy">
                 <div class="hero-title">立即开始全流程</div>
@@ -5182,9 +6903,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
           </div>
 
-          <!-- 控制台右列：内置全能 AI 智能管家 & 历次数据综合分析工作台 -->
-          <div class="bento-col">
-            <div class="ai-chat-card">
+          <!-- 控制台右列：内置全能 AI 智能管家 & 历次数据综合分析工作台（贴底冻结固定） -->
+          <div class="bento-col home-ai-col" id="homeAiCol">
+            <div class="ai-chat-card" id="aiCardBox">
               <div class="ai-card-hdr">
                 <div class="ai-hdr-top">
                   <div class="ai-hdr-left">
@@ -5244,6 +6965,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                   </div>
                   <div style="display:flex;align-items:center;gap:5px;flex-shrink:0;">
+                    <button class="mini-pill active" id="aiPopoutBtn" type="button" style="white-space:nowrap;display:inline-flex;align-items:center;gap:4px;" title="打开可自由移动缩放的独立大对话窗口"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg><span>放大弹窗</span></button>
                     <button class="mini-pill" id="aiSuggestBtn" type="button" style="white-space:nowrap;">数据自检</button>
                     <button class="mini-pill" id="aiClearChatBtn" type="button" style="color:var(--sub);white-space:nowrap;">清空</button>
                   </div>
@@ -5258,12 +6980,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
 
               <div class="remote-guide-strip" id="remoteGuideStrip">
-                <div style="flex:1;min-width:0;">
-                  <strong>云端异地连电脑：</strong>无论身在何处，用手机或电脑打开 <code>https://sorenskr.github.io/SheetMate/</code>，填上您的名字和远程密码，就能异地对话查数据、遥控跑表。
+                <div style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="无论身在何处，打开下方网址填上名字和远程密码就能异地遥控查数据">
+                  <strong>云端远程：</strong><code>https://sorenskr.github.io/SheetMate/</code> <span style="color:var(--sub);">填名字和密码即可手机遥控</span>
                 </div>
-                <div style="display:flex;gap:5px;flex-shrink:0;">
+                <div style="display:flex;gap:4px;flex-shrink:0;">
                   <button type="button" class="mini-pill active" id="copyGithubGuideBtn">复制网址</button>
-                  <button type="button" class="mini-pill" id="openMobileGuideModalBtn">扫码/改密码</button>
+                  <button type="button" class="mini-pill" id="openMobileGuideModalBtn">扫码/改密</button>
                 </div>
               </div>
 
@@ -5279,36 +7001,59 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <button type="button" class="mini-pill" id="aiClearTeamBtn" title="恢复所有团队公平汇报">全部组</button>
               </div>
 
-              <div class="ai-style-bar" id="aiStyleChips"></div>
-              <div class="ai-qa-bar" id="aiConfigTplBar" style="margin-bottom:4px;">
-                <button class="ai-style-chip" type="button" data-ai-tpl="帮我设置每周一到周五 9点到18点每2小时把昨天数据静音自动发送到「目标群名」">模板：工作日定时发</button>
-                <button class="ai-style-chip" type="button" data-ai-tpl="帮我设置每天上午 09:30 把昨天数据静音自动发送到「文件小助手」，粘贴等待 5 秒">模板：每天定点发昨天</button>
-                <button class="ai-style-chip" type="button" data-ai-tpl="帮我设置每周一、周三、周五 10点到20点每2小时发送，L3单元格写入「慕杰组」，发到「数据日报群」">模板：自选星期+写格位</button>
-                <button class="ai-style-chip" type="button" data-ai-tpl="帮我把钉钉目标群改成「运营群1、运营群2」，粘贴前等待 4 秒并开启静音发送">模板：改群名与等待秒</button>
-              </div>
-              <div class="ai-qa-bar" id="aiQuickQaBar">
-                <button class="ai-style-chip accent" type="button" data-ai-q="你是谁？用的是什么AI，能帮我做什么？">你是谁/能干嘛</button>
-                <button class="ai-style-chip accent" type="button" data-ai-q="请结合历史运行记录，分析最近一次为什么失败、和之前成功有什么不同，并给我一段直接发给 Antigravity 改代码和调整模块顺序的指令">复盘报错 &amp; 写 Antigravity 指令</button>
-                <button class="ai-style-chip accent" type="button" data-ai-q="怎么自己定义在表格哪个单元格里写什么内容？">怎么自定义单元格</button>
-                <button class="ai-style-chip accent" type="button" data-ai-q="汇报一下当前软件配置状态与最新数据概况">当前状态概览</button>
-                <button class="ai-style-chip accent" type="button" data-ai-q="结合历史数据档案，对比各团队和前几名个人最近的数据表现">查团队/个人档案</button>
-              </div>
-              <div class="ai-phrases-wrap" id="aiCustomPhrasesWrap" style="display:none;">
-                <span class="ai-phrases-lbl">我的话术：</span>
-                <div class="ai-qa-bar" id="aiCustomPhrasesBar" style="margin-bottom:0;"></div>
-              </div>
-
               <div class="ai-chat-feed" id="aiChatFeed">
                 <div class="ai-empty-guide" id="aiEmptyGuide">
                   我是「暗号表助手」内置智能助手。您可以：<br/>
-                  1. 点上方任意总结模板或快捷提问胶囊，也可点击左上角小猫头像让我陪你聊句元气工作鼓励；<br/>
+                  1. 点下方任意总结模板或快捷提问胶囊，也可点击左上角小猫头像让我陪你聊句元气工作鼓励；<br/>
                   2. 直接提问软件用法（如“怎么在 I4 格自动填入内容”）、当前状态或排障问题，每次跑完表我也会第一时间告诉你关键数据涨跌变化；<br/>
-                  3. 点名追问任意团队或成员数据（或在上方输入/掷骰子选组名），我会自动结合历次归档档案公平分析。
+                  3. 点名追问任意团队或成员数据（或在上方输入/掷骰子选组名），我会自动结合历次归档档案公平分析；点击右上角【放大弹窗】或拖拽下方横杠可自由放大对话视野。
+                </div>
+              </div>
+              <div class="ai-resize-handle" id="aiFeedResizeHandle" title="按住上下拖动，自由调整对话框高度">
+                <span class="ai-resize-grip"></span>
+              </div>
+
+              <div class="ai-shortcuts-dock collapsed" id="aiShortcutsDock">
+                <div class="ai-shortcuts-head" id="aiShortcutsHead" title="点击展开或收起快捷总结模板与常用提问">
+                  <span class="ai-shortcuts-head-left">
+                    <svg class="ai-shortcuts-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 15 12 9 18 15"/></svg>
+                    <span>快捷总结与常用提问</span>
+                  </span>
+                  <button type="button" class="mini-pill" id="aiShortcutsToggleBtn" style="padding:2px 9px;font-size:10.5px;">展开</button>
+                </div>
+                <div class="ai-shortcuts-anim">
+                <div class="ai-shortcuts-body">
+                  <div class="ai-style-bar" id="aiStyleChips"></div>
+                  <div class="ai-qa-bar" id="aiConfigTplBar">
+                    <button class="ai-style-chip" type="button" data-ai-tpl="帮我在定时计划里新增一个每天 14:30 发到「目标群名」，发日期+时间，内容写「午间数据情况」，非静音">加定时：某点发某群(日期+时间)</button>
+                    <button class="ai-style-chip" type="button" data-ai-tpl="帮我在定时计划里新增一个每天 09:00 发昨天数据到「目标群名」，只发年月日日期，内容写「昨日数据情况」">加定时：某点发昨天(年月日)</button>
+                    <button class="ai-style-chip" type="button" data-ai-tpl="帮我在定时计划里新增一个每天 21:15 静音发到「目标群名」，发日期+时间，内容写「晚间数据情况」">加定时：晚间静音发指定群</button>
+                    <button class="ai-style-chip" type="button" data-ai-tpl="帮我删除定时计划里 14:30 的自定义时间点">删定时：移除自定义时间点</button>
+                    <button class="ai-style-chip" type="button" data-ai-tpl="帮我设置每周一到周五 9点到18点每2小时把昨天数据静音自动发送到「目标群名」">模板：工作日定时发</button>
+                    <button class="ai-style-chip" type="button" data-ai-tpl="帮我设置每周一、周三、周五 10点到20点每2小时发送，L3单元格写入「慕杰组」，发到「数据日报群」">模板：自选星期+写格位</button>
+                    <button class="ai-style-chip" type="button" data-ai-tpl="帮我把钉钉目标群改成「运营群1、运营群2」，粘贴前等待 4 秒并开启静音发送">模板：改群名与等待秒</button>
+                    <button class="ai-style-chip" type="button" data-ai-tpl="每隔40分钟从后台下载三表粘贴到WPS，不要改数据汇总其他内容，只把粘贴时间写到R4">刷底表：每40分只写R4</button>
+                  </div>
+                  <div class="ai-qa-bar" id="aiQuickQaBar">
+                    <button class="ai-style-chip accent" type="button" data-ai-q="暂停运行">运行中暂停</button>
+                    <button class="ai-style-chip accent" type="button" data-ai-q="继续运行">恢复继续跑</button>
+                    <button class="ai-style-chip accent" type="button" data-ai-q="取消当前任务">取消当前任务</button>
+                    <button class="ai-style-chip accent" type="button" data-ai-q="你是谁？用的是什么AI，能帮我做什么？">你是谁/能干嘛</button>
+                    <button class="ai-style-chip accent" type="button" data-ai-q="请结合历史运行记录，分析最近一次为什么失败、和之前成功有什么不同，并给我一段直接发给 Antigravity 改代码和调整模块顺序的指令">复盘报错 &amp; 写 Antigravity 指令</button>
+                    <button class="ai-style-chip accent" type="button" data-ai-q="怎么自己定义在表格哪个单元格里写什么内容？">怎么自定义单元格</button>
+                    <button class="ai-style-chip accent" type="button" data-ai-q="汇报一下当前软件配置状态与最新数据概况">当前状态概览</button>
+                    <button class="ai-style-chip accent" type="button" data-ai-q="结合历史数据档案，对比各团队和前几名个人最近的数据表现">查团队/个人档案</button>
+                  </div>
+                  <div class="ai-phrases-wrap" id="aiCustomPhrasesWrap" style="display:none;">
+                    <span class="ai-phrases-lbl">我的话术：</span>
+                    <div class="ai-qa-bar" id="aiCustomPhrasesBar" style="margin-bottom:0;"></div>
+                  </div>
+                </div>
                 </div>
               </div>
 
               <div class="ai-input-bar">
-                <input type="text" id="aiChatInput" placeholder="随时提问：你是谁 / 怎么自定义格位 / 某某某数据怎么样 / 总结今日表…" />
+                <input type="text" id="aiChatInput" placeholder="随时提问：暂停运行 / 继续运行 / 取消当前任务 / 总结今日表…" />
                 <button class="mini-pill" id="saveAiPhraseBtn" type="button" title="把输入框当前句子存为常用话术，登录账号后跨电脑自动同步">存话术</button>
                 <button class="ai-send-btn" id="aiSendBtn" type="button">发送</button>
               </div>
@@ -5319,9 +7064,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <!-- Tab 2: 钉钉投递（左：会话与消息时间AI附发 · 右：汇总表预设与双列行为开关） -->
       <section class="tab-pane" id="pane-dingtalk">
+        <div class="sub-qnav-sticky">
+          <div class="sub-qnav-bar">
+            <span class="qnav-lbl">本页快跳</span>
+            <button type="button" class="qnav-pill" data-mjump="dingtalk" data-mtarget="#dtTargetsCard" data-mfocus="#dtTargetsList input[type=text]">1. 目标会话与 AI 识屏</button>
+            <button type="button" class="qnav-pill" data-mjump="dingtalk" data-mtarget="#dtMsgCard">2. 日期时间格式</button>
+            <button type="button" class="qnav-pill" data-mjump="dingtalk" data-mtarget="#dtSuffixCard" data-mfocus="#dtSuffix">3. 时段后缀</button>
+            <button type="button" class="qnav-pill" data-mjump="dingtalk" data-mtarget="#summaryPresetsSection" data-mfocus="#utCellInput">4. 格位与日期偏移</button>
+            <button type="button" class="qnav-pill" data-mjump="dingtalk" data-mtarget="#dtPolicyCard">5. 贴前贴后等待与开关</button>
+          </div>
+        </div>
         <div class="bento-grid">
           <div class="bento-col">
-            <div class="section-wrap">
+            <div class="section-wrap" id="dtTargetsCard">
               <div class="section-head">
                 <span>目标会话</span>
                 <button class="head-action-btn" id="addTargetBtn" type="button">+ 添加会话</button>
@@ -5342,10 +7097,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   </div>
                 </div>
               </div>
-              <div class="section-footer" id="kwPreview">将依次按 Ctrl+Shift+F 打开已勾选会话并完成投递</div>
+              <div class="section-footer" id="kwPreview">输入群名/人名后可点右侧「AI 识屏核对」看桌面钉钉核对是否一致，运行时按 Ctrl+Shift+F 顺序投递</div>
             </div>
 
-            <div class="section-wrap">
+            <div class="section-wrap" id="dtMsgCard">
               <div class="section-head">
                 <span>消息格式</span>
               </div>
@@ -5365,6 +7120,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                       <button type="button" class="mini-seg-btn" data-val="YYYY-MM-DD">横杠</button>
                       <button type="button" class="mini-seg-btn" data-val="YYYY年M月D日">年月日</button>
                       <button type="button" class="mini-seg-btn" data-val="M月D日">X月X日</button>
+                    </div>
+                  </div>
+                  <div class="cutoff-box" style="margin-top:4px;">
+                    <div class="cutoff-top">
+                      <div class="row-main">
+                        <div class="row-title" style="font-size:12.5px;">定时发消息用实际发送时钟</div>
+                        <div class="row-sub" style="font-size:11px;">开启后，带时间文案使用发出那一刻的电脑实时时钟（如 23:46）</div>
+                      </div>
+                      <label class="ios-switch xs"><input type="checkbox" id="dtUseActualClock" /><span class="ios-slider"></span></label>
                     </div>
                   </div>
                   <div class="preset-sub-row">
@@ -5419,7 +7183,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
             </div>
 
-            <div class="section-wrap">
+            <div class="section-wrap" id="dtSuffixCard">
               <div class="section-head">
                 <span>时段后缀</span>
                 <button class="head-action-btn" id="addSuffixRuleBtn" type="button">+ 添加时段</button>
@@ -5507,7 +7271,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               <div class="section-footer" id="spFooterTip">通过左上角名称框精准定位 D3 / D4 / E4 / D5 / L3 / Y3 / Y4 / Y5 / AA2 / AA5 及 R4 更新时间（采用原生 Win32 Unicode 写入绝不乱码）</div>
             </div>
 
-            <div class="section-wrap">
+            <div class="section-wrap" id="dtPolicyCard">
               <div class="section-head"><span>投递设置</span></div>
               <div class="ios-group">
                 <div class="slot-block" style="padding:10px 13px;border-bottom:0.5px solid var(--sep);">
@@ -5594,6 +7358,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   </div>
                   <div class="sg-cell">
                     <div class="sg-copy">
+                      <span class="sg-title">发前 AI 桌面核对对象</span>
+                      <span class="sg-sub">一致直接继续 · 不一致截屏请本人确认</span>
+                    </div>
+                    <label class="ios-switch sm"><input type="checkbox" id="dtAiScreenVerify" /><span class="ios-slider"></span></label>
+                  </div>
+                  <div class="sg-cell">
+                    <div class="sg-copy">
                       <span class="sg-title">发送前清空输入框</span>
                       <span class="sg-sub">清掉旧草稿防错发</span>
                     </div>
@@ -5636,9 +7407,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <!-- Tab 3: 定时计划（左设周期时段 · 右看每日排期全览） -->
       <section class="tab-pane" id="pane-schedule">
+        <div class="sub-qnav-sticky">
+          <div class="sub-qnav-bar">
+            <span class="qnav-lbl">本页快跳</span>
+            <button type="button" class="qnav-pill" data-mjump="schedule" data-mtarget="#scheduleSlotCard">1. 运行周期与昼夜时段</button>
+            <button type="button" class="qnav-pill" data-mjump="schedule" data-mtarget="#rawSyncCard">2. 每隔几分钟刷底表(仅三表+R4)</button>
+            <button type="button" class="qnav-pill" data-mjump="schedule" data-mtarget="#cpWindowCard">3. 允许发群时间窗口</button>
+            <button type="button" class="qnav-pill" data-mjump="schedule" data-mtarget="#timetableCard">4. 全天排期单点微调</button>
+          </div>
+        </div>
         <div class="bento-grid">
           <div class="bento-col">
-            <div class="section-wrap">
+            <div class="section-wrap" id="scheduleSlotCard">
               <div class="section-head"><span>值守时段</span><span>点击调整</span></div>
               <div class="ios-group">
                 <div class="slot-block">
@@ -5729,7 +7509,84 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
             </div>
 
-            <div class="section-wrap">
+            <div class="section-wrap" id="rawSyncCard">
+              <div class="section-head"><span>定时刷底表（仅更三表与 R4）</span></div>
+              <div class="ios-group">
+                <div class="ios-row">
+                  <div class="sf-badge sf-green">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+                  </div>
+                  <div class="row-main">
+                    <div class="row-title">每隔几分钟自动下载三表并写 R4</div>
+                    <div class="row-sub">仅更新暗号/注册/短链三表与 R4 粘贴时间，不改汇总其他内容、不截图发群</div>
+                  </div>
+                  <label class="ios-switch sm"><input type="checkbox" id="rawSyncEnabled" /><span class="ios-slider"></span></label>
+                </div>
+
+                <div class="accordion-body" id="rawSyncAccordion">
+                  <div class="slot-block" style="padding:10px 13px;border-bottom:0.5px solid var(--sep);">
+                    <div class="preset-sub-row">
+                      <div class="row-main">
+                        <div class="row-title" style="font-size:13px;">刷新间隔分钟数</div>
+                        <div class="row-sub" style="font-size:11px;">距离上次三表粘贴完成每满该分钟数再刷一次（支持 10~360 分钟）</div>
+                      </div>
+                      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                        <div class="mini-seg" id="rawSyncIntervalQuickSeg">
+                          <button type="button" class="mini-seg-btn" data-min="20">20分</button>
+                          <button type="button" class="mini-seg-btn" data-min="30">30分</button>
+                          <button type="button" class="mini-seg-btn" data-min="40">40分</button>
+                          <button type="button" class="mini-seg-btn" data-min="60">60分</button>
+                          <button type="button" class="mini-seg-btn" data-min="90">90分</button>
+                        </div>
+                        <div class="stepper-grp">
+                          <button type="button" class="step-btn" id="rawSyncIntervalMinus">-</button>
+                          <span class="step-val" id="rawSyncIntervalVal">40分</span>
+                          <button type="button" class="step-btn" id="rawSyncIntervalPlus">+</button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="slot-block" style="padding:10px 13px;border-bottom:0.5px solid var(--sep);">
+                    <div class="preset-sub-row">
+                      <div class="row-main">
+                        <div class="row-title" style="font-size:13px;">临近发群前几分钟自动避让</div>
+                        <div class="row-sub" style="font-size:11px;">若即将到正点发群时间，自动跳过空刷直接等发群轮顺带粘贴并发送，避免撞车</div>
+                      </div>
+                      <div class="stepper-grp">
+                        <button type="button" class="step-btn" id="rawSyncSkipMinus">-</button>
+                        <span class="step-val" id="rawSyncSkipVal">5分</span>
+                        <button type="button" class="step-btn" id="rawSyncSkipPlus">+</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="ios-row" style="min-height:46px;">
+                    <div class="row-main">
+                      <div class="row-title" style="font-size:13px;">保留「数据汇总」其余格位不动</div>
+                      <div class="row-sub" style="font-size:11px;">开启后刷底表时不重写 D3/D4/E4/D5/L3/Y3/AA3 等单元格</div>
+                    </div>
+                    <label class="ios-switch sm"><input type="checkbox" id="rawSyncPreserveSummary" /><span class="ios-slider"></span></label>
+                  </div>
+
+                  <div class="ios-row" style="min-height:46px;">
+                    <div class="row-main">
+                      <div class="row-title" style="font-size:13px;">粘贴完立即写「数据汇总」R4 时间戳</div>
+                      <div class="row-sub" style="font-size:11px;">示例写入格式：2026年11月24日01:59:13</div>
+                    </div>
+                    <label class="ios-switch sm"><input type="checkbox" id="rawSyncWriteR4" /><span class="ios-slider"></span></label>
+                  </div>
+
+                  <div class="ios-row no-icon-sep" style="justify-content:space-between;gap:8px;flex-wrap:wrap;min-height:48px;">
+                    <div class="row-sub" id="rawSyncStatusHint" style="flex:1;min-width:170px;font-size:11.5px;color:var(--sub);">已启用：每 40 分钟更新三表并仅写 R4</div>
+                    <button type="button" class="pill-action-btn primary" id="btnRunRawSyncNow">立即刷一次底表（仅三表+R4）</button>
+                  </div>
+                </div>
+              </div>
+              <div class="section-footer">开启桌面端【自动值守】后生效；每次正式发群前仍照常先粘贴最新三表，中间间隔也会按此处周期后台静默更新三表与 R4。</div>
+            </div>
+
+            <div class="section-wrap" id="cpWindowCard">
               <div class="section-head"><span>发送时段</span></div>
               <div class="ios-group">
                 <div class="ios-row">
@@ -5752,26 +7609,305 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
 
           <div class="bento-col">
-            <div class="section-wrap">
+            <div class="section-wrap" id="timetableCard">
               <div class="section-head">
                 <span>排期总览</span>
                 <div class="tt-head-tools">
+                  <button class="mini-pill active" id="addExtraPointBtn" type="button">+ 添加时间点</button>
                   <button class="head-action-btn" id="resetAllPointsBtn" type="button" style="display:none;color:var(--red);">重置单点</button>
                   <span id="ttSummaryText">共 0 轮</span>
                 </div>
               </div>
-              <div class="ios-group" id="timetableList" style="max-height:540px;overflow-y:auto;"></div>
-              <div class="section-footer">点击任意一行，可单独设置这个时间点「发不发钉钉」、「查哪天表格」和「群消息文字」</div>
+              <div class="ios-group">
+                <div id="timetableList" style="max-height:520px;overflow-y:auto;"></div>
+                <button type="button" class="add-row-btn" id="addExtraPointFootBtn">+ 新增自定义定时节点（可自定时间、发给谁、文案与日期格式）</button>
+              </div>
+              <div class="section-footer">点任意一行可单独改「发给谁」「查哪天表格」「发 YYYY年M月D日 还是 日期+时间」及自定义内容；也可直接点「+ 添加时间点」或让 AI 管家代加</div>
             </div>
           </div>
         </div>
       </section>
 
-      <!-- Tab 4: 记录账号（左：运行日志与操作指南 · 右：内置智能伙伴偏好 + 账号数据源 + 历史归档） -->
+      <!-- Tab 5 (最右): 手绘图解与新手 30 秒上手指南 -->
+      <section class="tab-pane" id="pane-guide">
+        <div class="guide-sticky-header" id="guideStickyTop">
+          <div class="sketch-hero">
+            <div>
+              <div class="sketch-title">暗号表助手 &middot; 手绘流程与快速上手板</div>
+              <div class="sketch-sub">点击下方任意手绘方框或模块按钮，都能直接跳到对应设置并把光标停在输入框，零门槛一看就会。</div>
+            </div>
+            <div style="display:flex;gap:7px;flex-wrap:wrap;">
+              <button type="button" class="mini-pill active" data-mjump="more" data-mtarget="#sourceAccountCard" data-mfocus="#wpsUrl">去填表格与账号</button>
+              <button type="button" class="mini-pill active" data-mjump="dingtalk" data-mtarget="#dtTargetsCard" data-mfocus="#dtTargetsList input[type=text]">去配钉钉群与核对</button>
+              <button type="button" class="mini-pill" data-mjump="home" data-mtarget="#homeControlCard">回控制台开跑</button>
+            </div>
+          </div>
+
+          <!-- 30秒三步上手便利贴（永久冻结顶部可见） -->
+          <div class="sketch-3steps">
+            <div class="sketch-step-note">
+              <span class="sketch-badge">第 1 步 · 连上数据</span>
+              <div style="font-size:13px;font-weight:800;">填好 WPS 表格网址与 Luya 账号</div>
+              <div style="font-size:11.5px;color:var(--sub);line-height:1.42;">软件会自动登录下载三份表，汇总填入在线表。已填一次就永久记住。</div>
+              <button type="button" class="qnav-pill" style="align-self:flex-start;" data-mjump="more" data-mtarget="#sourceAccountCard" data-mfocus="#wpsUrl">直达填写框</button>
+            </div>
+            <div class="sketch-step-note warm">
+              <span class="sketch-badge" style="background:rgba(255,149,0,0.14);color:var(--orange);">第 2 步 · 瞄准群聊</span>
+              <div style="font-size:13px;font-weight:800;">填好钉钉群名并点「AI 识屏核对」</div>
+              <div style="font-size:11.5px;color:var(--sub);line-height:1.42;">一致才直接发；如果不一致或找不到，会截图同时发给电脑与手机请您确认或改群。</div>
+              <button type="button" class="qnav-pill" style="align-self:flex-start;" data-mjump="dingtalk" data-mtarget="#dtTargetsCard" data-mfocus="#dtTargetsList input[type=text]">直达目标框</button>
+            </div>
+            <div class="sketch-step-note mint">
+              <span class="sketch-badge" style="background:rgba(40,205,65,0.14);color:var(--green);">第 3 步 · 解放双手</span>
+              <div style="font-size:13px;font-weight:800;">点「立即开始」或开启「自动值守」</div>
+              <div style="font-size:11.5px;color:var(--sub);line-height:1.42;">中途想用电脑随时按 F8 暂停；手机打开云端远程网址就能出门查数与看图确认。</div>
+              <button type="button" class="qnav-pill" style="align-self:flex-start;" data-mjump="schedule" data-mtarget="#scheduleSlotCard">设定时排期</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="sketch-board">
+
+          <!-- 手绘交互式 SVG 工作全流程示意图 -->
+          <div class="sketch-svg-box">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+              <span style="font-size:13px;font-weight:800;color:var(--text);">手绘交互架构图：点图上任意圆角方框即可跳转设置</span>
+              <span style="font-size:11.5px;color:var(--sub);">绿色路线 = AI 核对一致直通 | 橙色路线 = 不一致请您双端确认</span>
+            </div>
+            <svg viewBox="0 0 980 260" width="100%" style="min-width:740px;display:block;" fill="none">
+              <defs>
+                <marker id="skArrowBlue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                  <path d="M1 1 L9 5 L1 9 Z" fill="#0A84FF"/>
+                </marker>
+                <marker id="skArrowGreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                  <path d="M1 1 L9 5 L1 9 Z" fill="#28CD41"/>
+                </marker>
+                <marker id="skArrowOrange" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                  <path d="M1 1 L9 5 L1 9 Z" fill="#FF9500"/>
+                </marker>
+              </defs>
+
+              <!-- 节点 1：数据源抓数 -->
+              <g class="sketch-svg-node" data-mjump="more" data-mtarget="#sourceAccountCard" data-mfocus="#wpsUrl">
+                <rect x="14" y="54" width="156" height="82" rx="16" fill="rgba(0,122,255,0.08)" stroke="#0A84FF" stroke-width="2.2" stroke-dasharray="6 3"/>
+                <text x="92" y="82" text-anchor="middle" font-size="13" font-weight="800" fill="currentColor">1. 抓取三表数据</text>
+                <text x="92" y="103" text-anchor="middle" font-size="11" fill="#6B7280">登录 Luya 后台下载</text>
+                <text x="92" y="121" text-anchor="middle" font-size="10.5" font-weight="700" fill="#0A84FF">点我改账号与链接</text>
+              </g>
+              <path d="M172 95 Q196 86 218 95" stroke="#0A84FF" stroke-width="2.2" stroke-dasharray="5 3" marker-end="url(#skArrowBlue)"/>
+
+              <!-- 节点 2：填表与格位校准 -->
+              <g class="sketch-svg-node" data-mjump="dingtalk" data-mtarget="#summaryPresetsSection" data-mfocus="#utCellInput">
+                <rect x="222" y="54" width="166" height="82" rx="16" fill="rgba(50,173,230,0.09)" stroke="#32ADE6" stroke-width="2.2" stroke-dasharray="6 3"/>
+                <text x="305" y="82" text-anchor="middle" font-size="13" font-weight="800" fill="currentColor">2. 写表与校准格位</text>
+                <text x="305" y="103" text-anchor="middle" font-size="11" fill="#6B7280">填汇总并写 D3 / L3 / R4</text>
+                <text x="305" y="121" text-anchor="middle" font-size="10.5" font-weight="700" fill="#0A84FF">点我改日期与格位</text>
+              </g>
+              <path d="M390 95 Q414 104 436 95" stroke="#0A84FF" stroke-width="2.2" stroke-dasharray="5 3" marker-end="url(#skArrowBlue)"/>
+
+              <!-- 节点 3：高清截图与文案 -->
+              <g class="sketch-svg-node" data-mjump="dingtalk" data-mtarget="#dtSuffixCard" data-mfocus="#dtSuffix">
+                <rect x="440" y="54" width="156" height="82" rx="16" fill="rgba(88,86,214,0.09)" stroke="#5856D6" stroke-width="2.2" stroke-dasharray="6 3"/>
+                <text x="518" y="82" text-anchor="middle" font-size="13" font-weight="800" fill="currentColor">3. 截大图配文时间</text>
+                <text x="518" y="103" text-anchor="middle" font-size="11" fill="#6B7280">自动配时间戳 + 后缀词</text>
+                <text x="518" y="121" text-anchor="middle" font-size="10.5" font-weight="700" fill="#5856D6">点我改时段后缀</text>
+              </g>
+              <path d="M598 95 Q622 86 644 95" stroke="#0A84FF" stroke-width="2.2" stroke-dasharray="5 3" marker-end="url(#skArrowBlue)"/>
+
+              <!-- 节点 4：AI 桌面识屏核对分叉点 -->
+              <g class="sketch-svg-node" data-mjump="dingtalk" data-mtarget="#dtTargetsCard" data-mfocus="#dtTargetsList input[type=text]">
+                <rect x="648" y="42" width="168" height="104" rx="18" fill="rgba(255,149,0,0.10)" stroke="#FF9500" stroke-width="2.4"/>
+                <text x="732" y="72" text-anchor="middle" font-size="13.5" font-weight="800" fill="currentColor">4. AI 识屏核对群名</text>
+                <text x="732" y="93" text-anchor="middle" font-size="11" fill="#6B7280">搜群后看桌面顶栏与结果</text>
+                <text x="732" y="112" text-anchor="middle" font-size="11" fill="#28CD41" font-weight="700">一致 -> 等几秒直接 Enter</text>
+                <text x="732" y="130" text-anchor="middle" font-size="11" fill="#FF9500" font-weight="700">不一致 -> 下方双端截图确认</text>
+              </g>
+
+              <!-- 绿色直通线到节点 5 -->
+              <path d="M818 82 Q838 78 852 84" stroke="#28CD41" stroke-width="2.4" marker-end="url(#skArrowGreen)"/>
+
+              <!-- 橙色分支到本人确认框 -->
+              <path d="M732 148 Q732 174 686 184" stroke="#FF9500" stroke-width="2.2" stroke-dasharray="5 3" marker-end="url(#skArrowOrange)"/>
+              <g class="sketch-svg-node" data-mjump="home" data-mtarget="#aiCardBox" data-mfocus="#aiChatInput">
+                <rect x="330" y="166" width="352" height="72" rx="15" fill="rgba(255,149,0,0.12)" stroke="#FF9500" stroke-width="2.2" stroke-dasharray="6 3"/>
+                <text x="506" y="191" text-anchor="middle" font-size="13" font-weight="800" fill="#FF9500">异常分叉：桌面 AI 对话框 + 手机端同步收图</text>
+                <text x="506" y="211" text-anchor="middle" font-size="11" fill="currentColor">您看截图后可点【确认仍发当前】 / 【改发其他群或个人】 / 【取消发送】</text>
+                <text x="506" y="229" text-anchor="middle" font-size="10.5" font-weight="700" fill="#0A84FF">点我直达 AI 对话框</text>
+              </g>
+              <path d="M684 202 Q896 202 910 142" stroke="#28CD41" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#skArrowGreen)"/>
+
+              <!-- 节点 5：数据播报与归档复盘 -->
+              <g class="sketch-svg-node" data-mjump="home" data-mtarget="#aiCardBox">
+                <rect x="856" y="54" width="112" height="82" rx="16" fill="rgba(40,205,65,0.10)" stroke="#28CD41" stroke-width="2.2"/>
+                <text x="912" y="82" text-anchor="middle" font-size="13" font-weight="800" fill="currentColor">5. 完成与播报</text>
+                <text x="912" y="103" text-anchor="middle" font-size="11" fill="#6B7280">档案对比 + 增减</text>
+                <text x="912" y="121" text-anchor="middle" font-size="10.5" font-weight="700" fill="#28CD41">双端同步推送</text>
+              </g>
+
+              <!-- 左下定时计划小贴士 -->
+              <g class="sketch-svg-node" data-mjump="schedule" data-mtarget="#scheduleSlotCard">
+                <rect x="14" y="166" width="286" height="72" rx="15" fill="rgba(175,82,222,0.08)" stroke="#AF52DE" stroke-width="2" stroke-dasharray="6 3"/>
+                <text x="157" y="191" text-anchor="middle" font-size="12.5" font-weight="800" fill="#AF52DE">定时计划引擎（自动值守可按轮跑）</text>
+                <text x="157" y="211" text-anchor="middle" font-size="11" fill="#6B7280">支持工作日 / 昼夜不同间隔 / 单个时间点改群查昨天</text>
+                <text x="157" y="229" text-anchor="middle" font-size="10.5" font-weight="700" fill="#AF52DE">点我直达排期总览</text>
+              </g>
+            </svg>
+          </div>
+
+          <!-- 六大模块手绘功能卡与一键定位 -->
+          <div class="sketch-grid-cards">
+            <div class="sketch-mod-card">
+              <div class="sketch-mod-head">
+                <div class="sketch-mod-left">
+                  <div class="sketch-mod-ico">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                  </div>
+                  <div>
+                    <div style="font-size:14px;font-weight:800;">模块一：控制台与 AI 数据管家</div>
+                    <div style="font-size:11px;color:var(--sub);">总开关、战报分析与语音式指令中枢</div>
+                  </div>
+                </div>
+                <button type="button" class="mini-pill active" data-mjump="home" data-mtarget="#aiCardBox" data-mfocus="#aiChatInput">直达输入框</button>
+              </div>
+              <ul class="sketch-mod-list">
+                <li>点「立即开始全流程」从抓数到发群一气呵成；只要重发截图点「仅截图发送」。</li>
+                <li>AI 思考有动态小猫气泡与步骤过程；嫌窗小可点「放大弹窗」或拖底部横条拉大。</li>
+                <li>直接输入自然语言就能改定时、找人或跑一轮，例如“把今天数据总结后发给某群”。</li>
+              </ul>
+            </div>
+
+            <div class="sketch-mod-card">
+              <div class="sketch-mod-head">
+                <div class="sketch-mod-left">
+                  <div class="sketch-mod-ico" style="background:rgba(255,149,0,0.12);border-color:rgba(255,149,0,0.45);color:var(--orange);">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                  </div>
+                  <div>
+                    <div style="font-size:14px;font-weight:800;">模块二：钉钉目标群与 AI 识屏核对</div>
+                    <div style="font-size:11px;color:var(--sub);">先看桌面确定是本人或目标群再发图</div>
+                  </div>
+                </div>
+                <button type="button" class="mini-pill active" data-mjump="dingtalk" data-mtarget="#dtTargetsCard" data-mfocus="#dtTargetsList input[type=text]">直达填群名</button>
+              </div>
+              <ul class="sketch-mod-list">
+                <li>输完群名或人名后，先点右侧「AI 识屏核对」，自动唤醒钉钉搜一次看看对不对。</li>
+                <li>运行时开启「发前 AI 桌面核对对象」：一致自动继续；不一致会停住截屏发到电脑 AI 与手机，请您确认继续、改发他群或取消。</li>
+                <li>关闭静音发送开关时，不会去乱点静音按钮，按设定等待秒数稳定后直接 Enter 发出。</li>
+              </ul>
+            </div>
+
+            <div class="sketch-mod-card">
+              <div class="sketch-mod-head">
+                <div class="sketch-mod-left">
+                  <div class="sketch-mod-ico" style="background:rgba(50,173,230,0.12);border-color:rgba(50,173,230,0.45);color:var(--teal);">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="9" x2="9" y2="21"/></svg>
+                  </div>
+                  <div>
+                    <div style="font-size:14px;font-weight:800;">模块三：汇总表日期与格位校准</div>
+                    <div style="font-size:11px;color:var(--sub);">D3/D4/L3/Y3/R4 等全自动定位填写</div>
+                  </div>
+                </div>
+                <button type="button" class="mini-pill active" data-mjump="dingtalk" data-mtarget="#summaryPresetsSection" data-mfocus="#utCellInput">直达调格位</button>
+              </div>
+              <ul class="sketch-mod-list">
+                <li>可自定义写入任意工作表单元格：自动日期（如今天/昨天）、当前时间、公式或清空。</li>
+                <li>可勾选「凌晨前自动减天」，比如早上 9 点前自动查询昨天数据，9 点后自动切回今天。</li>
+                <li>最下面可设「贴图前等待秒数」和「写入对话框后等几秒再 Enter 发送」，防止大图没加载完就发出。</li>
+              </ul>
+            </div>
+
+            <div class="sketch-mod-card">
+              <div class="sketch-mod-head">
+                <div class="sketch-mod-left">
+                  <div class="sketch-mod-ico" style="background:rgba(175,82,222,0.12);border-color:rgba(175,82,222,0.45);color:var(--purple);">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+                  </div>
+                  <div>
+                    <div style="font-size:14px;font-weight:800;">模块四：定时计划与单点微调</div>
+                    <div style="font-size:11px;color:var(--sub);">每天自动跑、单点改后缀/查昨天</div>
+                  </div>
+                </div>
+                <button type="button" class="mini-pill active" data-mjump="schedule" data-mtarget="#scheduleSlotCard">直达定排期</button>
+              </div>
+              <ul class="sketch-mod-list">
+                <li>选每天 / 工作日 / 自定义星期，分开设定白天与晚上的起止时间和轮次间隔。</li>
+                <li>右侧「排期总览」点任意时间行，可只让那一个时间点不发钉钉或改查昨天数据。</li>
+                <li>勾选「值守期间防休眠息屏」，夜间挂机不会因为电脑锁屏睡眠而漏跑。</li>
+              </ul>
+            </div>
+
+            <div class="sketch-mod-card">
+              <div class="sketch-mod-head">
+                <div class="sketch-mod-left">
+                  <div class="sketch-mod-ico" style="background:rgba(88,86,214,0.12);border-color:rgba(88,86,214,0.45);color:var(--indigo);">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2" width="12" height="20" rx="2.5"/><line x1="12" y1="18" x2="12" y2="18.01"/></svg>
+                  </div>
+                  <div>
+                    <div style="font-size:14px;font-weight:800;">模块五：手机网页异地遥控与看图确认</div>
+                    <div style="font-size:11px;color:var(--sub);">在外用手机也能收电脑截图并拍板发送</div>
+                  </div>
+                </div>
+                <button type="button" class="mini-pill active" id="guideOpenMobileBtn">查看网址与密码</button>
+              </div>
+              <ul class="sketch-mod-list">
+                <li>先点右上角给自己起个好记的名字，再点「远程网站」记住或修改远程密码。</li>
+                <li>手机浏览器打开云端网址，输入同一名字与密码即可实时看电脑进度、向 AI 提问、遥控跑表。</li>
+                <li>遇到电脑钉钉核对不一致时，手机端会同步收到电脑桌面截图，直接在手机上就能点确认、改发他群或取消。</li>
+              </ul>
+            </div>
+
+            <div class="sketch-mod-card">
+              <div class="sketch-mod-head">
+                <div class="sketch-mod-left">
+                  <div class="sketch-mod-ico" style="background:rgba(40,205,65,0.12);border-color:rgba(40,205,65,0.45);color:var(--green);">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                  </div>
+                  <div>
+                    <div style="font-size:14px;font-weight:800;">模块六：运行日志、数据源与跨机同步</div>
+                    <div style="font-size:11px;color:var(--sub);">换电脑同步、报错复盘与 F8/F9 急救</div>
+                  </div>
+                </div>
+                <button type="button" class="mini-pill active" data-mjump="more" data-mtarget="#logCardBox">直达查日志</button>
+              </div>
+              <ul class="sketch-mod-list">
+                <li>出错时顶部会亮红字原因卡，支持一键看图自愈、自动调顺模块顺序或生成修复指令。</li>
+                <li>可选登录云端同步账号：在一台电脑配好的网址、Luya 账号与话术，换电脑自动同步过来。</li>
+                <li>运行中随时按 F8 暂停/续跑，手动进群按 F9 直接补贴发送。</li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- AI 常用指挥口令一键试用 -->
+          <div class="sketch-mod-card" style="border-style:dashed;border-color:rgba(0,122,255,0.38);">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+              <strong style="font-size:13px;">不想自己翻界面设置？直接点下面一句试试让 AI 管家帮你办（会跳回控制台发送）：</strong>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:7px;">
+              <button type="button" class="ai-style-chip accent" data-guide-prompt="你是谁，现在软件配置得怎么样？">问问 AI 当前配置体检</button>
+              <button type="button" class="ai-style-chip" data-guide-prompt="帮我设置工作日 9点到18点每2小时自动运行，发前等待 5 秒">模板：工作日 9-18 点每2小时</button>
+              <button type="button" class="ai-style-chip" data-guide-prompt="结合历史数据档案，对比各团队和个人数值最近变化">问 AI 团队与个人变化</button>
+              <button type="button" class="ai-style-chip" data-guide-prompt="最近运行训练总结了什么问题怎么解决的？">查 AI 历史训练避坑总结</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab 5: 记录账号（左：运行日志与操作指南 · 右：内置智能伙伴偏好 + 账号数据源 + 历史归档） -->
       <section class="tab-pane" id="pane-more">
+        <div class="sub-qnav-sticky">
+          <div class="sub-qnav-bar">
+            <span class="qnav-lbl">本页快跳</span>
+            <button type="button" class="qnav-pill" data-mjump="more" data-mtarget="#logCardBox">1. 运行日志</button>
+            <button type="button" class="qnav-pill" data-mjump="more" data-mtarget="#kbGuideCard">2. 按键排障 F8/F9</button>
+            <button type="button" class="qnav-pill" data-mjump="more" data-mtarget="#accountSyncCard">3. 跨机账号同步</button>
+            <button type="button" class="qnav-pill" data-mjump="more" data-mtarget="#aiSettingCard" data-mfocus="#aiCustomPrompt">4. 智能设置</button>
+            <button type="button" class="qnav-pill" data-mjump="more" data-mtarget="#sourceAccountCard" data-mfocus="#wpsUrl">5. WPS 与 Luya 账号</button>
+            <button type="button" class="qnav-pill" data-mjump="more" data-mtarget="#shotArchiveCard">6. 截图归档</button>
+          </div>
+        </div>
         <div class="bento-grid">
           <div class="bento-col">
-            <div class="section-wrap">
+            <div class="section-wrap" id="logCardBox">
               <div class="section-head">
                 <span>运行日志</span>
                 <div class="log-tools">
@@ -5789,7 +7925,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
             </div>
 
-            <div class="section-wrap">
+            <div class="section-wrap" id="kbGuideCard">
               <div class="section-head"><span>按键排障</span><span>F8 / F9</span></div>
               <div class="ios-group">
                 <div class="ios-row clickable" id="guideToggleRow">
@@ -5823,7 +7959,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
 
           <div class="bento-col">
-            <div class="section-wrap">
+            <div class="section-wrap" id="accountSyncCard">
               <div class="section-head">
                 <span>账号同步（可选）</span>
               </div>
@@ -5844,7 +7980,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
             </div>
 
-            <div class="section-wrap">
+            <div class="section-wrap" id="aiSettingCard">
               <div class="section-head">
                 <span>智能设置</span>
               </div>
@@ -5883,7 +8019,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
             </div>
 
-            <div class="section-wrap">
+            <div class="section-wrap" id="sourceAccountCard">
               <div class="section-head"><span>数据账号</span></div>
               <div class="ios-group">
                 <div class="ios-row">
@@ -5913,7 +8049,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
             </div>
 
-            <div class="section-wrap">
+            <div class="section-wrap" id="shotArchiveCard">
               <div class="section-head"><span>截图归档</span><span>最多留存 20 张</span></div>
               <div class="ios-group">
                 <div class="ios-row">
@@ -5970,6 +8106,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>
         <span>记录账号</span>
       </button>
+      <button class="tab-btn" data-tab="guide">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 014 4v14a3 3 0 00-3-3H2z"/><path d="M22 3h-6a4 4 0 00-4 4v14a3 3 0 013-3h7z"/></svg>
+        <span>图解教程</span>
+      </button>
     </div>
   </nav>
 
@@ -6009,6 +8149,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="sheet-body-pad">
         <div class="point-preview-strip">
           <div>本轮动作：<strong id="pointActionPrevText">—</strong></div>
+          <div>发送对象：<strong id="pointTargetPrevText">—</strong></div>
           <div>表格日期：<strong id="pointSheetPrevText">—</strong></div>
           <div id="pointMsgPrevRow">群消息词：<strong id="pointMsgPrevText">—</strong></div>
         </div>
@@ -6081,26 +8222,54 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   <button type="button" class="step-btn" id="ptMsgPlusBtn">+</button>
                 </div>
               </div>
+              <div id="pointMsgFmtRow" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px;">
+                <span style="font-size:11px;color:var(--sub);min-width:52px;">日期格式</span>
+                <div class="mini-seg" id="pointMsgFmtSeg">
+                  <button type="button" class="mini-seg-btn" data-val="default">按默认</button>
+                  <button type="button" class="mini-seg-btn" data-val="YYYY-MM-DD">2026-11-24</button>
+                  <button type="button" class="mini-seg-btn" data-val="YYYY年M月D日">2026年11月24日</button>
+                  <button type="button" class="mini-seg-btn" data-val="M月D日">11月24日</button>
+                </div>
+              </div>
             </div>
           </div>
 
           <div class="ios-group" style="box-shadow:none;">
             <div class="ios-row" style="min-height:42px;">
               <div class="row-main">
-                <div class="row-title">单独修改结尾词</div>
-                <div class="row-sub" id="pointSufHint">不改时默认按全局设置；留空代表不加结尾词</div>
+                <div class="row-title">单独指定发送对象（群聊/个人）</div>
+                <div class="row-sub" id="pointTargetHint">不改时发给全局启用的目标会话；开启后该时间点只发指定对象</div>
+              </div>
+              <label class="ios-switch sm"><input type="checkbox" id="pointCustomTargetOn" /><span class="ios-slider"></span></label>
+            </div>
+            <div class="ios-row no-icon-sep" id="pointCustomTargetWrap" style="display:none;flex-direction:column;align-items:stretch;gap:7px;">
+              <div class="rule-input-box" style="width:100%;">
+                <input type="text" id="pointCustomTargetInput" placeholder="输入群名或联系人姓名（多个用顿号、或逗号隔开）" />
+              </div>
+              <div id="pointTargetQuickChips" style="display:flex;flex-wrap:wrap;gap:5px;"></div>
+            </div>
+          </div>
+
+          <div class="ios-group" style="box-shadow:none;">
+            <div class="ios-row" style="min-height:42px;">
+              <div class="row-main">
+                <div class="row-title">自定义发送内容 / 结尾词</div>
+                <div class="row-sub" id="pointSufHint">配合上方「不加时间」即可只发此处内容；留空代表不加结尾词</div>
               </div>
               <label class="ios-switch sm"><input type="checkbox" id="pointCustomSufOn" /><span class="ios-slider"></span></label>
             </div>
             <div class="ios-row no-icon-sep" id="pointCustomSufWrap" style="display:none;min-height:42px;">
               <div class="rule-input-box" style="width:100%;">
-                <input type="text" id="pointCustomSufInput" placeholder="输入结尾文字，留空代表不加结尾词" />
+                <input type="text" id="pointCustomSufInput" placeholder="输入自定义内容或结尾词，留空代表不加结尾词" />
               </div>
             </div>
           </div>
         </div>
 
-        <button class="danger-card-btn" id="pointResetBtn" type="button" style="box-shadow:none;">恢复默认设置</button>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="danger-card-btn" id="pointDeleteExtraBtn" type="button" style="display:none;box-shadow:none;background:rgba(255,59,48,0.10);">删除此自定义时间点</button>
+          <button class="danger-card-btn" id="pointResetBtn" type="button" style="box-shadow:none;">恢复默认设置</button>
+        </div>
       </div>
     </div>
   </div>
@@ -6363,7 +8532,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button type="button" class="admin-tab-btn" data-atab="members">人员管理 · 权限与体检</button>
         <button type="button" class="admin-tab-btn" data-atab="errors">全员报错与 AI 聊天</button>
         <button type="button" class="admin-tab-btn" data-atab="feedbacks">成员反馈收件箱</button>
-        <button type="button" class="admin-tab-btn" data-atab="logic">全局软件逻辑与密码</button>
+        <button type="button" class="admin-tab-btn" data-atab="logic">公告栏 · 全局逻辑与密码</button>
       </div>
 
       <div class="modal-scroll" id="adminScrollBody">
@@ -6434,8 +8603,149 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <!-- Tab 4: 反馈收件箱 -->
         <div id="adminPane-feedbacks" class="admin-pane" style="display:none;flex-direction:column;gap:8px;"></div>
 
-        <!-- Tab 5: 全局软件设计逻辑与密码 -->
+        <!-- Tab 5: 全员顶部公告栏 + 全局软件设计逻辑与密码 -->
         <div id="adminPane-logic" class="admin-pane" style="display:none;flex-direction:column;gap:12px;">
+          <div class="admin-box">
+            <div class="admin-box-title">
+              <span>全员顶部公告栏（跨电脑实时同步 · 冻结置顶）</span>
+              <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;cursor:pointer;">
+                <span style="color:var(--sub);">开启展示</span>
+                <label class="ios-switch sm"><input type="checkbox" id="adminAnnEnabled" checked /><span class="ios-slider"></span></label>
+              </label>
+            </div>
+            <div style="display:grid;grid-template-columns:180px 1fr;gap:10px;font-size:12.5px;">
+              <div>
+                <div style="color:var(--sub);margin-bottom:4px;">左侧徽章标签（限 12 字）：</div>
+                <input type="text" id="adminAnnBadge" class="small-input" style="width:100%;" maxlength="12" placeholder="全员公告" />
+              </div>
+              <div>
+                <div style="color:var(--sub);margin-bottom:4px;display:flex;justify-content:space-between;">
+                  <span>公告正文内容（可留空纯播视频/GIF，或叠加显示在视频上层；多条用回车隔开）：</span>
+                  <span id="adminAnnCharCount">0 / 300</span>
+                </div>
+                <textarea id="adminAnnText" class="field-textarea" style="min-height:56px;" maxlength="300" placeholder="填写想置顶播报的通知内容；如果只想纯播放横幅视频/动图，这里可以完全留空不写…"></textarea>
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:12px;">
+              <div>
+                <div style="color:var(--sub);margin-bottom:4px;">文字动态效果：</div>
+                <div class="mini-seg" id="adminAnnEffectSeg" style="flex-wrap:wrap;">
+                  <button type="button" class="mini-seg-btn" data-val="marquee">跑马灯滚动</button>
+                  <button type="button" class="mini-seg-btn active" data-val="gradient">流光渐变</button>
+                  <button type="button" class="mini-seg-btn" data-val="pulse">柔光呼吸</button>
+                  <button type="button" class="mini-seg-btn" data-val="glow">霓虹闪烁</button>
+                  <button type="button" class="mini-seg-btn" data-val="typewriter">逐字打字</button>
+                  <button type="button" class="mini-seg-btn" data-val="static">静谧醒目</button>
+                </div>
+              </div>
+              <div>
+                <div style="color:var(--sub);margin-bottom:4px;">配色主题风格：</div>
+                <div class="mini-seg" id="adminAnnThemeSeg" style="flex-wrap:wrap;">
+                  <button type="button" class="mini-seg-btn active" data-val="ocean">科技蓝</button>
+                  <button type="button" class="mini-seg-btn" data-val="amber">暖金提醒</button>
+                  <button type="button" class="mini-seg-btn" data-val="emerald">翡翠清新</button>
+                  <button type="button" class="mini-seg-btn" data-val="rose">绯红紧急</button>
+                  <button type="button" class="mini-seg-btn" data-val="violet">幻紫星云</button>
+                  <button type="button" class="mini-seg-btn" data-val="obsidian">黑金尊享</button>
+                </div>
+              </div>
+              <div>
+                <div style="color:var(--sub);margin-bottom:4px;">公告文字字号：</div>
+                <div class="mini-seg" id="adminAnnSizeSeg">
+                  <button type="button" class="mini-seg-btn" data-val="sm">标准</button>
+                  <button type="button" class="mini-seg-btn active" data-val="md">偏大醒目</button>
+                  <button type="button" class="mini-seg-btn" data-val="lg">特大横幅</button>
+                </div>
+              </div>
+              <div>
+                <div style="color:var(--sub);margin-bottom:4px;">动态速度节奏：</div>
+                <div class="mini-seg" id="adminAnnSpeedSeg">
+                  <button type="button" class="mini-seg-btn" data-val="slow">舒缓</button>
+                  <button type="button" class="mini-seg-btn active" data-val="normal">适中</button>
+                  <button type="button" class="mini-seg-btn" data-val="fast">灵动</button>
+                </div>
+              </div>
+            </div>
+            <div style="border-top:0.5px solid var(--sep);padding-top:10px;margin-top:2px;display:flex;flex-direction:column;gap:9px;font-size:12px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+                <span style="font-weight:700;color:var(--text);">横幅动画 / 视频 / GIF 设置（贴合顶部公告栏横向尺寸）</span>
+                <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+                  <span style="color:var(--sub);">默认静音播放</span>
+                  <label class="ios-switch sm"><input type="checkbox" id="adminAnnMuted" checked /><span class="ios-slider"></span></label>
+                </label>
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                <div>
+                  <div style="color:var(--sub);margin-bottom:4px;">播放模式：</div>
+                  <div class="mini-seg" id="adminAnnMediaModeSeg" style="flex-wrap:wrap;">
+                    <button type="button" class="mini-seg-btn active" data-val="none">无需播放</button>
+                    <button type="button" class="mini-seg-btn" data-val="loop_one">循环播放一条</button>
+                    <button type="button" class="mini-seg-btn" data-val="loop_all">循环播放所有</button>
+                  </div>
+                </div>
+                <div>
+                  <div style="color:var(--sub);margin-bottom:4px;">文字与媒体叠层方式：</div>
+                  <div class="mini-seg" id="adminAnnTextOverlaySeg">
+                    <button type="button" class="mini-seg-btn active" data-val="overlay">文字在视频上层</button>
+                    <button type="button" class="mini-seg-btn" data-val="hide">隐藏文字仅播媒体</button>
+                  </div>
+                </div>
+                <div>
+                  <div style="color:var(--sub);margin-bottom:4px;">横幅高度尺寸：</div>
+                  <div class="mini-seg" id="adminAnnHeightSeg">
+                    <button type="button" class="mini-seg-btn active" data-val="normal">常规 (46px)</button>
+                    <button type="button" class="mini-seg-btn" data-val="tall">中横幅 (74px)</button>
+                    <button type="button" class="mini-seg-btn" data-val="cinema">大横幅 (108px)</button>
+                  </div>
+                </div>
+                <div>
+                  <div style="color:var(--sub);margin-bottom:4px;">画面横条适配方式：</div>
+                  <div class="mini-seg" id="adminAnnFitSeg">
+                    <button type="button" class="mini-seg-btn active" data-val="cover">横向铺满裁剪</button>
+                    <button type="button" class="mini-seg-btn" data-val="contain">完整居中显示</button>
+                  </div>
+                </div>
+              </div>
+              <div style="display:flex;gap:7px;flex-wrap:wrap;align-items:center;">
+                <input type="file" id="adminAnnMediaFileInput" accept="video/mp4,video/webm,image/gif,image/webp,image/png,image/jpeg" style="display:none;" />
+                <button type="button" class="pill-action-btn primary" id="adminAnnUploadBtn">上传本地视频 / GIF / 图片</button>
+                <button type="button" class="mini-pill" id="adminAnnAddAnimBtn" data-add-anim="aurora">+ 星河流动动画</button>
+                <button type="button" class="mini-pill" data-add-anim="pulse_wave">+ 霓虹脉冲动画</button>
+                <button type="button" class="mini-pill" data-add-anim="gold_ribbon">+ 黑金流光动画</button>
+              </div>
+              <div style="display:flex;gap:7px;flex-wrap:wrap;align-items:center;">
+                <input type="text" id="adminAnnMediaTitleInput" class="small-input" style="width:150px;" maxlength="36" placeholder="标题（选填，如迎新横幅）" />
+                <input type="text" id="adminAnnMediaUrlInput" class="small-input" style="flex:1;min-width:200px;" placeholder="粘贴公网 https:// 视频(.mp4/.webm) 或 GIF 链接（全员电脑同步推荐）" />
+                <button type="button" class="pill-action-btn" id="adminAnnAddUrlBtn">添加链接</button>
+              </div>
+              <div id="adminAnnMediaList" style="display:flex;flex-direction:column;gap:6px;"></div>
+            </div>
+            <div>
+              <div style="color:var(--sub);font-size:11.5px;margin-bottom:5px;">实时效果预览：</div>
+              <div class="ann-bar ann-theme-ocean ann-fx-gradient ann-size-md ann-speed-normal ann-h-normal" id="adminAnnPreviewBar">
+                <div class="ann-media-layer" id="adminAnnPreviewMediaLayer"></div>
+                <div class="ann-media-scrim" id="adminAnnPreviewScrim"></div>
+                <div class="ann-left">
+                  <span class="ann-icon-wrap" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-9.33-4.98L4 6.5v11l4.67 3.48A6 6 0 0 0 18 16"/><path d="M4 9.5H2.5a1.5 1.5 0 0 0 0 3H4"/><path d="M18 10.5c1 .9 1 2.1 0 3"/></svg>
+                  </span>
+                  <span class="ann-badge" id="adminAnnPreviewBadge">全员公告</span>
+                </div>
+                <div class="ann-viewport" id="adminAnnPreviewViewport">
+                  <div class="ann-track" id="adminAnnPreviewTrack">
+                    <span class="ann-text-seg" id="adminAnnPreviewTextA"></span>
+                  </div>
+                </div>
+                <span class="ann-meta" id="adminAnnPreviewMeta">实时预览</span>
+                <button type="button" class="ann-mute-btn" id="adminAnnPreviewMuteBtn" title="切换预览静音">已静音</button>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button type="button" class="pill-action-btn primary" id="adminSaveAnnBtn">保存并同步发布到所有电脑</button>
+              <button type="button" class="pill-action-btn" id="adminResetAnnBtn">恢复默认公告</button>
+            </div>
+          </div>
+
           <div class="admin-box">
             <div class="admin-box-title"><span>全局逻辑</span></div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:12.5px;">
@@ -6522,6 +8832,50 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- 数据管家可拖拽放大独立对话弹窗 -->
+  <div class="ai-popout-mask" id="aiPopoutModalMask">
+    <div class="ai-popout-win" id="aiPopoutWindow" role="dialog" aria-modal="true" aria-label="数据管家大屏对话">
+      <div class="ai-popout-head" id="aiPopoutHead">
+        <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1;">
+          <span style="display:inline-flex;width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,#0A84FF,#5856D6);align-items:center;justify-content:center;flex-shrink:0;">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M5 10L4 4l5 3.5h6L20 4l-1 6a6.5 6.5 0 01-14 0z" fill="#E0F2FE"/><circle cx="9.8" cy="12.5" r="1.2" fill="#0F172A"/><circle cx="14.2" cy="12.5" r="1.2" fill="#0F172A"/></svg>
+          </span>
+          <span style="font-size:13.5px;font-weight:700;color:var(--text);white-space:nowrap;">数据管家 &middot; 大屏对话</span>
+          <span class="shot-pill" id="aiPopoutShotPill" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">尚未加载最近截图</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+          <span id="aiPopoutResizeTip" style="font-size:11px;color:var(--sub);">可拖拽顶栏移动 / 右下角拉大缩小</span>
+          <button type="button" class="tiny-btn" id="aiPopoutMaxBtn">全屏</button>
+          <button type="button" class="tiny-btn" id="aiPopoutClearBtn">清空</button>
+          <button type="button" class="tiny-btn" id="aiPopoutCloseBtn">关闭</button>
+        </div>
+      </div>
+      <div class="ai-popout-feed" id="aiPopoutFeed"></div>
+      <div class="ai-popout-foot">
+        <div class="ai-style-chips" id="aiPopoutStyleBar" style="margin-bottom:4px;"></div>
+        <div class="ai-quick-qa-bar" id="aiPopoutQaBar" style="margin-bottom:6px;">
+          <button type="button" class="ai-qa-pill" data-ai-q="你是谁，能帮我做什么？">你是谁/能干嘛</button>
+          <button type="button" class="ai-qa-pill" data-ai-q="现在整体配置和上次发送状态怎么样？">当前状态概览</button>
+          <button type="button" class="ai-qa-pill" data-ai-q="列出所有被我们记录档案的团队和个人习惯，重点注意哪些人？">查团队/个人档案</button>
+          <button type="button" class="ai-qa-pill" data-ai-q="怎么修改汇总表复制和写入的单元格位置？">怎么自定义单元格</button>
+          <button type="button" class="ai-qa-pill" data-ai-pop-tpl="帮我在定时计划里新增一个每天 14:30 发到「目标群名」，发日期+时间，内容写「午间数据情况」，非静音">加定时：某点发某群</button>
+          <button type="button" class="ai-qa-pill" data-ai-pop-tpl="帮我在定时计划里新增一个每天 09:00 发昨天数据到「目标群名」，只发年月日日期，内容写「昨日数据情况」">加定时：发昨天日期</button>
+        </div>
+        <div class="ai-popout-input-row">
+          <textarea id="aiPopoutInput" class="ai-popout-textarea" rows="2" placeholder="输入问题或指令（Enter 直接发送，Shift+Enter 换行）..."></textarea>
+          <button type="button" class="pill-action-btn" id="aiPopoutSendBtn" style="height:38px;padding:0 16px;">发送</button>
+        </div>
+      </div>
+      <div class="ai-popout-resize-hint"></div>
+    </div>
+  </div>
+
+  <!-- 现场截图高清大图放大弹窗 -->
+  <div class="img-zoom-mask" id="imgZoomModalMask">
+    <img class="img-zoom-img" id="imgZoomPreview" src="" alt="桌面钉钉现场截图" />
+    <div class="img-zoom-tip">点击画面空白处或按 Esc 关闭大图</div>
+  </div>
+
 <script>
 const TOKEN = __TOKEN_JSON__;
 const $ = (id) => document.getElementById(id);
@@ -6564,6 +8918,7 @@ let editingPointSilent = "default";
 let editingPtSheetOff = null;
 let editingPtMsgMode = "default";
 let editingPtMsgOff = null;
+let editingPtMsgFmt = "default";
 let editingPointOrigOv = null;
 let lastRecSignature = "";
 let lastBusyState = false;
@@ -6610,6 +8965,19 @@ function safeExternalHttpUrl(rawUrl) {
   const s = String(rawUrl || "").trim();
   return /^https?:\/\/[^\s"'<>]+$/i.test(s) ? s : "";
 }
+function safeShotImageUrl(rawUrl) {
+  const s = String(rawUrl || "").trim();
+  if (s.length > 240000) return "";
+  return /^data:image\/(?:png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]{20,}$/i.test(s) ? s : "";
+}
+function openShotZoomModal(rawSrc) {
+  const safe = safeShotImageUrl(rawSrc);
+  if (!safe) return;
+  if ($("imgZoomPreview") && $("imgZoomModalMask")) {
+    $("imgZoomPreview").src = safe;
+    $("imgZoomModalMask").classList.add("show");
+  }
+}
 function safeQrSvgMarkup(rawSvg) {
   const fallback = "<span style='font-size:12px;color:#64748B;'>暂未生成二维码</span>";
   const s = String(rawSvg || "").trim();
@@ -6654,7 +9022,11 @@ function formatSafeMarkdown(raw) {
       out.push(`<div class="md-hr"></div>`);
       continue;
     }
-    let esc = escapeHtmlStr(line).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+    let esc = escapeHtmlStr(line)
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/\*\*([^*\n]+?)\*(?=[:：\s]|$)/g, "<strong>$1</strong>")
+      .replace(/`([^`\n]+)`/g, '<code style="padding:1px 5px;border-radius:4px;background:rgba(120,120,128,0.12);font-size:11.5px;">$1</code>')
+      .replace(/^\s*\*\s+/, "&bull; ");
     if (/^#{1,4}\s+/.test(tr)) {
       esc = esc.replace(/^\s*#{1,4}\s+/, "");
       out.push(`<div class="md-h3">${esc}</div>`);
@@ -6791,7 +9163,10 @@ function resolveDingtalkTimeLocal(hm) {
   const tMode = ["datetime", "date_only", "none"].includes(ov.msg_time_mode)
     ? ov.msg_time_mode
     : (["datetime", "date_only", "none"].includes(cfg.dt_time_mode) ? cfg.dt_time_mode : "datetime");
-  const dFmt = ["YYYY-MM-DD", "YYYY年M月D日", "M月D日"].includes(cfg.dt_date_fmt) ? cfg.dt_date_fmt : "YYYY-MM-DD";
+  const validFmts = ["YYYY-MM-DD", "YYYY年M月D日", "M月D日"];
+  const dFmt = validFmts.includes(ov.msg_date_fmt)
+    ? ov.msg_date_fmt
+    : (validFmts.includes(cfg.dt_date_fmt) ? cfg.dt_date_fmt : "YYYY-MM-DD");
   let dOff = clampOff(cfg.dt_day_offset, 0);
   let src = "全局";
   if (ov.msg_day_offset !== null && ov.msg_day_offset !== undefined) {
@@ -6861,6 +9236,48 @@ function ensureSummaryPresetsStruct() {
   }
   return cfg.summary_presets;
 }
+function ensureRawSyncStruct() {
+  if (!cfg.raw_sync || typeof cfg.raw_sync !== "object") {
+    cfg.raw_sync = { enabled: false, interval_min: 40, skip_near_send_min: 5, preserve_summary_cells: true, write_r4_timestamp: true, all_day: true, start: "00:00", end: "23:59" };
+  }
+  const rs = cfg.raw_sync;
+  rs.enabled = Boolean(rs.enabled);
+  const iv = Number(rs.interval_min);
+  rs.interval_min = Number.isFinite(iv) ? Math.max(10, Math.min(360, Math.round(iv))) : 40;
+  const sk = Number(rs.skip_near_send_min);
+  rs.skip_near_send_min = (rs.skip_near_send_min === undefined || rs.skip_near_send_min === null || !Number.isFinite(sk)) ? 5 : Math.max(0, Math.min(30, Math.round(sk)));
+  if (rs.preserve_summary_cells === undefined) rs.preserve_summary_cells = true;
+  if (rs.write_r4_timestamp === undefined) rs.write_r4_timestamp = true;
+  if (rs.all_day === undefined) rs.all_day = true;
+  if (!rs.start) rs.start = "00:00";
+  if (!rs.end) rs.end = "23:59";
+  return rs;
+}
+function renderRawSyncControls(nextStr = "") {
+  const rs = ensureRawSyncStruct();
+  const on = Boolean(rs.enabled);
+  if ($("rawSyncEnabled")) $("rawSyncEnabled").checked = on;
+  if ($("rawSyncAccordion")) $("rawSyncAccordion").classList.toggle("open", on);
+  if ($("rawSyncIntervalVal")) $("rawSyncIntervalVal").textContent = `${rs.interval_min}分`;
+  if ($("rawSyncIntervalQuickSeg")) {
+    for (const b of $("rawSyncIntervalQuickSeg").querySelectorAll(".mini-seg-btn")) {
+      b.classList.toggle("active", Number(b.dataset.min) === rs.interval_min);
+    }
+  }
+  if ($("rawSyncSkipVal")) $("rawSyncSkipVal").textContent = `${rs.skip_near_send_min}分`;
+  if ($("rawSyncPreserveSummary")) $("rawSyncPreserveSummary").checked = rs.preserve_summary_cells !== false;
+  if ($("rawSyncWriteR4")) $("rawSyncWriteR4").checked = rs.write_r4_timestamp !== false;
+  if ($("rawSyncStatusHint")) {
+    if (!on) {
+      $("rawSyncStatusHint").textContent = "未启用定时刷底表（仅在正式发群轮前刷新三表）";
+    } else {
+      const keepTxt = rs.preserve_summary_cells !== false ? "保留汇总其余格位" : "同步重填汇总格位";
+      const r4Txt = rs.write_r4_timestamp !== false ? "仅写 R4" : "不写 R4";
+      const nxtTxt = (nextStr && nextStr !== "—") ? ` · 下次预计 ${nextStr}` : "";
+      $("rawSyncStatusHint").textContent = `已启用：每 ${rs.interval_min} 分钟更新三表（${keepTxt} · ${r4Txt}）${nxtTxt}`;
+    }
+  }
+}
 function ensureUpdateTimeStruct() {
   if (!cfg.update_time_cell || typeof cfg.update_time_cell !== "object") {
     cfg.update_time_cell = { enabled: true, cell: "R4", only_after_paste: true };
@@ -6898,6 +9315,8 @@ function ensureAiStruct() {
   return cfg.ai_assistant;
 }
 
+let dtVerifyStatusMap = {};
+
 function renderDtTargets() {
   const wrap = $("dtTargetsList");
   wrap.innerHTML = "";
@@ -6907,6 +9326,10 @@ function renderDtTargets() {
   cfg.dt_targets.forEach((tgt, idx) => {
     const row = document.createElement("div");
     row.className = "target-item-row";
+
+    const mainLine = document.createElement("div");
+    mainLine.className = "target-item-main";
+
     const sw = document.createElement("label");
     sw.className = "ios-switch sm";
     const chk = document.createElement("input");
@@ -6924,20 +9347,138 @@ function renderDtTargets() {
     inp.type = "text";
     inp.placeholder = "输入完整群名或联系人名称";
     inp.value = tgt.name || "";
-    inp.oninput = () => { cfg.dt_targets[idx].name = inp.value; syncPrimaryDtSearch(); scheduleSave(false); };
+    inp.oninput = () => {
+      cfg.dt_targets[idx].name = inp.value;
+      delete dtVerifyStatusMap[idx];
+      const oldSt = row.querySelector(".target-verify-status");
+      if (oldSt) oldSt.remove();
+      syncPrimaryDtSearch();
+      scheduleSave(false);
+    };
     inpWrap.appendChild(inp);
 
-    row.appendChild(sw);
-    row.appendChild(inpWrap);
+    const verifyBtn = document.createElement("button");
+    verifyBtn.type = "button";
+    verifyBtn.className = "target-verify-btn";
+    const curSt = dtVerifyStatusMap[idx];
+    const isVerifying = Boolean(curSt && curSt.kind === "loading");
+    verifyBtn.disabled = isVerifying;
+    verifyBtn.textContent = isVerifying ? "识屏中…" : "AI 识屏核对";
+    verifyBtn.title = "唤醒桌面钉钉并搜一下这个名字，让 AI 看屏幕核对与您想发送的是否一致";
+    verifyBtn.onclick = async () => {
+      const curName = String(inp.value || "").trim();
+      if (!curName) {
+        showToast("请先输入群名或联系人名称");
+        inp.focus();
+        return;
+      }
+      dtVerifyStatusMap[idx] = { kind: "loading", text: "正在打开钉钉搜索并由 AI 看屏幕核对是否一致…" };
+      renderDtTargets();
+      try {
+        await flushPendingSave();
+        const r = await api("/api/verify-dingtalk-target", "POST", { name: curName }, null, 35000);
+        if (r && r.ok && r.matched) {
+          const mName = String(r.matched_name || curName).trim();
+          const kwUsed = String(r.used_keyword || curName).trim();
+          const secTxt = r.section ? ` [${r.section}]` : "";
+          const modeTxt = r.used_vision ? "AI 桌面看屏" : "本地识别";
+          dtVerifyStatusMap[idx] = {
+            kind: "ok",
+            matched_name: mName,
+            text: `${modeTxt}核对一致：钉钉为「${mName}」${secTxt}（检索词：${kwUsed}）`,
+          };
+        } else {
+          const reason = (r && (r.reason || r.message)) || "未在钉钉桌面搜索结果中发现一致对象";
+          const cands = (r && Array.isArray(r.candidates)) ? r.candidates.slice(0, 4) : [];
+          dtVerifyStatusMap[idx] = {
+            kind: "warn",
+            text: `AI 识屏提示：${reason}`,
+            candidates: cands,
+          };
+        }
+      } catch (_e) {
+        dtVerifyStatusMap[idx] = {
+          kind: "warn",
+          text: "AI 识屏请求超时或波动，请确认钉钉已登录后再点一次",
+          candidates: [],
+        };
+      }
+      renderDtTargets();
+    };
+
+    mainLine.appendChild(sw);
+    mainLine.appendChild(inpWrap);
+    mainLine.appendChild(verifyBtn);
     if (cfg.dt_targets.length > 1) {
       const del = document.createElement("button");
       del.type = "button";
       del.className = "clear-circle";
       del.title = "删除该会话";
       del.innerHTML = SVG_CLOSE;
-      del.onclick = () => { cfg.dt_targets.splice(idx, 1); syncPrimaryDtSearch(); renderDtTargets(); scheduleSave(true); };
-      row.appendChild(del);
+      del.onclick = () => {
+        cfg.dt_targets.splice(idx, 1);
+        dtVerifyStatusMap = {};
+        syncPrimaryDtSearch();
+        renderDtTargets();
+        scheduleSave(true);
+      };
+      mainLine.appendChild(del);
     }
+    row.appendChild(mainLine);
+
+    if (curSt && curSt.text) {
+      const stBox = document.createElement("div");
+      stBox.className = `target-verify-status ${curSt.kind || ""}`;
+      const stTxt = document.createElement("span");
+      stTxt.textContent = curSt.text;
+      stBox.appendChild(stTxt);
+
+      if (curSt.kind === "ok" && curSt.matched_name && curSt.matched_name !== String(tgt.name || "").trim()) {
+        const useBtn = document.createElement("button");
+        useBtn.type = "button";
+        useBtn.className = "target-cand-chip";
+        useBtn.textContent = `改用钉钉原名：${curSt.matched_name}`;
+        useBtn.onclick = () => {
+          cfg.dt_targets[idx].name = curSt.matched_name;
+          dtVerifyStatusMap[idx] = {
+            kind: "ok",
+            matched_name: curSt.matched_name,
+            text: `已按钉钉桌面实名校准为「${curSt.matched_name}」`,
+          };
+          syncPrimaryDtSearch();
+          renderDtTargets();
+          scheduleSave(true);
+          showToast(`已替换并保存：${curSt.matched_name}`);
+        };
+        stBox.appendChild(useBtn);
+      } else if (curSt.kind === "warn" && Array.isArray(curSt.candidates) && curSt.candidates.length) {
+        const lbl = document.createElement("span");
+        lbl.style.fontWeight = "700";
+        lbl.textContent = "桌面候选：";
+        stBox.appendChild(lbl);
+        for (const cand of curSt.candidates) {
+          const cBtn = document.createElement("button");
+          cBtn.type = "button";
+          cBtn.className = "target-cand-chip";
+          cBtn.textContent = cand;
+          cBtn.onclick = () => {
+            cfg.dt_targets[idx].name = cand;
+            dtVerifyStatusMap[idx] = {
+              kind: "ok",
+              matched_name: cand,
+              text: `已替换为桌面可见对象「${cand}」，可再点右侧按钮复核`,
+            };
+            syncPrimaryDtSearch();
+            renderDtTargets();
+            scheduleSave(true);
+            showToast(`已选用：${cand}`);
+          };
+          stBox.appendChild(cBtn);
+        }
+      }
+      row.appendChild(stBox);
+    }
+
     wrap.appendChild(row);
   });
 }
@@ -7265,7 +9806,9 @@ function renderAiControls() {
 
   // Tab 1 快捷总结风格胶囊
   const chipsWrap = $("aiStyleChips");
+  const popChipsWrap = $("aiPopoutStyleBar");
   chipsWrap.innerHTML = "";
+  if (popChipsWrap) popChipsWrap.innerHTML = "";
   for (const s of styles) {
     const b = document.createElement("button");
     b.type = "button";
@@ -7274,6 +9817,15 @@ function renderAiControls() {
     b.textContent = s.name;
     b.onclick = () => sendAiSummary(s.id, "");
     chipsWrap.appendChild(b);
+    if (popChipsWrap) {
+      const pb = document.createElement("button");
+      pb.type = "button";
+      pb.className = "ai-style-chip";
+      pb.title = s.desc || s.name;
+      pb.textContent = s.name;
+      pb.onclick = () => sendAiSummary(s.id, "");
+      popChipsWrap.appendChild(pb);
+    }
   }
 
   // Tab 2 随图附发风格分段选择
@@ -7448,6 +10000,7 @@ function renderDingtalkDatePanel() {
   }
   $("dtOffVal").textContent = formatOffsetLabel(dOff);
 
+  if ($("dtUseActualClock")) $("dtUseActualClock").checked = Boolean(cfg.dt_use_actual_clock);
   const cutOn = Boolean(cfg.dt_cutoff_enabled);
   $("dtCutoffEnabled").checked = cutOn;
   $("dtCutoffCtrlWrap").style.display = cutOn ? "flex" : "none";
@@ -7566,7 +10119,417 @@ function scrollToLogBottom(smooth = false) {
   });
 }
 
-const TAB_ORDER = ["home", "dingtalk", "schedule", "more"];
+const TAB_ORDER = ["home", "dingtalk", "schedule", "more", "guide"];
+const ANN_EFFECTS = ["marquee", "gradient", "pulse", "glow", "typewriter", "static"];
+const ANN_THEMES = ["ocean", "amber", "emerald", "rose", "violet", "obsidian"];
+const ANN_SIZES = ["sm", "md", "lg"];
+const ANN_SPEEDS = ["slow", "normal", "fast"];
+const ANN_MEDIA_MODES = ["none", "loop_one", "loop_all"];
+const ANN_MEDIA_FITS = ["cover", "contain"];
+const ANN_HEIGHTS = ["normal", "tall", "cinema"];
+const ANN_TEXT_OVERLAYS = ["overlay", "hide"];
+const ANN_ANIM_LABELS = { aurora: "星河流动动画", pulse_wave: "霓虹脉冲动画", gold_ribbon: "黑金流光动画" };
+let _lastGlobalAnnSig = "";
+
+function safeAnnouncementMediaUrl(rawSrc) {
+  const s = String(rawSrc || "").trim();
+  if (!s || /[\r\n\0]/.test(s)) return "";
+  const mAnim = /^anim:(aurora|pulse_wave|gold_ribbon)$/i.exec(s);
+  if (mAnim) return `anim:${mAnim[1].toLowerCase()}`;
+  const mLoc = /^\/api\/ann-media\/([a-f0-9]{24}\.(?:mp4|webm|gif|webp|png|jpg|jpeg))$/i.exec(s);
+  if (mLoc) return `/api/ann-media/${mLoc[1].toLowerCase()}?token=${encodeURIComponent(TOKEN)}`;
+  if (/^data:(?:image\/(?:gif|webp|png|jpeg)|video\/(?:mp4|webm));base64,[A-Za-z0-9+/=]+$/.test(s)) {
+    return s.length <= 700000 ? s : "";
+  }
+  if (/^https?:\/\//i.test(s) && s.length <= 2048) {
+    try {
+      const u = new URL(s);
+      if (!["http:", "https:"].includes(u.protocol) || u.username || u.password) return "";
+      const host = (u.hostname || "").replace(/^\[|\]$/g, "").toLowerCase();
+      if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal") || host.endsWith(".arpa")) return "";
+      if (/^(?:127\.|10\.|0\.|169\.254\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(host)) return "";
+      if (host === "::1" || host === "::" || /^(?:fe80|fc|fd)/i.test(host)) return "";
+      return s;
+    } catch (_e) {
+      return "";
+    }
+  }
+  return "";
+}
+
+function normalizeAnnouncementClient(raw) {
+  const r = raw && typeof raw === "object" ? raw : {};
+  const ef = String(r.effect || "gradient").toLowerCase();
+  const th = String(r.theme || "ocean").toLowerCase();
+  const sz = String(r.font_size || "md").toLowerCase();
+  const sp = String(r.speed || "normal").toLowerCase();
+  const mm = String(r.media_mode || "none").toLowerCase();
+  const mf = String(r.media_fit || "cover").toLowerCase();
+  const bh = String(r.banner_height || "normal").toLowerCase();
+  const to = String(r.text_overlay || "overlay").toLowerCase();
+  const rawItems = Array.isArray(r.media_items) ? r.media_items : [];
+  const cleanItems = [];
+  for (let i = 0; i < rawItems.length && cleanItems.length < 8; i++) {
+    const it = rawItems[i];
+    if (!it || typeof it !== "object") continue;
+    const rawUrl = String(it.src || "").trim();
+    if (!safeAnnouncementMediaUrl(rawUrl)) continue;
+    const k0 = String(it.kind || "").toLowerCase();
+    const kind = ["video", "gif", "image", "anim"].includes(k0) ? k0 : (rawUrl.startsWith("anim:") ? "anim" : "video");
+    const dur = Number(it.duration_sec);
+    cleanItems.push({
+      id: String(it.id || `m_${i + 1}`).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 24) || `m_${i + 1}`,
+      kind,
+      title: String(it.title || "横幅媒体").replace(/[\r\n]+/g, " ").trim().slice(0, 36) || "横幅媒体",
+      src: rawUrl,
+      duration_sec: Number.isFinite(dur) ? Math.max(3, Math.min(60, Math.round(dur))) : 8,
+    });
+  }
+  const aIdx0 = Number(r.media_active_idx || 0);
+  const activeIdx = cleanItems.length ? Math.max(0, Math.min(cleanItems.length - 1, Math.round(Number.isFinite(aIdx0) ? aIdx0 : 0))) : 0;
+  return {
+    enabled: r.enabled !== false,
+    badge: String(r.badge || "全员公告").trim().slice(0, 12) || "全员公告",
+    text: String(r.text !== undefined ? r.text : "欢迎使用暗号表助手！超级管理员可在总控后台实时编辑全员公告与文字动态效果，所有电脑将自动同步显示。").trim().slice(0, 300),
+    effect: ANN_EFFECTS.includes(ef) ? ef : "gradient",
+    theme: ANN_THEMES.includes(th) ? th : "ocean",
+    font_size: ANN_SIZES.includes(sz) ? sz : "md",
+    speed: ANN_SPEEDS.includes(sp) ? sp : "normal",
+    media_mode: ANN_MEDIA_MODES.includes(mm) ? mm : "none",
+    media_active_idx: activeIdx,
+    media_muted: r.media_muted !== false,
+    media_fit: ANN_MEDIA_FITS.includes(mf) ? mf : "cover",
+    banner_height: ANN_HEIGHTS.includes(bh) ? bh : "normal",
+    text_overlay: ANN_TEXT_OVERLAYS.includes(to) ? to : "overlay",
+    media_items: cleanItems,
+    rev: Number(r.rev || 0),
+    updated_at: String(r.updated_at || ""),
+    updated_by: String(r.updated_by || ""),
+  };
+}
+
+const _annMediaPlayers = {
+  global: { layerId: "globalAnnMediaLayer", muteBtnId: "globalAnnMuteBtn", mediaSig: "", timer: 0, videoEl: null, index: 0, failCount: 0, pausedByVis: false, lastAnn: null },
+  preview: { layerId: "adminAnnPreviewMediaLayer", muteBtnId: "adminAnnPreviewMuteBtn", mediaSig: "", timer: 0, videoEl: null, index: 0, failCount: 0, pausedByVis: false, lastAnn: null },
+};
+let _annVisBound = false;
+
+function _clearAnnVideoEl(st) {
+  if (st.timer) {
+    clearTimeout(st.timer);
+    st.timer = 0;
+  }
+  if (st.videoEl) {
+    try {
+      st.videoEl.onended = null;
+      st.videoEl.onerror = null;
+      st.videoEl.pause();
+      st.videoEl.removeAttribute("src");
+      st.videoEl.load();
+    } catch (_e) {}
+    st.videoEl = null;
+  }
+  const layer = $(st.layerId);
+  if (layer) {
+    for (const im of layer.querySelectorAll("img")) {
+      im.onload = null;
+      im.onerror = null;
+    }
+  }
+}
+
+function destroyAnnMediaPlayer(slotKey) {
+  const st = _annMediaPlayers[slotKey];
+  if (!st) return;
+  _clearAnnVideoEl(st);
+  st.mediaSig = "";
+  st.index = 0;
+  st.failCount = 0;
+  st.pausedByVis = false;
+  st.lastAnn = null;
+  const layer = $(st.layerId);
+  if (layer) layer.innerHTML = "";
+  const mbtn = $(st.muteBtnId);
+  if (mbtn) {
+    mbtn.onclick = null;
+    mbtn.classList.remove("show");
+  }
+}
+
+function _mountAnnMediaIndex(slotKey, ann, targetIdx) {
+  const st = _annMediaPlayers[slotKey];
+  if (!st) return;
+  const layer = $(st.layerId);
+  const mbtn = $(st.muteBtnId);
+  if (!layer || !ann.media_items.length) {
+    destroyAnnMediaPlayer(slotKey);
+    return;
+  }
+  _clearAnnVideoEl(st);
+  st.lastAnn = ann;
+  const items = ann.media_items;
+  const idx = ((targetIdx % items.length) + items.length) % items.length;
+  st.index = idx;
+  const item = items[idx];
+  const playUrl = safeAnnouncementMediaUrl(item.src);
+  layer.innerHTML = "";
+
+  const advanceNext = (wasErr = false) => {
+    if (wasErr) st.failCount += 1;
+    else st.failCount = 0;
+    if (st.failCount >= items.length) return;
+    if (ann.media_mode === "loop_all" && items.length > 1) {
+      _mountAnnMediaIndex(slotKey, ann, idx + 1);
+    }
+  };
+  const armAdvance = (ms, wasErr = false) => {
+    if (document.hidden) {
+      st.pausedByVis = true;
+      return;
+    }
+    st.timer = setTimeout(() => advanceNext(wasErr), ms);
+  };
+
+  if (!playUrl) {
+    advanceNext(true);
+    return;
+  }
+
+  if (playUrl.startsWith("anim:")) {
+    if (mbtn) {
+      mbtn.onclick = null;
+      mbtn.classList.remove("show");
+    }
+    const preset = playUrl.slice(5);
+    const dv = document.createElement("div");
+    dv.className = `ann-anim-canvas ann-anim-${preset}`;
+    layer.appendChild(dv);
+    if (ann.media_mode === "loop_all" && items.length > 1) {
+      armAdvance(Math.max(3, item.duration_sec || 8) * 1000, false);
+    }
+    return;
+  }
+
+  if (item.kind === "video") {
+    const vid = document.createElement("video");
+    vid.className = "ann-media-item";
+    vid.autoplay = true;
+    vid.playsInline = true;
+    vid.preload = "auto";
+    vid.defaultMuted = Boolean(ann.media_muted);
+    vid.muted = Boolean(ann.media_muted);
+    const isSingleLoop = (ann.media_mode === "loop_one") || (items.length === 1);
+    vid.loop = isSingleLoop;
+    vid.src = playUrl;
+    vid.onended = () => {
+      if (!isSingleLoop && ann.media_mode === "loop_all") advanceNext(false);
+    };
+    vid.onerror = () => {
+      armAdvance(220, true);
+    };
+    st.videoEl = vid;
+    layer.appendChild(vid);
+    const playP = vid.play();
+    if (playP && typeof playP.catch === "function") playP.catch(() => {});
+    if (mbtn) {
+      mbtn.classList.add("show");
+      mbtn.textContent = vid.muted ? "已静音" : "有声";
+      mbtn.onclick = (e) => {
+        e.stopPropagation();
+        if (!st.videoEl) return;
+        st.videoEl.muted = !st.videoEl.muted;
+        mbtn.textContent = st.videoEl.muted ? "已静音" : "有声";
+      };
+    }
+    return;
+  }
+
+  if (mbtn) {
+    mbtn.onclick = null;
+    mbtn.classList.remove("show");
+  }
+  const img = document.createElement("img");
+  img.className = "ann-media-item";
+  img.alt = item.title || "横幅动画";
+  img.onload = () => { st.failCount = 0; };
+  img.onerror = () => {
+    armAdvance(220, true);
+  };
+  img.src = playUrl;
+  layer.appendChild(img);
+  if (ann.media_mode === "loop_all" && items.length > 1) {
+    armAdvance(Math.max(3, item.duration_sec || 8) * 1000, false);
+  }
+}
+
+function renderAnnMediaPlayer(slotKey, ann) {
+  const st = _annMediaPlayers[slotKey];
+  if (!st) return;
+  if (!_annVisBound) {
+    _annVisBound = true;
+    document.addEventListener("visibilitychange", () => {
+      for (const k of ["global", "preview"]) {
+        const ps = _annMediaPlayers[k];
+        if (!ps || !ps.mediaSig) continue;
+        try {
+          if (document.hidden) {
+            if (ps.videoEl) ps.videoEl.pause();
+            if (ps.timer) {
+              clearTimeout(ps.timer);
+              ps.timer = 0;
+            }
+            ps.pausedByVis = true;
+          } else if (ps.pausedByVis) {
+            ps.pausedByVis = false;
+            if (ps.videoEl) {
+              const p0 = ps.videoEl.play();
+              if (p0 && typeof p0.catch === "function") p0.catch(() => {});
+            } else if (ps.lastAnn && ps.lastAnn.media_mode === "loop_all" && ps.lastAnn.media_items.length > 1) {
+              _mountAnnMediaIndex(k, ps.lastAnn, ps.index + 1);
+            }
+          }
+        } catch (_e) {}
+      }
+    });
+  }
+  const hasActiveMedia = Boolean(ann.enabled && ann.media_mode !== "none" && ann.media_items.length > 0);
+  if (!hasActiveMedia) {
+    destroyAnnMediaPlayer(slotKey);
+    return;
+  }
+  st.lastAnn = ann;
+  const nextMediaSig = `${ann.media_mode}|${ann.media_active_idx}|${JSON.stringify(ann.media_items)}`;
+  if (st.mediaSig === nextMediaSig) {
+    if (st.videoEl) {
+      st.videoEl.muted = Boolean(ann.media_muted);
+      const mbtn = $(st.muteBtnId);
+      if (mbtn) mbtn.textContent = st.videoEl.muted ? "已静音" : "有声";
+    }
+    return;
+  }
+  st.mediaSig = nextMediaSig;
+  st.failCount = 0;
+  const startIdx = ann.media_mode === "loop_one" ? ann.media_active_idx : 0;
+  _mountAnnMediaIndex(slotKey, ann, startIdx);
+}
+
+function applyAnnouncementToDom(annRaw, isPreview = false) {
+  const ann = normalizeAnnouncementClient(annRaw);
+  const slotKey = isPreview ? "preview" : "global";
+  const bar = $(isPreview ? "adminAnnPreviewBar" : "globalAnnouncementBar");
+  const badgeEl = $(isPreview ? "adminAnnPreviewBadge" : "globalAnnBadge");
+  const trackEl = $(isPreview ? "adminAnnPreviewTrack" : "globalAnnTrack");
+  const metaEl = $(isPreview ? "adminAnnPreviewMeta" : "globalAnnMeta");
+  if (!bar || !badgeEl || !trackEl) return;
+
+  const hasActiveMedia = Boolean(ann.media_mode !== "none" && ann.media_items.length > 0);
+  const shouldHide = !isPreview && (!ann.enabled || (!ann.text && !hasActiveMedia));
+  const hideTextEffective = hasActiveMedia && (ann.text_overlay === "hide" || (!ann.text && !isPreview));
+  const sig = `${ann.enabled ? 1 : 0}|${ann.badge}|${ann.text}|${ann.effect}|${ann.theme}|${ann.font_size}|${ann.speed}|${ann.media_mode}|${ann.media_active_idx}|${ann.media_muted ? 1 : 0}|${ann.media_fit}|${ann.banner_height}|${ann.text_overlay}|${JSON.stringify(ann.media_items)}|${ann.updated_at}|${ann.rev}`;
+  if (!isPreview && sig === _lastGlobalAnnSig) return;
+  if (!isPreview) _lastGlobalAnnSig = sig;
+
+  bar.className = [
+    "ann-bar",
+    `ann-theme-${ann.theme}`,
+    `ann-fx-${ann.effect}`,
+    `ann-size-${ann.font_size}`,
+    `ann-speed-${ann.speed}`,
+    `ann-h-${ann.banner_height}`,
+    `ann-fit-${ann.media_fit}`,
+    hasActiveMedia ? "ann-has-media" : "",
+    (hasActiveMedia && !hideTextEffective) ? "ann-text-overlay" : "",
+    hideTextEffective ? "ann-text-hide" : "",
+    shouldHide ? "ann-hidden" : "",
+    (isPreview && !ann.enabled) ? "ann-is-disabled-preview" : "",
+  ].filter(Boolean).join(" ");
+
+  badgeEl.textContent = ann.badge;
+  const displayTxt = ann.text || (isPreview ? (hasActiveMedia ? "（纯横幅播放中 · 无文字）" : "（暂未填写公告内容，如要纯播视频可直接在下方添加媒体）") : "");
+  trackEl.innerHTML = "";
+  const seg1 = document.createElement("span");
+  seg1.className = "ann-text-seg";
+  seg1.id = isPreview ? "adminAnnPreviewTextA" : "globalAnnTextA";
+  seg1.textContent = displayTxt;
+  trackEl.appendChild(seg1);
+  if (ann.effect === "marquee" && displayTxt) {
+    const seg2 = document.createElement("span");
+    seg2.className = "ann-text-seg";
+    seg2.setAttribute("aria-hidden", "true");
+    seg2.textContent = displayTxt;
+    trackEl.appendChild(seg2);
+  }
+  if (metaEl) {
+    if (isPreview) {
+      metaEl.textContent = ann.enabled ? "已开启 · 实时预览" : "当前已关闭展示";
+    } else if (ann.updated_at) {
+      metaEl.textContent = `${ann.updated_by ? ann.updated_by + " · " : ""}${ann.updated_at}`;
+    } else {
+      metaEl.textContent = "";
+    }
+  }
+  renderAnnMediaPlayer(slotKey, ann);
+  if (!isPreview && typeof scheduleSyncHomeAiStickyHeight === "function") {
+    scheduleSyncHomeAiStickyHeight();
+  }
+}
+
+let _homeAiUserMaxH = null;
+let _homeAiStickyRaf = 0;
+let _lastHomeAiCardH = 0;
+
+function syncHomeAiStickyHeight() {
+  const paneHome = $("pane-home");
+  const aiCol = $("homeAiCol");
+  const card = $("aiCardBox");
+  const stg = $("scrollStage");
+  if (!paneHome || !aiCol || !card || !stg) return;
+  if (!paneHome.classList.contains("active")) return;
+  if (window.innerWidth <= 680 || window.innerHeight <= 620) {
+    if (card.style.height) {
+      card.style.height = "";
+      _lastHomeAiCardH = 0;
+    }
+    return;
+  }
+  const colRect = aiCol.getBoundingClientRect();
+  const tabEl = $("tabbar");
+  const tabTop = tabEl ? tabEl.getBoundingClientRect().top : (window.innerHeight - 68);
+  const availH = Math.max(300, Math.round(tabTop - colRect.top - 14));
+  const finalH = (_homeAiUserMaxH && Number.isFinite(_homeAiUserMaxH))
+    ? Math.max(300, Math.min(availH, _homeAiUserMaxH))
+    : availH;
+  if (Math.abs(finalH - _lastHomeAiCardH) >= 1) {
+    _lastHomeAiCardH = finalH;
+    card.style.height = `${finalH}px`;
+  }
+}
+
+function scheduleSyncHomeAiStickyHeight() {
+  if (_homeAiStickyRaf) return;
+  _homeAiStickyRaf = requestAnimationFrame(() => {
+    _homeAiStickyRaf = 0;
+    syncHomeAiStickyHeight();
+  });
+}
+
+function scrollStageToElement(el, behavior = "smooth") {
+  const stg = $("scrollStage");
+  if (!stg || !el) return;
+  const activePane = document.querySelector(".tab-pane.active");
+  let stickySubH = 0;
+  if (activePane) {
+    const subSticky = activePane.querySelector(".sub-qnav-sticky, .guide-sticky-header");
+    if (subSticky && window.getComputedStyle(subSticky).position === "sticky") {
+      stickySubH = subSticky.getBoundingClientRect().height || 0;
+    }
+  }
+  const stgRect = stg.getBoundingClientRect();
+  const elRect = el.getBoundingClientRect();
+  const nextTop = Math.max(0, stg.scrollTop + (elRect.top - stgRect.top) - stickySubH - 12);
+  stg.scrollTo({ top: nextTop, behavior });
+}
+
 function switchTab(name) {
   const idx = Math.max(0, TAB_ORDER.indexOf(name));
   $("tabPillBg").style.transform = `translateX(${idx * 100}%)`;
@@ -7579,9 +10542,42 @@ function switchTab(name) {
   const stg = $("scrollStage");
   if (stg) stg.scrollTop = 0;
   window.scrollTo({ top: 0, behavior: "instant" });
+  if (name === "home") scheduleSyncHomeAiStickyHeight();
   if (name === "more" && autoScroll) {
     scrollToLogBottom(false);
   }
+}
+
+function jumpToModule(tabName, targetSelector, focusSelector = "") {
+  if (tabName) switchTab(tabName);
+  setTimeout(() => {
+    if (targetSelector === "#kbGuideCard" && $("guideBody")) {
+      $("guideBody").classList.add("open");
+      if ($("guideChevron")) $("guideChevron").style.transform = "rotate(90deg)";
+    }
+    if (targetSelector === "#summaryPresetsSection" && $("spAccordion")) {
+      $("spAccordion").classList.add("open");
+    }
+    const tgtEl = targetSelector ? document.querySelector(targetSelector) : null;
+    if (tgtEl) {
+      if (tabName === "home" && targetSelector === "#aiCardBox" && window.innerWidth > 680) {
+        const stg = $("scrollStage");
+        if (stg) stg.scrollTo({ top: 0, behavior: "smooth" });
+      } else {
+        scrollStageToElement(tgtEl, "smooth");
+      }
+      tgtEl.classList.remove("module-focus-pulse");
+      void tgtEl.offsetWidth;
+      tgtEl.classList.add("module-focus-pulse");
+      setTimeout(() => tgtEl.classList.remove("module-focus-pulse"), 2400);
+    }
+    if (focusSelector) {
+      const fEl = document.querySelector(focusSelector);
+      if (fEl && typeof fEl.focus === "function") {
+        setTimeout(() => { try { fEl.focus(); } catch (_e) {} }, 120);
+      }
+    }
+  }, 60);
 }
 
 function iosAlert(title, msg, { okText = "好", cancelText = null, danger = false } = {}) {
@@ -7858,8 +10854,37 @@ function renderCaptureWindows() {
   });
 }
 
+let editingPointIsExtra = false;
+let editingPointAddedNew = false;
+
+function _parseTargetListInput(rawStr) {
+  const parts = String(rawStr || "").split(/[、,，\r\n]+/).map((x) => x.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const out = [];
+  for (const x of parts) {
+    const clean = x.slice(0, 64);
+    if (clean && !out.includes(clean)) out.push(clean);
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+function _normExtraPointsArray(arr) {
+  const out = [];
+  for (const x of (Array.isArray(arr) ? arr : [])) {
+    const m = /^(\d{1,2}):(\d{1,2})$/.exec(String(x || "").trim());
+    if (!m) continue;
+    const h = Math.max(0, Math.min(23, Number(m[1])));
+    const mn = Math.max(0, Math.min(59, Number(m[2])));
+    const hm = `${pad2(h)}:${pad2(mn)}`;
+    if (!out.includes(hm)) out.push(hm);
+    if (out.length >= 48) break;
+  }
+  return out.sort();
+}
+
 function _isPointOverrideEmpty(ov) {
   if (!ov) return true;
+  const hasTgts = Array.isArray(ov.targets) && ov.targets.some((x) => String(x || "").trim());
   return (
     (!ov.mode || ov.mode === "default")
     && (ov.suffix === null || ov.suffix === undefined)
@@ -7867,6 +10892,8 @@ function _isPointOverrideEmpty(ov) {
     && (ov.sheet_day_offset === null || ov.sheet_day_offset === undefined)
     && (!ov.msg_time_mode || ov.msg_time_mode === "default")
     && (ov.msg_day_offset === null || ov.msg_day_offset === undefined)
+    && (!ov.msg_date_fmt || ov.msg_date_fmt === "default")
+    && !hasTgts
   );
 }
 
@@ -7891,8 +10918,9 @@ function renderTimetable(tt, forceRebuild = false) {
     next: nextPt ? nextPt.time : "",
     dayMode: cfg.day_mode || "daily",
     cdays: cfg.custom_days || [],
+    extra: cfg.extra_points || [],
     ov: cfg.point_overrides || {},
-    items: latestTimetable.map((it) => [it.time, it.do_dingtalk, it.do_capture, it.do_silent, it.sheet_offset_effective, it.msg_preview]),
+    items: latestTimetable.map((it) => [it.time, it.period, Boolean(it.is_extra), it.do_dingtalk, it.do_capture, it.do_silent, it.sheet_offset_effective, it.msg_preview, it.targets_override || null]),
   });
   if (!forceRebuild && ttSig === lastTimetableSig) {
     return;
@@ -7924,9 +10952,16 @@ function renderTimetable(tt, forceRebuild = false) {
     hmEl.textContent = item.time;
     const perEl = document.createElement("div");
     perEl.className = "tt-period";
+    const isExtraPt = Boolean(item.is_extra || (Array.isArray(cfg.extra_points) && cfg.extra_points.includes(item.time)));
     const perTxt = document.createElement("span");
-    perTxt.textContent = item.period || "白天";
+    perTxt.textContent = item.period || (isExtraPt ? "自定义" : "白天");
     perEl.appendChild(perTxt);
+    if (isExtraPt && item.period !== "自定义") {
+      const exTag = document.createElement("span");
+      exTag.className = "tt-next-tag extra";
+      exTag.textContent = "自定";
+      perEl.appendChild(exTag);
+    }
     if (dayOk && !nextMarked && item.min > nowMin) {
       nextMarked = true;
       const tag = document.createElement("span");
@@ -7952,10 +10987,15 @@ function renderTimetable(tt, forceRebuild = false) {
     const badges = document.createElement("div");
     badges.className = "tt-badges";
 
+    const ptOvTgts = Array.isArray(item.targets_override) && item.targets_override.length
+      ? item.targets_override
+      : (rawOv && Array.isArray(rawOv.targets) && rawOv.targets.length ? rawOv.targets : null);
     if (item.do_dingtalk) {
       const dtPill = document.createElement("span");
-      dtPill.className = "tt-pill dt-on";
-      dtPill.textContent = enabledTargetCount > 1 ? `发钉钉(${enabledTargetCount}群)` : "发钉钉";
+      dtPill.className = ptOvTgts ? "tt-pill tgt-on" : "tt-pill dt-on";
+      dtPill.textContent = ptOvTgts
+        ? `发给：${ptOvTgts.join("、")}`
+        : (enabledTargetCount > 1 ? `发钉钉(${enabledTargetCount}群)` : "发钉钉");
       badges.appendChild(dtPill);
 
       const shPill = document.createElement("span");
@@ -8006,7 +11046,7 @@ function renderTimetable(tt, forceRebuild = false) {
       silChk.onchange = () => {
         if (!cfg.point_overrides) cfg.point_overrides = {};
         const globalSil = $("dtSilentSend").checked;
-        const curOv = cfg.point_overrides[item.time] ? { ...cfg.point_overrides[item.time] } : { mode: "default", suffix: null, silent: null, sheet_day_offset: null, msg_time_mode: null, msg_day_offset: null };
+        const curOv = cfg.point_overrides[item.time] ? { ...cfg.point_overrides[item.time] } : { mode: "default", suffix: null, silent: null, sheet_day_offset: null, msg_time_mode: null, msg_day_offset: null, msg_date_fmt: null };
         curOv.silent = silChk.checked === globalSil ? null : silChk.checked;
         if (_isPointOverrideEmpty(curOv)) delete cfg.point_overrides[item.time];
         else cfg.point_overrides[item.time] = curOv;
@@ -8020,6 +11060,19 @@ function renderTimetable(tt, forceRebuild = false) {
       silWrap.appendChild(silLbl);
       silWrap.appendChild(silSw);
       rightCtrl.appendChild(silWrap);
+    }
+
+    if (isExtraPt) {
+      const delPtBtn = document.createElement("button");
+      delPtBtn.type = "button";
+      delPtBtn.className = "tt-del-btn";
+      delPtBtn.title = "删除该自定义时间点";
+      delPtBtn.textContent = "×";
+      delPtBtn.onclick = (e) => {
+        e.stopPropagation();
+        deleteExtraPoint(item.time);
+      };
+      rightCtrl.appendChild(delPtBtn);
     }
 
     const chevWrap = document.createElement("div");
@@ -8059,6 +11112,11 @@ function _applyOvToLiveTimetable(hm, ovObj) {
   livePt.sheet_offset_effective = sOff;
   livePt.sheet_date_preview = formatShiftedDateLocal(sFmt, sOff);
 
+  const ovTgts = Array.isArray(ov.targets) && ov.targets.length ? ov.targets.slice() : null;
+  livePt.targets_override = ovTgts;
+  livePt.targets = ovTgts || getEnabledTargetsLocal();
+  livePt.targets_source = ovTgts ? "单点指定" : "全局默认";
+
   const msgPrev = buildMessagePreviewLocal(hm);
   livePt.suffix = msgPrev.suf;
   livePt.has_custom_suffix = ov.suffix !== null && ov.suffix !== undefined;
@@ -8072,9 +11130,12 @@ function _syncEditingPointLive(immediateSave = false) {
   if (!editingPointHm) return;
   if (!cfg.point_overrides) cfg.point_overrides = {};
   const hasCustom = $("pointCustomSufOn").checked;
+  const hasCustomTgt = $("pointCustomTargetOn") ? $("pointCustomTargetOn").checked : false;
   const silVal = editingPointSilent === "on" ? true : (editingPointSilent === "off" ? false : null);
   const sufVal = hasCustom ? $("pointCustomSufInput").value.trim() : null;
+  const tgtsList = (hasCustomTgt && $("pointCustomTargetInput")) ? _parseTargetListInput($("pointCustomTargetInput").value) : [];
   const msgModeVal = editingPtMsgMode === "default" ? null : editingPtMsgMode;
+  const msgFmtVal = editingPtMsgFmt === "default" ? null : editingPtMsgFmt;
   const ovObj = {
     mode: editingPointMode,
     suffix: sufVal,
@@ -8082,6 +11143,8 @@ function _syncEditingPointLive(immediateSave = false) {
     sheet_day_offset: editingPtSheetOff,
     msg_time_mode: msgModeVal,
     msg_day_offset: editingPtMsgOff,
+    msg_date_fmt: msgFmtVal,
+    targets: (hasCustomTgt && tgtsList.length) ? tgtsList : null,
   };
   if (_isPointOverrideEmpty(ovObj)) delete cfg.point_overrides[editingPointHm];
   else cfg.point_overrides[editingPointHm] = ovObj;
@@ -8097,6 +11160,20 @@ function _refreshPointModalPreview() {
   }
   if ($("pointActionPrevText")) {
     $("pointActionPrevText").textContent = actState.doDingtalk ? "更新表格 + 发钉钉" : "只更新表格（不发钉钉）";
+  }
+  if ($("pointTargetPrevText")) {
+    if (!actState.doDingtalk) {
+      $("pointTargetPrevText").textContent = "本时间点不发钉钉";
+    } else {
+      const hasCustomTgt = $("pointCustomTargetOn") && $("pointCustomTargetOn").checked;
+      const customTgts = (hasCustomTgt && $("pointCustomTargetInput")) ? _parseTargetListInput($("pointCustomTargetInput").value) : [];
+      if (customTgts.length) {
+        $("pointTargetPrevText").textContent = `${customTgts.join("、")}（单独指定）`;
+      } else {
+        const gTgts = getEnabledTargetsLocal();
+        $("pointTargetPrevText").textContent = `${gTgts.join("、") || "文件小助手"}（按全局默认）`;
+      }
+    }
   }
 
   // 表格日期预览
@@ -8125,8 +11202,11 @@ function _refreshPointModalPreview() {
   const baseTp = resolveDingtalkTimeLocal(editingPointHm);
   const mMode = editingPtMsgMode === "default" ? (cfg.dt_time_mode || "datetime") : editingPtMsgMode;
   if ($("pointMsgDateRow")) $("pointMsgDateRow").style.display = (mMode === "none") ? "none" : "flex";
+  if ($("pointMsgFmtRow")) $("pointMsgFmtRow").style.display = (mMode === "none") ? "none" : "flex";
   const mOff = (editingPtMsgOff !== null && editingPtMsgOff !== undefined) ? clampOff(editingPtMsgOff, 0) : baseTp.dOff;
-  const datePart = formatShiftedDateLocal(baseTp.dFmt, mOff);
+  const gFmtFallback = ["YYYY-MM-DD", "YYYY年M月D日", "M月D日"].includes(cfg.dt_date_fmt) ? cfg.dt_date_fmt : "YYYY-MM-DD";
+  const mFmt = editingPtMsgFmt === "default" ? gFmtFallback : editingPtMsgFmt;
+  const datePart = formatShiftedDateLocal(mFmt, mOff);
   const stamp = mMode === "datetime" ? `${datePart} ${editingPointHm}` : (mMode === "date_only" ? datePart : "");
   const hasSuf = $("pointCustomSufOn").checked;
   const sufVal = hasSuf ? $("pointCustomSufInput").value.trim() : resolveSuffixByRulesOnly(editingPointHm).suf;
@@ -8149,12 +11229,127 @@ function _refreshPointModalPreview() {
     const active = v === "default" ? (editingPtMsgOff === null) : (editingPtMsgOff !== null && Number(v) === editingPtMsgOff);
     b.classList.toggle("active", active);
   }
+  if ($("pointMsgFmtSeg")) {
+    for (const b of $("pointMsgFmtSeg").querySelectorAll(".mini-seg-btn")) {
+      b.classList.toggle("active", b.dataset.val === editingPtMsgFmt);
+    }
+  }
   $("ptMsgOffVal").textContent = editingPtMsgOff === null ? "按默认" : formatOffsetLabel(editingPtMsgOff);
 }
 
-function openPointModal(item) {
+function _renderPointTargetQuickChips() {
+  const wrap = $("pointTargetQuickChips");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  const allKnown = [];
+  for (const t of (Array.isArray(cfg.dt_targets) ? cfg.dt_targets : [])) {
+    const nm = String((t && t.name) || "").trim();
+    if (nm && !allKnown.includes(nm)) allKnown.push(nm);
+  }
+  const primary = String(cfg.dt_search || "").trim();
+  if (primary && !allKnown.includes(primary)) allKnown.push(primary);
+  if (!allKnown.includes("文件小助手")) allKnown.push("文件小助手");
+  for (const nm of allKnown.slice(0, 8)) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ai-confirm-chip";
+    b.textContent = nm;
+    b.onclick = () => {
+      if ($("pointCustomTargetOn")) $("pointCustomTargetOn").checked = true;
+      if ($("pointCustomTargetWrap")) $("pointCustomTargetWrap").style.display = "flex";
+      const inp = $("pointCustomTargetInput");
+      if (!inp) return;
+      const curList = _parseTargetListInput(inp.value);
+      if (!curList.includes(nm)) {
+        if (curList.length >= 10) {
+          showToast("单个时间点最多指定 10 个发送对象");
+          return;
+        }
+        curList.push(nm);
+      }
+      inp.value = curList.join("、");
+      _refreshPointModalPreview();
+      _syncEditingPointLive(true);
+    };
+    wrap.appendChild(b);
+  }
+}
+
+function deleteExtraPoint(hm) {
+  const targetHm = String(hm || "").trim();
+  if (!targetHm) return;
+  cfg.extra_points = _normExtraPointsArray(cfg.extra_points).filter((x) => x !== targetHm);
+  if (cfg.point_overrides && cfg.point_overrides[targetHm]) {
+    delete cfg.point_overrides[targetHm];
+  }
+  latestTimetable = (Array.isArray(latestTimetable) ? latestTimetable : []).filter((it) => !(it && it.time === targetHm && (it.is_extra || it.period === "自定义")));
+  renderTimetable(latestTimetable, true);
+  scheduleSave(true);
+  showToast(`已移除自定义时间点 ${targetHm}`);
+}
+
+function openAddExtraPointFlow() {
+  if (_normExtraPointsArray(cfg.extra_points).length >= 48) {
+    showToast("自定义时间点最多支持 48 个");
+    return;
+  }
+  const now = new Date();
+  openPicker({
+    title: "新增自定义定时时间点",
+    mode: "time",
+    h: now.getHours(),
+    m: 0,
+    onConfirm: (nh, nm) => {
+      const hm = `${pad2(nh)}:${pad2(nm)}`;
+      const existItem = Array.isArray(latestTimetable) ? latestTimetable.find((it) => it && it.time === hm) : null;
+      if (existItem) {
+        showToast(`${hm} 已在排期列表中，已为您直接打开该时间点设置`);
+        openPointModal(existItem, { isNewExtra: false });
+        return;
+      }
+      cfg.extra_points = _normExtraPointsArray([...(cfg.extra_points || []), hm]);
+      if (!cfg.point_overrides) cfg.point_overrides = {};
+      if (!cfg.point_overrides[hm]) {
+        cfg.point_overrides[hm] = {
+          mode: "send",
+          suffix: null,
+          silent: null,
+          sheet_day_offset: null,
+          msg_time_mode: null,
+          msg_day_offset: null,
+          msg_date_fmt: null,
+          targets: null,
+        };
+      }
+      const actInit = resolvePointActionStateLocal(hm, "send");
+      const msgPrev = buildMessagePreviewLocal(hm);
+      const newItem = {
+        time: hm,
+        min: nh * 60 + nm,
+        period: "自定义",
+        is_extra: true,
+        do_capture: actInit.doCapture,
+        do_dingtalk: actInit.doDingtalk,
+        do_silent: $("dtSilentSend") ? $("dtSilentSend").checked : true,
+        suffix: msgPrev.suf,
+        sheet_offset_effective: 0,
+        msg_preview: msgPrev.text,
+        targets: getEnabledTargetsLocal(),
+        targets_override: null,
+      };
+      latestTimetable = [...(Array.isArray(latestTimetable) ? latestTimetable : []), newItem].sort((a, b) => (a.min || 0) - (b.min || 0));
+      renderTimetable(latestTimetable, true);
+      scheduleSave(true);
+      openPointModal(newItem, { isNewExtra: true });
+    },
+  });
+}
+
+function openPointModal(item, opts = {}) {
   editingPointHm = item.time;
-  $("pointSheetTitle").textContent = `${item.time} 时间点设置`;
+  editingPointAddedNew = Boolean(opts && opts.isNewExtra);
+  editingPointIsExtra = Boolean(item.is_extra || (Array.isArray(cfg.extra_points) && cfg.extra_points.includes(item.time)));
+  $("pointSheetTitle").textContent = `${item.time} ${editingPointIsExtra ? "自定义时间点设置" : "时间点设置"}`;
   const ov = (cfg.point_overrides && cfg.point_overrides[item.time]) || {};
   editingPointOrigOv = cfg.point_overrides && cfg.point_overrides[item.time]
     ? JSON.parse(JSON.stringify(cfg.point_overrides[item.time]))
@@ -8169,16 +11364,30 @@ function openPointModal(item) {
   editingPtSheetOff = (ov.sheet_day_offset !== null && ov.sheet_day_offset !== undefined) ? clampOff(ov.sheet_day_offset, 0) : null;
   editingPtMsgMode = ["datetime", "date_only", "none"].includes(ov.msg_time_mode) ? ov.msg_time_mode : "default";
   editingPtMsgOff = (ov.msg_day_offset !== null && ov.msg_day_offset !== undefined) ? clampOff(ov.msg_day_offset, 0) : null;
+  editingPtMsgFmt = ["YYYY-MM-DD", "YYYY年M月D日", "M月D日"].includes(ov.msg_date_fmt) ? ov.msg_date_fmt : "default";
+
+  const ovTgts = Array.isArray(ov.targets) && ov.targets.length ? ov.targets : [];
+  const gTgts = getEnabledTargetsLocal();
+  if ($("pointTargetHint")) {
+    $("pointTargetHint").textContent = `不单独指定时默认发给：「${gTgts.join("、") || "文件小助手"}」`;
+  }
+  if ($("pointCustomTargetOn")) $("pointCustomTargetOn").checked = ovTgts.length > 0;
+  if ($("pointCustomTargetWrap")) $("pointCustomTargetWrap").style.display = ovTgts.length > 0 ? "flex" : "none";
+  if ($("pointCustomTargetInput")) $("pointCustomTargetInput").value = ovTgts.join("、");
+  _renderPointTargetQuickChips();
 
   const baseRes = resolveSuffixByRulesOnly(item.time);
   $("pointSufHint").textContent = baseRes.suf
-    ? `不单独修改时将使用：「${baseRes.suf}」`
-    : "不单独修改时按默认（无结尾词）";
+    ? `不单独改时用全局后缀「${baseRes.suf}」；配合上方「不加时间」可只发自定义内容`
+    : "配合上方「不加时间」可只发此处输入的自定义内容";
 
   const hasCustom = ov.suffix !== undefined && ov.suffix !== null;
   $("pointCustomSufOn").checked = hasCustom;
   $("pointCustomSufWrap").style.display = hasCustom ? "flex" : "none";
   $("pointCustomSufInput").value = hasCustom ? String(ov.suffix) : (item.suffix || "");
+  if ($("pointDeleteExtraBtn")) {
+    $("pointDeleteExtraBtn").style.display = editingPointIsExtra ? "block" : "none";
+  }
   _refreshPointModalPreview();
   $("pointMask").classList.add("show");
 }
@@ -8278,10 +11487,10 @@ function updateSummaries() {
     $("kwPreview").textContent = "请至少开启或添加一个目标会话，否则本轮将跳过钉钉发送";
   } else if (enabledTargets.length === 1) {
     $("sumTarget").textContent = enabledTargets[0];
-    $("kwPreview").textContent = `将在钉钉按 Ctrl+Shift+F 直接粘贴「${enabledTargets[0]}」并按 Enter 进入会话`;
+    $("kwPreview").textContent = `输入「${enabledTargets[0]}」可点右侧「AI 识屏核对」看桌面钉钉核对是否一致，运行时一对一匹配进入`;
   } else {
     $("sumTarget").textContent = `${enabledTargets[0]} 等 ${enabledTargets.length} 群`;
-    $("kwPreview").textContent = `将依次投递共 ${enabledTargets.length} 个会话：${enabledTargets.join("、")}`;
+    $("kwPreview").textContent = `将依次核对并投递共 ${enabledTargets.length} 个会话：${enabledTargets.join("、")}`;
   }
 
   const now = new Date();
@@ -8346,6 +11555,7 @@ function renderConfig() {
   if (!Array.isArray(cfg.custom_days)) cfg.custom_days = [0, 1, 2, 3, 4];
   if (!Array.isArray(cfg.suffix_rules)) cfg.suffix_rules = [];
   if (!Array.isArray(cfg.dt_targets)) cfg.dt_targets = [];
+  cfg.extra_points = _normExtraPointsArray(cfg.extra_points);
   if (!cfg.point_overrides) cfg.point_overrides = {};
   ensureSummaryPresetsStruct();
   ensureUpdateTimeStruct();
@@ -8358,6 +11568,7 @@ function renderConfig() {
 
   $("enableCapture").checked = cfg.enable_capture !== false;
   $("enableDingtalk").checked = Boolean(cfg.enable_dingtalk);
+  $("dtAiScreenVerify").checked = cfg.dt_ai_screen_verify !== false;
   $("dtClearBeforeSend").checked = cfg.dt_clear_before_send !== false;
   $("dtSilentSend").checked = cfg.dt_silent_send !== false;
   $("dtAutoSend").checked = cfg.dt_auto_send === true;
@@ -8371,6 +11582,7 @@ function renderConfig() {
   renderPipelineTuning();
   renderAiControls();
 
+  renderRawSyncControls();
   renderUpdateTimeControls();
   const spOn = cfg.summary_presets.enabled !== false;
   $("spEnabled").checked = spOn;
@@ -8396,12 +11608,14 @@ function collectConfigFromDOM() {
   cfg.prevent_sleep = $("preventSleep").checked;
   cfg.enable_capture = $("enableCapture").checked;
   cfg.enable_dingtalk = $("enableDingtalk").checked;
+  cfg.dt_ai_screen_verify = $("dtAiScreenVerify").checked;
   cfg.dt_clear_before_send = $("dtClearBeforeSend").checked;
   cfg.dt_silent_send = $("dtSilentSend").checked;
   cfg.dt_auto_send = $("dtAutoSend").checked;
   cfg.dt_minimize_after_send = $("dtMinimizeAfterSend").checked;
   cfg.open_wps_after_run = $("openWpsAfterRun").checked;
   cfg.save_shot_history = $("saveShotHistory").checked;
+  if ($("dtUseActualClock")) cfg.dt_use_actual_clock = $("dtUseActualClock").checked;
   cfg.dt_cutoff_enabled = $("dtCutoffEnabled").checked;
   cfg.dt_paste_delay_sec = clampPasteDelay(cfg.dt_paste_delay_sec, 3);
   cfg.dt_send_wait_sec = clampSendWait(cfg.dt_send_wait_sec, 5);
@@ -8425,6 +11639,11 @@ function collectConfigFromDOM() {
   ai.custom_summary_prompt = $("aiCustomPrompt").value.trim();
   if ($("aiFocusTeamInput")) ai.focus_team = $("aiFocusTeamInput").value.trim();
 
+  const rsDom = ensureRawSyncStruct();
+  if ($("rawSyncEnabled")) rsDom.enabled = $("rawSyncEnabled").checked;
+  if ($("rawSyncPreserveSummary")) rsDom.preserve_summary_cells = $("rawSyncPreserveSummary").checked;
+  if ($("rawSyncWriteR4")) rsDom.write_r4_timestamp = $("rawSyncWriteR4").checked;
+  cfg.extra_points = _normExtraPointsArray(cfg.extra_points);
   if (!cfg.capture_plan) cfg.capture_plan = { enabled: false, windows: [] };
   cfg.capture_plan.enabled = $("cpEnabled").checked;
   return cfg;
@@ -8666,15 +11885,106 @@ function buildMiniCatSvg() {
   return `<svg class="ai-mini-cat" viewBox="0 0 24 24" fill="none"><path d="M5 10L4 4l5 3.5h6L20 4l-1 6a6.5 6.5 0 01-14 0z" fill="#4F46E5" stroke="#38BDF8" stroke-width="1.1" stroke-linejoin="round"/><rect x="6.5" y="9.5" width="11" height="7.5" rx="3.5" fill="#0F172A"/><circle cx="9.8" cy="13" r="1.15" fill="#38BDF8"/><circle cx="14.2" cy="13" r="1.15" fill="#38BDF8"/><path d="M10.4 15.2q1.6 1.1 3.2 0" stroke="#F8FAFC" stroke-width="1.1" stroke-linecap="round"/></svg>`;
 }
 
-function renderAiChatFeed(history, pendingText = null) {
-  const feed = $("aiChatFeed");
-  const guide = $("aiEmptyGuide");
-  const items = Array.isArray(history) ? history : [];
-  if (!items.length && !pendingText) {
+function buildCuteThinkingCatSvg() {
+  return `<svg class="ai-think-cat" viewBox="0 0 32 32" fill="none"><g class="ai-ear-wiggle"><path d="M6.5 13L5 4.5l7 4.5h8l7-4.5L25.5 13a9 9 0 01-19 0z" fill="#4F46E5" stroke="#38BDF8" stroke-width="1.3" stroke-linejoin="round"/></g><rect x="7.5" y="12.5" width="17" height="10.5" rx="5.2" fill="#0F172A"/><circle cx="12.5" cy="17.2" r="1.7" fill="#38BDF8"/><circle cx="19.5" cy="17.2" r="1.7" fill="#38BDF8"/><path d="M13.5 20.3q2.5 1.7 5 0" stroke="#F8FAFC" stroke-width="1.35" stroke-linecap="round"/><circle cx="10.2" cy="19.2" r="1.1" fill="#F472B6" opacity="0.65"/><circle cx="21.8" cy="19.2" r="1.1" fill="#F472B6" opacity="0.65"/></svg>`;
+}
+
+let cachedAiEmptyGuide = null;
+const aiThinkingState = { active: false, prompt: "", styleId: "custom", startTs: 0, timerId: null };
+
+function getAiThinkingStages(promptText, styleId) {
+  const txt = String(promptText || "");
+  const isSummary = Boolean(styleId && styleId !== "custom") || /总结|汇总|战报|排查|排行|团队|数据/.test(txt);
+  return [
+    "正在理解您的问题意图与指令上下文",
+    isSummary ? "正在读取最新汇总表截图与数据指标变动" : "正在检索本地记忆档案、个人习惯与配置项",
+    "正在结合个人偏好与历史复盘组织答案",
+    "正在云端模型推理与校对细节，马上回复您",
+  ];
+}
+
+function buildAiThinkingBubbleHtml(promptText, styleId, elapsedSec) {
+  const stages = getAiThinkingStages(promptText, styleId);
+  const sec = Math.max(0, Number(elapsedSec || 0));
+  const activeIdx = sec < 0.9 ? 0 : (sec < 2.2 ? 1 : (sec < 4.5 ? 2 : 3));
+  const stepsHtml = stages.map((label, idx) => {
+    const stCls = idx < activeIdx ? "step-done" : (idx === activeIdx ? "step-now" : "step-wait");
+    return `<div class="ai-think-step"><span class="step-dot ${stCls}"></span><span>${escapeHtmlStr(label)}</span></div>`;
+  }).join("");
+  return `<div class="ai-think-head">${buildCuteThinkingCatSvg()}<span class="ai-think-title">小管家正在认真思考中</span><span class="ai-think-dots"><span></span><span></span><span></span></span><span class="ai-think-timer">已思考 ${sec.toFixed(1)}s</span></div><div class="ai-think-steps">${stepsHtml}</div>`;
+}
+
+function refreshAiThinkingNodes() {
+  if (!aiThinkingState.active) return;
+  const elapsed = (Date.now() - aiThinkingState.startTs) / 1000;
+  const html = buildAiThinkingBubbleHtml(aiThinkingState.prompt, aiThinkingState.styleId, elapsed);
+  for (const feedId of ["aiChatFeed", "aiPopoutFeed"]) {
+    const feed = $(feedId);
+    if (!feed) continue;
+    const node = feed.querySelector(".ai-think-bubble");
+    if (node) node.innerHTML = html;
+  }
+}
+
+function startAiThinking(promptText, styleId) {
+  stopAiThinking();
+  aiThinkingState.active = true;
+  aiThinkingState.prompt = String(promptText || "");
+  aiThinkingState.styleId = String(styleId || "custom");
+  aiThinkingState.startTs = Date.now();
+  aiThinkingState.timerId = setInterval(refreshAiThinkingNodes, 450);
+}
+
+function stopAiThinking() {
+  if (aiThinkingState.timerId) {
+    clearInterval(aiThinkingState.timerId);
+    aiThinkingState.timerId = null;
+  }
+  aiThinkingState.active = false;
+  aiThinkingState.prompt = "";
+}
+
+async function submitTargetConfirm(pendingId, act, newTarget = "", onFailUnlock = null) {
+  if (!pendingId) return;
+  const ntgt = String(newTarget || "").trim();
+  if (act === "switch_target" && !ntgt) {
+    showToast("请先输入或点选一个群名或联系人名称");
+    if (typeof onFailUnlock === "function") onFailUnlock();
+    return;
+  }
+  try {
+    const r = await api("/api/confirm-dingtalk-target", "POST", {
+      pending_id: pendingId,
+      action: act,
+      new_target: ntgt,
+    });
+    showToast((r && r.message) || "已提交您的确认结果");
+    if (r && r.ok === false && typeof onFailUnlock === "function") onFailUnlock();
+    if (r && Array.isArray(r.history)) {
+      cachedChatHistory = r.history;
+      if (typeof r.chat_seq === "number") lastChatSeq = r.chat_seq;
+      renderAiChatFeed(cachedChatHistory);
+    }
+    pollState();
+  } catch (_e) {
+    if (typeof onFailUnlock === "function") onFailUnlock();
+    showToast("提交确认失败，请重试或在聊天框回复确认/取消");
+  }
+}
+
+function renderChatItemsInto(feed, items, pendingText, isPopout) {
+  if (!feed) return;
+  const activePending = pendingText || (aiThinkingState.active ? aiThinkingState.prompt : null);
+  if (!items.length && !activePending) {
     feed.innerHTML = "";
-    if (guide) {
-      guide.style.display = "block";
-      feed.appendChild(guide);
+    if (!isPopout && cachedAiEmptyGuide) {
+      cachedAiEmptyGuide.style.display = "block";
+      feed.appendChild(cachedAiEmptyGuide);
+    } else if (isPopout) {
+      const emp = document.createElement("div");
+      emp.className = "ai-empty-guide";
+      emp.textContent = "大屏对话已就绪，点击下方风格胶囊或直接输入指令即可开始思考并回复。";
+      feed.appendChild(emp);
     }
     return;
   }
@@ -8683,6 +11993,23 @@ function renderAiChatFeed(history, pendingText = null) {
     const b = document.createElement("div");
     const isSpot = turn.source === "data_spotlight";
     b.className = `ai-bubble ${turn.role === "user" ? "user" : "model"}${isSpot ? " is-spotlight" : ""}`;
+    if (turn.role !== "user" && Array.isArray(turn.thinking_steps) && turn.thinking_steps.length) {
+      const det = document.createElement("details");
+      det.className = "ai-thought-box";
+      const sum = document.createElement("summary");
+      const elTxt = (typeof turn.elapsed_sec === "number") ? ` · 用时 ${turn.elapsed_sec}s` : "";
+      sum.textContent = `思考过程（${turn.thinking_steps.length} 步${elTxt}）`;
+      det.appendChild(sum);
+      const lst = document.createElement("div");
+      lst.className = "ai-thought-list";
+      turn.thinking_steps.forEach((st, i) => {
+        const line = document.createElement("div");
+        line.textContent = `${i + 1}. ${cleanText(st) || st}`;
+        lst.appendChild(line);
+      });
+      det.appendChild(lst);
+      b.appendChild(det);
+    }
     const txt = document.createElement("div");
     if (turn.role === "user") {
       const viaBadge = turn.via === "mobile"
@@ -8693,6 +12020,91 @@ function renderAiChatFeed(history, pendingText = null) {
       txt.innerHTML = formatSafeMarkdown(turn.text || "");
     }
     b.appendChild(txt);
+
+    const safeImg = turn.role !== "user" ? safeShotImageUrl(turn.image_data_url) : "";
+    if (safeImg) {
+      const sWrap = document.createElement("div");
+      sWrap.className = "ai-shot-wrap";
+      const sImg = document.createElement("img");
+      sImg.className = "ai-shot-img";
+      sImg.src = safeImg;
+      sImg.alt = "桌面钉钉现场截图";
+      const sCap = document.createElement("div");
+      sCap.className = "ai-shot-cap";
+      sCap.textContent = "桌面钉钉当前画面（点击可放大查看清晰名称）";
+      sWrap.appendChild(sImg);
+      sWrap.appendChild(sCap);
+      sWrap.onclick = () => openShotZoomModal(safeImg);
+      b.appendChild(sWrap);
+    }
+
+    const cc = (turn.role !== "user" && turn.confirm_card && typeof turn.confirm_card === "object") ? turn.confirm_card : null;
+    if (cc) {
+      const isPend = cc.status === "pending";
+      const card = document.createElement("div");
+      card.className = "ai-confirm-card" + (isPend ? "" : " done");
+      const hdr = document.createElement("div");
+      hdr.className = "ai-confirm-hdr";
+      hdr.textContent = isPend
+        ? `待您确认：预设「${cc.target_name || ""}」 / 桌面看到「${cc.opened_name || ""}」`
+        : (cc.resolved_text || "已完成确认");
+      card.appendChild(hdr);
+      if (isPend) {
+        const btns = document.createElement("div");
+        btns.className = "ai-confirm-btns";
+        const okBtn = document.createElement("button");
+        okBtn.type = "button";
+        okBtn.className = "pill-action-btn primary";
+        okBtn.textContent = "确认仍发当前会话";
+        const cancelBtn = document.createElement("button");
+        cancelBtn.type = "button";
+        cancelBtn.className = "pill-action-btn danger";
+        cancelBtn.textContent = "取消发送";
+
+        const inpRow = document.createElement("div");
+        inpRow.className = "ai-confirm-row";
+        const inp = document.createElement("input");
+        inp.type = "text";
+        inp.placeholder = "输入其他群聊或联系人名称后点击切换重搜";
+        const swBtn = document.createElement("button");
+        swBtn.type = "button";
+        swBtn.className = "pill-action-btn";
+        swBtn.textContent = "改发此对象";
+
+        const setConfirmBusy = (busyFlag) => { okBtn.disabled = busyFlag; cancelBtn.disabled = busyFlag; swBtn.disabled = busyFlag; };
+        okBtn.onclick = () => { setConfirmBusy(true); submitTargetConfirm(cc.pending_id, "confirm_send", "", () => setConfirmBusy(false)); };
+        cancelBtn.onclick = () => { setConfirmBusy(true); submitTargetConfirm(cc.pending_id, "cancel_send", "", () => setConfirmBusy(false)); };
+        swBtn.onclick = () => {
+          const val = inp.value.trim();
+          if (!val) { showToast("请先选择或输入要改发的对象名称"); inp.focus(); return; }
+          setConfirmBusy(true);
+          submitTargetConfirm(cc.pending_id, "switch_target", val, () => setConfirmBusy(false));
+        };
+        btns.appendChild(okBtn);
+        btns.appendChild(cancelBtn);
+        card.appendChild(btns);
+
+        const cands = Array.isArray(cc.candidates) ? cc.candidates.filter(Boolean) : [];
+        if (cands.length) {
+          const chips = document.createElement("div");
+          chips.className = "ai-confirm-chips";
+          for (const cn of cands) {
+            const cb = document.createElement("button");
+            cb.type = "button";
+            cb.className = "ai-confirm-chip";
+            cb.textContent = `改发：${cn}`;
+            cb.onclick = () => { inp.value = cn; inp.focus(); };
+            chips.appendChild(cb);
+          }
+          card.appendChild(chips);
+        }
+        inpRow.appendChild(inp);
+        inpRow.appendChild(swBtn);
+        card.appendChild(inpRow);
+      }
+      b.appendChild(card);
+    }
+
     if (turn.role !== "user") {
       const meta = document.createElement("div");
       meta.className = "ai-bubble-meta";
@@ -8701,7 +12113,8 @@ function renderAiChatFeed(history, pendingText = null) {
       const srcDesc = (turn.source === "gemini" || turn.source === "ai_cloud" || turn.source === "data_spotlight" || turn.source === "greeting")
         ? "智能管家"
         : (turn.shot_info ? "智能助手" : "贴士");
-      infoSpan.innerHTML = `${buildMiniCatSvg()}<span>${escapeHtmlStr([turn.time, srcDesc, turn.shot_info].filter(Boolean).join(" · "))}</span>`;
+      const durDesc = (typeof turn.elapsed_sec === "number") ? `用时 ${turn.elapsed_sec}s` : "";
+      infoSpan.innerHTML = `${buildMiniCatSvg()}<span>${escapeHtmlStr([turn.time, srcDesc, turn.shot_info, durDesc].filter(Boolean).join(" · "))}</span>`;
       const cpBtn = document.createElement("button");
       cpBtn.type = "button";
       cpBtn.className = "ai-copy-btn";
@@ -8718,18 +12131,37 @@ function renderAiChatFeed(history, pendingText = null) {
     }
     feed.appendChild(b);
   }
-  if (pendingText) {
-    const u = document.createElement("div");
-    u.className = "ai-bubble user";
-    u.textContent = pendingText;
-    feed.appendChild(u);
-
+  if (activePending) {
+    const tail = items.length ? items[items.length - 1] : null;
+    if (!tail || tail.role !== "user" || cleanText(tail.text) !== cleanText(activePending)) {
+      const u = document.createElement("div");
+      u.className = "ai-bubble user";
+      u.textContent = activePending;
+      feed.appendChild(u);
+    }
     const w = document.createElement("div");
-    w.className = "ai-bubble model";
-    w.innerHTML = `<div class="typing-dots"><span></span><span></span><span></span></div>`;
+    w.className = "ai-bubble model thinking ai-think-bubble";
+    const sec = aiThinkingState.active ? (Date.now() - aiThinkingState.startTs) / 1000 : 0.2;
+    w.innerHTML = buildAiThinkingBubbleHtml(activePending, aiThinkingState.styleId, sec);
     feed.appendChild(w);
   }
   feed.scrollTop = feed.scrollHeight;
+}
+
+function renderAiChatFeed(history, pendingText = null) {
+  if (!cachedAiEmptyGuide) cachedAiEmptyGuide = $("aiEmptyGuide");
+  const items = Array.isArray(history) ? history : [];
+  renderChatItemsInto($("aiChatFeed"), items, pendingText, false);
+  const popFeed = $("aiPopoutFeed");
+  if (popFeed) renderChatItemsInto(popFeed, items, pendingText, true);
+  if ($("aiPopoutShotPill") && $("aiShotStatusPill")) {
+    $("aiPopoutShotPill").textContent = $("aiShotStatusPill").textContent || "尚未加载最近截图";
+  }
+  scheduleSyncHomeAiStickyHeight();
+  requestAnimationFrame(() => {
+    const f = $("aiChatFeed");
+    if (f) f.scrollTop = f.scrollHeight;
+  });
 }
 
 let cachedChatHistory = [];
@@ -8737,13 +12169,19 @@ let lastSpotlightSeq = 0;
 let lastChatSeq = -1;
 async function sendAiSummary(styleId, rawPrompt) {
   const input = $("aiChatInput");
-  const promptText = String(rawPrompt !== undefined ? rawPrompt : input.value).trim();
+  const popInput = $("aiPopoutInput");
+  const promptText = String(rawPrompt !== undefined ? rawPrompt : (input ? input.value : "")).trim();
   const sMeta = (aiStyles || []).find((x) => x.id === styleId);
   const label = promptText || (sMeta ? `请按【${sMeta.name}】帮我总结当前数据` : "总结当前数据");
-  if (rawPrompt === undefined || rawPrompt === null || rawPrompt === input.value) {
+  if (input && (rawPrompt === undefined || rawPrompt === null || rawPrompt === input.value)) {
     input.value = "";
   }
-  $("aiSendBtn").disabled = true;
+  if (popInput && rawPrompt === popInput.value) {
+    popInput.value = "";
+  }
+  if ($("aiSendBtn")) $("aiSendBtn").disabled = true;
+  if ($("aiPopoutSendBtn")) $("aiPopoutSendBtn").disabled = true;
+  startAiThinking(label, styleId);
   renderAiChatFeed(cachedChatHistory, label);
   try {
     await flushPendingSave();
@@ -8767,11 +12205,24 @@ async function sendAiSummary(styleId, rawPrompt) {
       if (typeof res.chat_seq === "number") lastChatSeq = res.chat_seq;
     } else if (res && res.reply) {
       cachedChatHistory.push({ role: "user", text: label, time: "" });
-      cachedChatHistory.push({ role: "model", text: res.reply, model: res.model, source: res.source, shot_info: res.shot_info });
+      cachedChatHistory.push({
+        role: "model",
+        text: res.reply,
+        model: res.model,
+        source: res.source,
+        shot_info: res.shot_info,
+        thinking_steps: res.thinking_steps,
+        elapsed_sec: res.elapsed_sec,
+      });
     }
     if (res && res.shot_info) $("aiShotStatusPill").textContent = res.shot_info;
+    stopAiThinking();
     renderAiChatFeed(cachedChatHistory);
+    if (res && (res.source === "on_demand_task" || res.on_demand_meta)) {
+      pollState();
+    }
   } catch (e) {
+    stopAiThinking();
     renderAiChatFeed(cachedChatHistory);
     if (e && e.name === "AbortError") {
       showToast("AI 总结响应超时，请稍后再试");
@@ -8779,10 +12230,13 @@ async function sendAiSummary(styleId, rawPrompt) {
       showToast("AI 总结请求波动，请稍后重试");
     }
   } finally {
-    $("aiSendBtn").disabled = false;
+    stopAiThinking();
+    if ($("aiSendBtn")) $("aiSendBtn").disabled = false;
+    if ($("aiPopoutSendBtn")) $("aiPopoutSendBtn").disabled = false;
   }
 }
 
+let lastTargetConfirmId = "";
 let pollInFlight = false;
 async function pollState() {
   if (pollInFlight) return;
@@ -8880,6 +12334,10 @@ async function pollState() {
     $("sumNextRun").textContent = st.next_run_str && st.next_run_str !== "—" && cd ? `${st.next_run_str} (${cd})` : (st.next_run_str || "—");
     $("btnNow").disabled = busy;
     $("btnCapture").disabled = busy;
+    if ($("btnRunRawSyncNow")) $("btnRunRawSyncNow").disabled = busy;
+    if ($("rawSyncStatusHint") && cfg && cfg.raw_sync && cfg.raw_sync.enabled) {
+      renderRawSyncControls(st.schedule_running ? (st.next_raw_sync_str || "") : "");
+    }
 
     const schedBtn = $("btnSchedule");
     schedBtn.classList.toggle("schedule-on", Boolean(st.schedule_running));
@@ -8934,6 +12392,9 @@ async function pollState() {
       memberProfile = st.member_profile;
       updateMemberTopChip(st.member_profile);
     }
+    if (st.global_logic && st.global_logic.announcement) {
+      applyAnnouncementToDom(st.global_logic.announcement, false);
+    }
     if (st.cloud_account) updateAccountSyncUI(st.cloud_account);
     if (st.sync_settings) syncSettingsState = st.sync_settings;
     if (!previewMemberUid && st.permissions) {
@@ -8964,6 +12425,23 @@ async function pollState() {
       }
     }
     updateTeamLockBanner(st.lock_status, st.queue_status, st.member_profile);
+    const tcBanner = $("targetConfirmBanner");
+    const pendTc = (st.pending_target_confirm && typeof st.pending_target_confirm === "object") ? st.pending_target_confirm : null;
+    if (tcBanner) {
+      const hasTc = Boolean(pendTc && pendTc.pending_id);
+      tcBanner.classList.toggle("show", hasTc);
+      if (hasTc) {
+        if ($("targetConfirmBannerTitle")) {
+          $("targetConfirmBannerTitle").textContent = `待本人确认：设定「${pendTc.target_name || ""}」 / 桌面看到「${pendTc.opened_name || ""}」`;
+        }
+        if (pendTc.pending_id !== lastTargetConfirmId) {
+          lastTargetConfirmId = pendTc.pending_id;
+          showToast("AI 桌面核对发现不一致，已将截图发到 AI 对话框及手机，请本人确认");
+        }
+      } else {
+        lastTargetConfirmId = "";
+      }
+    }
     const hoBanner = $("handsOffBanner");
     if (hoBanner) {
       const hoOn = Boolean(busy && st.hands_off && st.hands_off_text);
@@ -8996,24 +12474,49 @@ function bindEvents() {
   for (const el of document.querySelectorAll("[data-jump]")) {
     el.onclick = () => switchTab(el.dataset.jump);
   }
+  for (const el of document.querySelectorAll("[data-mjump]")) {
+    el.onclick = () => jumpToModule(el.dataset.mjump || "home", el.dataset.mtarget || "", el.dataset.mfocus || "");
+  }
+  for (const gp of document.querySelectorAll("[data-guide-prompt]")) {
+    gp.onclick = () => {
+      const pTxt = gp.dataset.guidePrompt || gp.textContent || "";
+      jumpToModule("home", "#aiCardBox", "#aiChatInput");
+      if ($("aiChatInput")) $("aiChatInput").value = pTxt;
+      showToast("已填入 AI 对话框，直接按回车或点发送即可");
+    };
+  }
+  if ($("targetConfirmJumpBtn")) {
+    $("targetConfirmJumpBtn").onclick = () => {
+      jumpToModule("home", "#aiCardBox");
+      setTimeout(() => {
+        const feed = $("aiChatFeed");
+        if (feed) feed.scrollTop = feed.scrollHeight;
+      }, 120);
+    };
+  }
+  if ($("imgZoomModalMask")) {
+    $("imgZoomModalMask").onclick = () => $("imgZoomModalMask").classList.remove("show");
+  }
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && $("imgZoomModalMask") && $("imgZoomModalMask").classList.contains("show")) {
+      $("imgZoomModalMask").classList.remove("show");
+    }
+  });
+  if ($("guideOpenMobileBtn")) {
+    $("guideOpenMobileBtn").onclick = () => {
+      if ($("mobileBridgeBtn")) $("mobileBridgeBtn").click();
+    };
+  }
   $("sumPresetsRow").onclick = () => {
-    switchTab("dingtalk");
-    setTimeout(() => {
-      const sec = $("summaryPresetsSection");
-      if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 60);
+    jumpToModule("dingtalk", "#summaryPresetsSection", "#utCellInput");
   };
   if ($("homeAddCellBtn")) {
     $("homeAddCellBtn").onclick = () => {
-      switchTab("dingtalk");
       const sp = ensureSummaryPresetsStruct();
       sp.enabled = true;
       $("spEnabled").checked = true;
       $("spAccordion").classList.add("open");
-      setTimeout(() => {
-        const sec = $("summaryPresetsSection");
-        if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: "smooth", block: "start" });
-      }, 60);
+      jumpToModule("dingtalk", "#summaryPresetsSection", "#utCellInput");
     };
   }
   for (const b of document.querySelectorAll("#aiQuickQaBar [data-ai-q]")) {
@@ -9188,6 +12691,13 @@ function bindEvents() {
   }
   $("dtOffMinusBtn").onclick = () => { cfg.dt_day_offset = clampOff((cfg.dt_day_offset || 0) - 1, 0); renderDingtalkDatePanel(); scheduleSave(true); };
   $("dtOffPlusBtn").onclick = () => { cfg.dt_day_offset = clampOff((cfg.dt_day_offset || 0) + 1, 0); renderDingtalkDatePanel(); scheduleSave(true); };
+  if ($("dtUseActualClock")) {
+    $("dtUseActualClock").addEventListener("change", () => {
+      cfg.dt_use_actual_clock = $("dtUseActualClock").checked;
+      renderDingtalkDatePanel();
+      scheduleSave(true);
+    });
+  }
   $("dtCutoffEnabled").addEventListener("change", () => {
     cfg.dt_cutoff_enabled = $("dtCutoffEnabled").checked;
     renderDingtalkDatePanel();
@@ -9325,6 +12835,8 @@ function bindEvents() {
     const r = await api("/api/open-shots", "POST");
     showToast(r.message || "已尝试打开文件夹");
   };
+  if ($("addExtraPointBtn")) $("addExtraPointBtn").onclick = openAddExtraPointFlow;
+  if ($("addExtraPointFootBtn")) $("addExtraPointFootBtn").onclick = openAddExtraPointFlow;
   $("resetAllPointsBtn").onclick = async () => {
     cfg.point_overrides = {};
     scheduleSave(true);
@@ -9346,15 +12858,76 @@ function bindEvents() {
 
   for (const id of [
     "nightEnabled", "preventSleep", "enableCapture", "enableDingtalk",
-    "dtClearBeforeSend", "dtSilentSend", "dtAutoSend", "dtMinimizeAfterSend",
+    "dtClearBeforeSend", "dtSilentSend", "dtAutoSend", "dtMinimizeAfterSend", "dtAiScreenVerify",
     "openWpsAfterRun", "saveShotHistory", "aiEnabled", "aiAutoDiagnose", "aiAutoHeal"
   ]) {
-    $(id).addEventListener("change", () => scheduleSave(true));
+    if ($(id)) $(id).addEventListener("change", () => scheduleSave(true));
   }
   $("cpEnabled").addEventListener("change", () => {
     $("cpAccordion").classList.toggle("open", $("cpEnabled").checked);
     scheduleSave(true);
   });
+  if ($("rawSyncEnabled")) {
+    $("rawSyncEnabled").addEventListener("change", () => {
+      const rs = ensureRawSyncStruct();
+      rs.enabled = $("rawSyncEnabled").checked;
+      renderRawSyncControls();
+      scheduleSave(true);
+    });
+  }
+  for (const rsid of ["rawSyncPreserveSummary", "rawSyncWriteR4"]) {
+    if ($(rsid)) {
+      $(rsid).addEventListener("change", () => {
+        const rs = ensureRawSyncStruct();
+        if (rsid === "rawSyncPreserveSummary") rs.preserve_summary_cells = $(rsid).checked;
+        if (rsid === "rawSyncWriteR4") rs.write_r4_timestamp = $(rsid).checked;
+        renderRawSyncControls();
+        scheduleSave(true);
+      });
+    }
+  }
+  if ($("rawSyncIntervalQuickSeg")) {
+    for (const b of $("rawSyncIntervalQuickSeg").querySelectorAll(".mini-seg-btn")) {
+      b.onclick = () => {
+        const rs = ensureRawSyncStruct();
+        rs.interval_min = Math.max(10, Math.min(360, Number(b.dataset.min) || 40));
+        renderRawSyncControls();
+        scheduleSave(true);
+      };
+    }
+  }
+  if ($("rawSyncIntervalMinus")) {
+    $("rawSyncIntervalMinus").onclick = () => {
+      const rs = ensureRawSyncStruct();
+      rs.interval_min = Math.max(10, rs.interval_min - 5);
+      renderRawSyncControls();
+      scheduleSave(true);
+    };
+  }
+  if ($("rawSyncIntervalPlus")) {
+    $("rawSyncIntervalPlus").onclick = () => {
+      const rs = ensureRawSyncStruct();
+      rs.interval_min = Math.min(360, rs.interval_min + 5);
+      renderRawSyncControls();
+      scheduleSave(true);
+    };
+  }
+  if ($("rawSyncSkipMinus")) {
+    $("rawSyncSkipMinus").onclick = () => {
+      const rs = ensureRawSyncStruct();
+      rs.skip_near_send_min = Math.max(0, rs.skip_near_send_min - 1);
+      renderRawSyncControls();
+      scheduleSave(true);
+    };
+  }
+  if ($("rawSyncSkipPlus")) {
+    $("rawSyncSkipPlus").onclick = () => {
+      const rs = ensureRawSyncStruct();
+      rs.skip_near_send_min = Math.min(30, rs.skip_near_send_min + 1);
+      renderRawSyncControls();
+      scheduleSave(true);
+    };
+  }
   for (const id of ["dtSuffix", "wpsUrl", "luyaUser", "luyaPass", "aiCustomPrompt"]) {
     $(id).addEventListener("input", () => scheduleSave(false));
   }
@@ -9426,6 +12999,15 @@ function bindEvents() {
       _syncEditingPointLive(true);
     };
   }
+  if ($("pointMsgFmtSeg")) {
+    for (const b of $("pointMsgFmtSeg").querySelectorAll(".mini-seg-btn")) {
+      b.onclick = () => {
+        editingPtMsgFmt = b.dataset.val;
+        _refreshPointModalPreview();
+        _syncEditingPointLive(true);
+      };
+    }
+  }
   $("ptMsgMinusBtn").onclick = () => {
     editingPtMsgOff = clampOff((editingPtMsgOff === null ? 0 : editingPtMsgOff) - 1, -1);
     _refreshPointModalPreview();
@@ -9437,10 +13019,31 @@ function bindEvents() {
     _syncEditingPointLive(true);
   };
 
+  if ($("pointCustomTargetOn")) {
+    $("pointCustomTargetOn").addEventListener("change", () => {
+      if ($("pointCustomTargetWrap")) {
+        $("pointCustomTargetWrap").style.display = $("pointCustomTargetOn").checked ? "flex" : "none";
+      }
+      _refreshPointModalPreview();
+      _syncEditingPointLive(true);
+      if ($("pointCustomTargetOn").checked && $("pointCustomTargetInput")) {
+        setTimeout(() => $("pointCustomTargetInput").focus(), 40);
+      }
+    });
+  }
+  if ($("pointCustomTargetInput")) {
+    $("pointCustomTargetInput").addEventListener("input", () => {
+      _refreshPointModalPreview();
+      _syncEditingPointLive(false);
+    });
+  }
   $("pointCustomSufOn").addEventListener("change", () => {
     $("pointCustomSufWrap").style.display = $("pointCustomSufOn").checked ? "flex" : "none";
     _refreshPointModalPreview();
     _syncEditingPointLive(true);
+    if ($("pointCustomSufOn").checked && $("pointCustomSufInput")) {
+      setTimeout(() => $("pointCustomSufInput").focus(), 40);
+    }
   });
   $("pointCustomSufInput").addEventListener("input", () => {
     _refreshPointModalPreview();
@@ -9448,27 +13051,46 @@ function bindEvents() {
   });
   $("pointCancel").onclick = () => {
     if (editingPointHm) {
-      if (!cfg.point_overrides) cfg.point_overrides = {};
-      if (editingPointOrigOv && !_isPointOverrideEmpty(editingPointOrigOv)) {
-        cfg.point_overrides[editingPointHm] = JSON.parse(JSON.stringify(editingPointOrigOv));
+      if (editingPointAddedNew) {
+        deleteExtraPoint(editingPointHm);
       } else {
-        delete cfg.point_overrides[editingPointHm];
+        if (!cfg.point_overrides) cfg.point_overrides = {};
+        if (editingPointOrigOv && !_isPointOverrideEmpty(editingPointOrigOv)) {
+          cfg.point_overrides[editingPointHm] = JSON.parse(JSON.stringify(editingPointOrigOv));
+        } else {
+          delete cfg.point_overrides[editingPointHm];
+        }
+        _applyOvToLiveTimetable(editingPointHm, cfg.point_overrides[editingPointHm] || null);
+        scheduleSave(true);
       }
-      _applyOvToLiveTimetable(editingPointHm, cfg.point_overrides[editingPointHm] || null);
-      scheduleSave(true);
     }
     editingPointHm = "";
     editingPointOrigOv = null;
+    editingPointAddedNew = false;
+    editingPointIsExtra = false;
     $("pointMask").classList.remove("show");
   };
   const finishPointModal = () => {
     if (editingPointHm) _syncEditingPointLive(true);
     editingPointHm = "";
     editingPointOrigOv = null;
+    editingPointAddedNew = false;
+    editingPointIsExtra = false;
     $("pointMask").classList.remove("show");
   };
   $("pointMask").onclick = (e) => { if (e.target === $("pointMask")) finishPointModal(); };
   $("pointDone").onclick = finishPointModal;
+  if ($("pointDeleteExtraBtn")) {
+    $("pointDeleteExtraBtn").onclick = () => {
+      const hmToDel = editingPointHm;
+      editingPointHm = "";
+      editingPointOrigOv = null;
+      editingPointAddedNew = false;
+      editingPointIsExtra = false;
+      $("pointMask").classList.remove("show");
+      if (hmToDel) deleteExtraPoint(hmToDel);
+    };
+  }
   $("pointResetBtn").onclick = () => {
     if (editingPointHm && cfg.point_overrides) {
       delete cfg.point_overrides[editingPointHm];
@@ -9476,6 +13098,8 @@ function bindEvents() {
     }
     editingPointHm = "";
     editingPointOrigOv = null;
+    editingPointAddedNew = false;
+    editingPointIsExtra = false;
     $("pointMask").classList.remove("show");
     scheduleSave(true);
   };
@@ -9520,6 +13144,24 @@ function bindEvents() {
       if (!lastBusyState) $("btnCapture").disabled = false;
     }
   };
+  if ($("btnRunRawSyncNow")) {
+    $("btnRunRawSyncNow").onclick = async () => {
+      $("btnRunRawSyncNow").disabled = true;
+      showToast("正在启动仅刷三表并写入 R4…");
+      try {
+        await flushPendingSave();
+        const r = await api("/api/run-raw-sync", "POST");
+        if (!r.ok && r.locked) {
+          openLockWaitModal(r.locked_by, "raw_sync");
+          return;
+        }
+        if (r && r.message) showToast(r.message);
+        pollState();
+      } finally {
+        if (!lastBusyState) $("btnRunRawSyncNow").disabled = false;
+      }
+    };
+  }
   $("btnSchedule").onclick = async () => {
     await flushPendingSave();
     const r = await api("/api/schedule", "POST");
@@ -9660,6 +13302,7 @@ function applyPermissionsUI(perms) {
   lastPermsSig = sig;
   if ($("btnNow")) $("btnNow").disabled = Boolean(lastBusyState || p.can_run === false);
   if ($("btnCapture")) $("btnCapture").disabled = Boolean(lastBusyState || p.can_run === false);
+  if ($("btnRunRawSyncNow")) $("btnRunRawSyncNow").disabled = Boolean(lastBusyState || p.can_run === false);
   if ($("aiSendBtn")) $("aiSendBtn").disabled = (p.can_use_ai === false);
   if ($("aiChatInput")) $("aiChatInput").disabled = (p.can_use_ai === false);
 }
@@ -10111,8 +13754,34 @@ function renderAdminDashboard(d) {
     }
   }
 
-  // 5. 全局软件逻辑
+  // 5. 全局公告栏 + 媒体播放列表 + 全局软件逻辑
   const gl = d.global_logic || {};
+  const gAnn = normalizeAnnouncementClient(gl.announcement || {});
+  adminAnnDraftMediaItems = gAnn.media_items.map((x) => ({ ...x }));
+  adminAnnActiveIdx = gAnn.media_active_idx || 0;
+  if ($("adminAnnEnabled")) $("adminAnnEnabled").checked = Boolean(gAnn.enabled);
+  if ($("adminAnnBadge")) $("adminAnnBadge").value = gAnn.badge || "全员公告";
+  if ($("adminAnnText")) $("adminAnnText").value = gAnn.text || "";
+  if ($("adminAnnCharCount")) $("adminAnnCharCount").textContent = `${(gAnn.text || "").length} / 300`;
+  if ($("adminAnnMuted")) $("adminAnnMuted").checked = gAnn.media_muted !== false;
+  for (const [segId, val] of [
+    ["adminAnnEffectSeg", gAnn.effect],
+    ["adminAnnThemeSeg", gAnn.theme],
+    ["adminAnnSizeSeg", gAnn.font_size],
+    ["adminAnnSpeedSeg", gAnn.speed],
+    ["adminAnnMediaModeSeg", gAnn.media_mode],
+    ["adminAnnTextOverlaySeg", gAnn.text_overlay],
+    ["adminAnnHeightSeg", gAnn.banner_height],
+    ["adminAnnFitSeg", gAnn.media_fit],
+  ]) {
+    const seg = $(segId);
+    if (!seg) continue;
+    for (const b of seg.querySelectorAll(".mini-seg-btn")) {
+      b.classList.toggle("active", b.dataset.val === val);
+    }
+  }
+  if (typeof renderAdminAnnMediaList === "function") renderAdminAnnMediaList();
+  applyAnnouncementToDom(gAnn, true);
   $("logicLockTimeoutInput").value = String(gl.lock_timeout_sec || 180);
   $("logicPasteDelayInput").value = (gl.enforce_paste_delay_sec === null || gl.enforce_paste_delay_sec === undefined) ? "" : String(gl.enforce_paste_delay_sec);
   for (const b of $("logicComposeSeg").querySelectorAll(".mini-seg-btn")) {
@@ -10411,15 +14080,11 @@ function bindTeamCollabAndAdminEvents() {
   const renderMobileBridgeModal = (info) => {
     if (!info) return;
     const ghUrl = info.github_pages_url || "https://sorenskr.github.io/SheetMate/";
-    const lanList = Array.isArray(info.lan_urls) ? info.lan_urls : [];
     const pub = info.public_url || "";
     if ($("mobileModalNickVal")) {
       $("mobileModalNickVal").textContent = info.local_nick || "（暂未设置，请点右边起名字）";
     }
     if ($("mobileGithubUrlInput")) $("mobileGithubUrlInput").value = ghUrl;
-    if ($("mobileLanUrlInput")) $("mobileLanUrlInput").value = lanList[0] || "";
-    if ($("mobilePublicUrlInput")) $("mobilePublicUrlInput").value = pub;
-    if ($("copyMobilePublicBtn")) $("copyMobilePublicBtn").style.display = pub ? "inline-flex" : "none";
     if ($("mobilePinInput") && document.activeElement !== $("mobilePinInput")) {
       $("mobilePinInput").value = info.remote_password || "";
     }
@@ -10443,15 +14108,6 @@ function bindTeamCollabAndAdminEvents() {
         $("cloudRelayStatusBadge").style.background = "var(--pill-blue)";
         $("mobileCloudRelayTip").textContent = info.cloud_relay_error || "正在连接云端实时通道，请稍等 1~2 秒…";
       }
-    }
-    if ($("toggleMobileTunnelBtn")) {
-      $("toggleMobileTunnelBtn").textContent = info.tunnel_running ? "关闭备用链接" : "开启备用链接";
-      $("toggleMobileTunnelBtn").className = "mini-pill " + (info.tunnel_running ? "danger" : "");
-    }
-    if ($("mobileTunnelStatusTip")) {
-      $("mobileTunnelStatusTip").textContent = pub
-        ? `临时链接已通：${pub}`
-        : (info.tunnel_error || (info.tunnel_running ? "正在开通临时链接，请等 2~5 秒…" : "一般直接用上面的全球远程网址就行，不用单独开这个。"));
     }
     const needPoll = (info.tunnel_running && !pub) || (info.local_nick && !info.cloud_relay_connected);
     if (needPoll) {
@@ -10511,35 +14167,6 @@ function bindTeamCollabAndAdminEvents() {
     $("mobileModalCloseBtn").onclick = () => {
       clearTimeout(mobileTunnelPollTimer);
       $("mobileBridgeModalMask").classList.remove("show");
-    };
-  }
-  if ($("copyMobileLanBtn")) {
-    $("copyMobileLanBtn").onclick = async () => {
-      const v = $("mobileLanUrlInput").value.trim();
-      if (!v) return;
-      try { await navigator.clipboard.writeText(v); showToast("已复制同 Wi-Fi 备用网址"); } catch (_e) {}
-    };
-  }
-  if ($("copyMobilePublicBtn")) {
-    $("copyMobilePublicBtn").onclick = async () => {
-      const v = $("mobilePublicUrlInput").value.trim();
-      if (!v) return;
-      try { await navigator.clipboard.writeText(v); showToast("已复制临时备用链接"); } catch (_e) {}
-    };
-  }
-  if ($("openMobileWebBtn")) {
-    $("openMobileWebBtn").onclick = () => {
-      const v = safeExternalHttpUrl($("mobilePublicUrlInput").value || $("mobileLanUrlInput").value);
-      if (v) window.open(v, "_blank", "noopener,noreferrer");
-    };
-  }
-  if ($("toggleMobileTunnelBtn")) {
-    $("toggleMobileTunnelBtn").onclick = async () => {
-      const isOff = $("toggleMobileTunnelBtn").textContent.includes("开启");
-      showToast(isOff ? "正在开通临时备用链接…" : "正在关闭备用链接…");
-      const res = await api("/api/mobile-bridge/tunnel", "POST", { enable: isOff });
-      renderMobileBridgeModal(res);
-      if (res && res.message) showToast(res.message);
     };
   }
   if ($("saveMobilePinBtn")) {
@@ -10666,7 +14293,18 @@ function bindTeamCollabAndAdminEvents() {
   $("adminPasswordInput").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") $("adminLoginBtn").click();
   });
-  $("adminCloseBtn").onclick = () => $("adminConsoleMask").classList.remove("show");
+  $("adminCloseBtn").onclick = () => {
+    destroyAnnMediaPlayer("preview");
+    $("adminConsoleMask").classList.remove("show");
+  };
+  if ($("adminConsoleMask")) {
+    $("adminConsoleMask").onclick = (ev) => {
+      if (ev.target === $("adminConsoleMask")) {
+        destroyAnnMediaPlayer("preview");
+        $("adminConsoleMask").classList.remove("show");
+      }
+    };
+  }
   $("adminRefreshBtn").onclick = loadAdminDashboard;
   $("exitPreviewBtn").onclick = exitAdminMemberPreview;
 
@@ -10718,15 +14356,314 @@ function bindTeamCollabAndAdminEvents() {
     showToast(r.message || "已强制释放锁定");
     loadAdminDashboard();
   };
-  for (const segId of ["logicComposeSeg", "logicSilentSeg", "logicMinimizeSeg", "adminGlobalAiProviderSeg"]) {
+  let adminAnnDraftMediaItems = [];
+  let adminAnnActiveIdx = 0;
+
+  const readAdminAnnouncementForm = () => {
+    const pick = (segId, defVal) => {
+      const seg = $(segId);
+      const act = seg ? seg.querySelector(".mini-seg-btn.active") : null;
+      return act ? act.dataset.val : defVal;
+    };
+    const txtVal = $("adminAnnText") ? $("adminAnnText").value : "";
+    if ($("adminAnnCharCount")) $("adminAnnCharCount").textContent = `${txtVal.length} / 300`;
+    const clampedIdx = adminAnnDraftMediaItems.length
+      ? Math.max(0, Math.min(adminAnnDraftMediaItems.length - 1, adminAnnActiveIdx))
+      : 0;
+    return {
+      enabled: $("adminAnnEnabled") ? Boolean($("adminAnnEnabled").checked) : true,
+      badge: $("adminAnnBadge") ? $("adminAnnBadge").value.trim() : "全员公告",
+      text: txtVal,
+      effect: pick("adminAnnEffectSeg", "gradient"),
+      theme: pick("adminAnnThemeSeg", "ocean"),
+      font_size: pick("adminAnnSizeSeg", "md"),
+      speed: pick("adminAnnSpeedSeg", "normal"),
+      media_mode: pick("adminAnnMediaModeSeg", "none"),
+      media_active_idx: clampedIdx,
+      media_muted: $("adminAnnMuted") ? Boolean($("adminAnnMuted").checked) : true,
+      media_fit: pick("adminAnnFitSeg", "cover"),
+      banner_height: pick("adminAnnHeightSeg", "normal"),
+      text_overlay: pick("adminAnnTextOverlaySeg", "overlay"),
+      media_items: adminAnnDraftMediaItems.map((x) => ({ ...x })),
+    };
+  };
+  const refreshAdminAnnPreview = () => applyAnnouncementToDom(readAdminAnnouncementForm(), true);
+
+  function renderAdminAnnMediaList() {
+    const listEl = $("adminAnnMediaList");
+    if (!listEl) return;
+    listEl.innerHTML = "";
+    if (!adminAnnDraftMediaItems.length) {
+      const tip = document.createElement("div");
+      tip.className = "empty-rule-tip";
+      tip.textContent = "暂未添加横幅视频、GIF 或动画；可通过上方按钮上传文件、添加内置动画或粘贴链接";
+      listEl.appendChild(tip);
+      return;
+    }
+    const kindLbl = { video: "视频", gif: "动图GIF", image: "图片", anim: "内置动画" };
+    adminAnnDraftMediaItems.forEach((it, idx) => {
+      const row = document.createElement("div");
+      row.className = "target-item-row";
+      row.style.cssText = "gap:8px;flex-wrap:wrap;padding:7px 10px;";
+
+      const leftInfo = document.createElement("div");
+      leftInfo.style.cssText = "flex:1;min-width:160px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;";
+      const tag = document.createElement("span");
+      tag.className = "tt-pill " + (idx === adminAnnActiveIdx ? "tgt-on" : "date-on");
+      tag.textContent = `${idx + 1}. ${kindLbl[it.kind] || "媒体"}`;
+      const tit = document.createElement("span");
+      tit.style.cssText = "font-weight:700;font-size:12px;color:var(--text);";
+      tit.textContent = it.title || "横幅媒体";
+      const srcInfo = document.createElement("span");
+      srcInfo.style.cssText = "font-size:11px;color:var(--sub);max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+      srcInfo.textContent = it.src.startsWith("data:") ? "[云同步内联文件]" : (it.src.startsWith("/api/") ? "[本机高清媒体]" : (it.src.startsWith("anim:") ? "[零流量CSS动效]" : it.src));
+      leftInfo.appendChild(tag);
+      leftInfo.appendChild(tit);
+      leftInfo.appendChild(srcInfo);
+
+      const ctrls = document.createElement("div");
+      ctrls.style.cssText = "display:flex;align-items:center;gap:5px;flex-wrap:wrap;";
+      if (it.kind !== "video") {
+        const secBtn = document.createElement("button");
+        secBtn.type = "button";
+        secBtn.className = "mini-pill";
+        secBtn.textContent = `${it.duration_sec || 8}秒`;
+        secBtn.title = "点击循环切换轮播停留秒数 (5s/8s/12s/20s)";
+        secBtn.onclick = () => {
+          const seq = [5, 8, 12, 20];
+          const cur = Number(it.duration_sec || 8);
+          it.duration_sec = seq[(seq.indexOf(cur) + 1) % seq.length];
+          renderAdminAnnMediaList();
+          refreshAdminAnnPreview();
+        };
+        ctrls.appendChild(secBtn);
+      }
+
+      const pickBtn = document.createElement("button");
+      pickBtn.type = "button";
+      pickBtn.className = "mini-pill" + (idx === adminAnnActiveIdx ? " active" : "");
+      pickBtn.textContent = idx === adminAnnActiveIdx ? "单条选中" : "设为单条";
+      pickBtn.onclick = () => {
+        adminAnnActiveIdx = idx;
+        renderAdminAnnMediaList();
+        refreshAdminAnnPreview();
+      };
+      ctrls.appendChild(pickBtn);
+
+      if (idx > 0) {
+        const upBtn = document.createElement("button");
+        upBtn.type = "button";
+        upBtn.className = "mini-pill";
+        upBtn.textContent = "上移";
+        upBtn.onclick = () => {
+          const tmp = adminAnnDraftMediaItems[idx - 1];
+          adminAnnDraftMediaItems[idx - 1] = adminAnnDraftMediaItems[idx];
+          adminAnnDraftMediaItems[idx] = tmp;
+          if (adminAnnActiveIdx === idx) adminAnnActiveIdx = idx - 1;
+          else if (adminAnnActiveIdx === idx - 1) adminAnnActiveIdx = idx;
+          renderAdminAnnMediaList();
+          refreshAdminAnnPreview();
+        };
+        ctrls.appendChild(upBtn);
+      }
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "mini-pill";
+      delBtn.style.color = "var(--red)";
+      delBtn.textContent = "删除";
+      delBtn.onclick = () => {
+        adminAnnDraftMediaItems.splice(idx, 1);
+        if (adminAnnActiveIdx >= adminAnnDraftMediaItems.length) {
+          adminAnnActiveIdx = Math.max(0, adminAnnDraftMediaItems.length - 1);
+        }
+        renderAdminAnnMediaList();
+        refreshAdminAnnPreview();
+      };
+      ctrls.appendChild(delBtn);
+
+      row.appendChild(leftInfo);
+      row.appendChild(ctrls);
+      listEl.appendChild(row);
+    });
+  }
+
+  for (const segId of [
+    "logicComposeSeg", "logicSilentSeg", "logicMinimizeSeg", "adminGlobalAiProviderSeg",
+    "adminAnnEffectSeg", "adminAnnThemeSeg", "adminAnnSizeSeg", "adminAnnSpeedSeg",
+    "adminAnnMediaModeSeg", "adminAnnTextOverlaySeg", "adminAnnHeightSeg", "adminAnnFitSeg",
+  ]) {
     const seg = $(segId);
     if (!seg) continue;
+    const isAnnSeg = segId.startsWith("adminAnn");
     for (const b of seg.querySelectorAll(".mini-seg-btn")) {
       b.onclick = () => {
         for (const x of seg.querySelectorAll(".mini-seg-btn")) x.classList.remove("active");
         b.classList.add("active");
+        if (isAnnSeg) refreshAdminAnnPreview();
       };
     }
+  }
+  if ($("adminAnnEnabled")) $("adminAnnEnabled").onchange = refreshAdminAnnPreview;
+  if ($("adminAnnMuted")) $("adminAnnMuted").onchange = refreshAdminAnnPreview;
+  if ($("adminAnnBadge")) $("adminAnnBadge").oninput = refreshAdminAnnPreview;
+  if ($("adminAnnText")) $("adminAnnText").oninput = refreshAdminAnnPreview;
+
+  const ensureMediaModeActive = () => {
+    const modeSeg = $("adminAnnMediaModeSeg");
+    if (!modeSeg) return;
+    const curBtn = modeSeg.querySelector(".mini-seg-btn.active");
+    if (!curBtn || curBtn.dataset.val === "none") {
+      const targetVal = adminAnnDraftMediaItems.length > 1 ? "loop_all" : "loop_one";
+      for (const b of modeSeg.querySelectorAll(".mini-seg-btn")) b.classList.toggle("active", b.dataset.val === targetVal);
+    }
+  };
+
+  for (const ab of document.querySelectorAll("[data-add-anim]")) {
+    ab.onclick = () => {
+      if (adminAnnDraftMediaItems.length >= 8) { showToast("最多添加 8 个横幅媒体"); return; }
+      const preset = ab.dataset.addAnim || "aurora";
+      adminAnnDraftMediaItems.push({
+        id: `anim_${Date.now().toString(36)}`,
+        kind: "anim",
+        title: ANN_ANIM_LABELS[preset] || "内置横幅动画",
+        src: `anim:${preset}`,
+        duration_sec: 8,
+      });
+      adminAnnActiveIdx = adminAnnDraftMediaItems.length - 1;
+      ensureMediaModeActive();
+      renderAdminAnnMediaList();
+      refreshAdminAnnPreview();
+      showToast("已加入内置动画，记得点底部【保存并同步发布到所有电脑】");
+    };
+  }
+
+  if ($("adminAnnAddUrlBtn")) {
+    $("adminAnnAddUrlBtn").onclick = () => {
+      if (adminAnnDraftMediaItems.length >= 8) { showToast("最多添加 8 个横幅媒体"); return; }
+      const rawUrl = $("adminAnnMediaUrlInput") ? $("adminAnnMediaUrlInput").value.trim() : "";
+      if (!/^https?:\/\//i.test(rawUrl) || !safeAnnouncementMediaUrl(rawUrl)) {
+        showToast("请输入合法的公网 https:// 直链（禁止内网/本机或带账号密码的链接）");
+        return;
+      }
+      const lowerPath = rawUrl.split("?")[0].toLowerCase();
+      const kind = /\.(gif|webp)$/.test(lowerPath) ? "gif" : (/\.(png|jpg|jpeg|bmp)$/.test(lowerPath) ? "image" : "video");
+      const titInp = $("adminAnnMediaTitleInput");
+      const title = (titInp && titInp.value.trim()) || (kind === "gif" ? "公网横幅动图" : (kind === "image" ? "公网横幅图片" : "公网横幅视频"));
+      adminAnnDraftMediaItems.push({
+        id: `url_${Date.now().toString(36)}`,
+        kind,
+        title: title.slice(0, 36),
+        src: rawUrl,
+        duration_sec: 8,
+      });
+      if ($("adminAnnMediaUrlInput")) $("adminAnnMediaUrlInput").value = "";
+      if (titInp) titInp.value = "";
+      adminAnnActiveIdx = adminAnnDraftMediaItems.length - 1;
+      ensureMediaModeActive();
+      renderAdminAnnMediaList();
+      refreshAdminAnnPreview();
+    };
+  }
+
+  if ($("adminAnnUploadBtn") && $("adminAnnMediaFileInput")) {
+    $("adminAnnUploadBtn").onclick = () => {
+      if (adminAnnDraftMediaItems.length >= 8) { showToast("最多添加 8 个横幅媒体"); return; }
+      $("adminAnnMediaFileInput").click();
+    };
+    $("adminAnnMediaFileInput").onchange = async (ev) => {
+      const f = ev.target && ev.target.files ? ev.target.files[0] : null;
+      ev.target.value = "";
+      if (!f) return;
+      if (f.size > 25 * 1024 * 1024) {
+        showToast("单个视频/GIF 文件不能超过 25 MB");
+        return;
+      }
+      $("adminAnnUploadBtn").disabled = true;
+      showToast("正在上传并校验横幅媒体…");
+      try {
+        const res = await fetch(`/api/admin/ann-media?token=${encodeURIComponent(TOKEN)}`, {
+          method: "POST",
+          headers: {
+            "X-Token": TOKEN,
+            "X-Admin-Token": adminToken,
+            "Content-Type": "application/octet-stream",
+          },
+          body: f,
+        });
+        const data = await res.json();
+        if (!res.ok || !data || !data.ok) {
+          showToast((data && data.message) || "上传失败，请检查文件格式");
+          return;
+        }
+        const titInp = $("adminAnnMediaTitleInput");
+        const title = (titInp && titInp.value.trim()) || f.name.replace(/\.[^.]+$/, "").slice(0, 36) || "横幅媒体";
+        adminAnnDraftMediaItems.push({
+          id: `up_${Date.now().toString(36)}`,
+          kind: data.kind || "video",
+          title,
+          src: data.src,
+          duration_sec: 8,
+        });
+        if (titInp) titInp.value = "";
+        adminAnnActiveIdx = adminAnnDraftMediaItems.length - 1;
+        ensureMediaModeActive();
+        renderAdminAnnMediaList();
+        refreshAdminAnnPreview();
+        showToast(data.message || "已加入媒体列表");
+      } catch (_e) {
+        showToast("上传媒体时发生网络或读写异常");
+      } finally {
+        $("adminAnnUploadBtn").disabled = false;
+      }
+    };
+  }
+
+  if ($("adminResetAnnBtn")) {
+    $("adminResetAnnBtn").onclick = () => {
+      const defAnn = normalizeAnnouncementClient({});
+      adminAnnDraftMediaItems = [];
+      adminAnnActiveIdx = 0;
+      if ($("adminAnnEnabled")) $("adminAnnEnabled").checked = true;
+      if ($("adminAnnMuted")) $("adminAnnMuted").checked = true;
+      if ($("adminAnnBadge")) $("adminAnnBadge").value = defAnn.badge;
+      if ($("adminAnnText")) $("adminAnnText").value = defAnn.text;
+      for (const [segId, v] of [
+        ["adminAnnEffectSeg", defAnn.effect],
+        ["adminAnnThemeSeg", defAnn.theme],
+        ["adminAnnSizeSeg", defAnn.font_size],
+        ["adminAnnSpeedSeg", defAnn.speed],
+        ["adminAnnMediaModeSeg", "none"],
+        ["adminAnnTextOverlaySeg", "overlay"],
+        ["adminAnnHeightSeg", "normal"],
+        ["adminAnnFitSeg", "cover"],
+      ]) {
+        const s = $(segId);
+        if (s) for (const x of s.querySelectorAll(".mini-seg-btn")) x.classList.toggle("active", x.dataset.val === v);
+      }
+      renderAdminAnnMediaList();
+      refreshAdminAnnPreview();
+      showToast("已填入默认公告设置，请点击保存发布生效");
+    };
+  }
+  if ($("adminSaveAnnBtn")) {
+    $("adminSaveAnnBtn").onclick = async () => {
+      $("adminSaveAnnBtn").disabled = true;
+      try {
+        const r = await api("/api/admin/global-logic", "POST", { announcement: readAdminAnnouncementForm() }, { "X-Admin-Token": adminToken });
+        if (r && r.ok && r.global_logic && r.global_logic.announcement) {
+          const syncedAnn = normalizeAnnouncementClient(r.global_logic.announcement);
+          adminAnnDraftMediaItems = syncedAnn.media_items.map((x) => ({ ...x }));
+          adminAnnActiveIdx = syncedAnn.media_active_idx || 0;
+          renderAdminAnnMediaList();
+          applyAnnouncementToDom(r.global_logic.announcement, false);
+          applyAnnouncementToDom(r.global_logic.announcement, true);
+        }
+        showToast((r && r.message) || "全员顶部公告已保存并同步发布到所有电脑");
+      } finally {
+        $("adminSaveAnnBtn").disabled = false;
+      }
+    };
   }
   if ($("adminGlobalAiKeyToggle") && $("adminGlobalAiKeyInput")) {
     $("adminGlobalAiKeyToggle").onclick = () => {
@@ -10885,9 +14822,210 @@ async function loadStartupGreeting(force = false) {
   }
 }
 
+function initAiDialogResizeAndPopout() {
+  const feed = $("aiChatFeed");
+  const card = $("aiCardBox");
+  const handle = $("aiFeedResizeHandle");
+  const stg = $("scrollStage");
+  if (stg) {
+    stg.addEventListener("scroll", scheduleSyncHomeAiStickyHeight, { passive: true });
+  }
+  window.addEventListener("resize", scheduleSyncHomeAiStickyHeight, { passive: true });
+  if (typeof ResizeObserver === "function") {
+    const ro = new ResizeObserver(scheduleSyncHomeAiStickyHeight);
+    if ($("appFrozenTop")) ro.observe($("appFrozenTop"));
+    if (stg) ro.observe(stg);
+    if ($("homeKpiRibbon")) ro.observe($("homeKpiRibbon"));
+  }
+  scheduleSyncHomeAiStickyHeight();
+
+  if (feed && handle) {
+    let draggingFeed = false;
+    let dragStartY = 0;
+    let startCardH = 480;
+    handle.ondblclick = () => {
+      _homeAiUserMaxH = null;
+      _lastHomeAiCardH = 0;
+      scheduleSyncHomeAiStickyHeight();
+      showToast("已恢复 AI 对话栏全高度贴底固定");
+    };
+    handle.onmousedown = (ev) => {
+      ev.preventDefault();
+      draggingFeed = true;
+      dragStartY = ev.clientY;
+      startCardH = (window.innerWidth <= 680 ? feed.getBoundingClientRect().height : (card ? card.getBoundingClientRect().height : 480)) || 480;
+      handle.classList.add("dragging");
+      document.body.style.userSelect = "none";
+    };
+    document.addEventListener("mousemove", (ev) => {
+      if (!draggingFeed) return;
+      const dy = ev.clientY - dragStartY;
+      if (window.innerWidth <= 680) {
+        const nextF = Math.max(180, Math.min(680, Math.round(startCardH + dy)));
+        feed.style.height = nextF + "px";
+      } else {
+        _homeAiUserMaxH = Math.max(300, Math.min(920, Math.round(startCardH + dy)));
+        syncHomeAiStickyHeight();
+      }
+    });
+    document.addEventListener("mouseup", () => {
+      if (!draggingFeed) return;
+      draggingFeed = false;
+      handle.classList.remove("dragging");
+      document.body.style.userSelect = "";
+      if (window.innerWidth > 680 && card && _homeAiUserMaxH) {
+        const tabEl = $("tabbar");
+        const tabTop = tabEl ? tabEl.getBoundingClientRect().top : (window.innerHeight - 68);
+        const colRect = ($("homeAiCol") || card).getBoundingClientRect();
+        const maxAvail = Math.round(tabTop - colRect.top - 14);
+        if (_homeAiUserMaxH >= maxAvail - 12) _homeAiUserMaxH = null;
+        syncHomeAiStickyHeight();
+      }
+    });
+  }
+
+  const dock = $("aiShortcutsDock");
+  const dockHead = $("aiShortcutsHead");
+  const dockBtn = $("aiShortcutsToggleBtn");
+  if (dock && dockBtn) {
+    const applyDockState = (collapsed) => {
+      dock.classList.toggle("collapsed", Boolean(collapsed));
+      dockBtn.textContent = collapsed ? "展开" : "收起";
+      scheduleSyncHomeAiStickyHeight();
+    };
+    // 严格保持默认收起状态，仅在本次使用过程中由用户主动点击展开
+    applyDockState(true);
+    const toggleDock = () => applyDockState(!dock.classList.contains("collapsed"));
+    if (dockHead) {
+      dockHead.onclick = toggleDock;
+    } else {
+      dockBtn.onclick = toggleDock;
+    }
+  }
+
+  const mask = $("aiPopoutModalMask");
+  const win = $("aiPopoutWindow");
+  const head = $("aiPopoutHead");
+  const openBtn = $("aiPopoutBtn");
+  const closeBtn = $("aiPopoutCloseBtn");
+  const maxBtn = $("aiPopoutMaxBtn");
+  const clearBtn = $("aiPopoutClearBtn");
+  const popFeed = $("aiPopoutFeed");
+  const popInput = $("aiPopoutInput");
+  const popSendBtn = $("aiPopoutSendBtn");
+  if (!mask || !win) return;
+
+  let winOffsetX = 0;
+  let winOffsetY = 0;
+  const openPopout = () => {
+    mask.classList.add("show");
+    renderAiChatFeed(cachedChatHistory);
+    if (popFeed) popFeed.scrollTop = popFeed.scrollHeight;
+    if (popInput) setTimeout(() => popInput.focus(), 60);
+  };
+  const closePopout = () => {
+    mask.classList.remove("show");
+  };
+
+  if (openBtn) openBtn.onclick = openPopout;
+  if (closeBtn) closeBtn.onclick = closePopout;
+  mask.addEventListener("click", (ev) => {
+    if (ev.target === mask) closePopout();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && mask.classList.contains("show")) closePopout();
+  });
+
+  if (maxBtn) {
+    maxBtn.onclick = () => {
+      const nextMax = !win.classList.contains("is-max");
+      win.classList.toggle("is-max", nextMax);
+      maxBtn.textContent = nextMax ? "还原" : "全屏";
+      if (!nextMax) {
+        win.style.transform = `translate(${winOffsetX}px, ${winOffsetY}px)`;
+      }
+    };
+  }
+
+  if (clearBtn) {
+    clearBtn.onclick = () => {
+      if ($("aiClearChatBtn")) {
+        $("aiClearChatBtn").click();
+      } else {
+        cachedChatHistory = [];
+        renderAiChatFeed([]);
+      }
+    };
+  }
+
+  if (head) {
+    let draggingWin = false;
+    let dragX0 = 0;
+    let dragY0 = 0;
+    let baseX = 0;
+    let baseY = 0;
+    head.onmousedown = (ev) => {
+      if (win.classList.contains("is-max")) return;
+      if (ev.target && ev.target.closest && ev.target.closest("button")) return;
+      ev.preventDefault();
+      draggingWin = true;
+      dragX0 = ev.clientX;
+      dragY0 = ev.clientY;
+      baseX = winOffsetX;
+      baseY = winOffsetY;
+      document.body.style.userSelect = "none";
+    };
+    document.addEventListener("mousemove", (ev) => {
+      if (!draggingWin) return;
+      const dx = ev.clientX - dragX0;
+      const dy = ev.clientY - dragY0;
+      winOffsetX = Math.max(-window.innerWidth * 0.45, Math.min(window.innerWidth * 0.45, baseX + dx));
+      winOffsetY = Math.max(-window.innerHeight * 0.4, Math.min(window.innerHeight * 0.4, baseY + dy));
+      win.style.transform = `translate(${winOffsetX}px, ${winOffsetY}px)`;
+    });
+    document.addEventListener("mouseup", () => {
+      if (!draggingWin) return;
+      draggingWin = false;
+      document.body.style.userSelect = "";
+    });
+  }
+
+  const triggerPopSend = () => {
+    if (!popInput) return;
+    const txt = popInput.value.trim();
+    if (!txt) return;
+    popInput.value = "";
+    sendAiSummary("custom", txt);
+  };
+  if (popSendBtn) popSendBtn.onclick = triggerPopSend;
+  if (popInput) {
+    popInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && !ev.shiftKey) {
+        ev.preventDefault();
+        triggerPopSend();
+      }
+    });
+  }
+  for (const qb of document.querySelectorAll("#aiPopoutQaBar [data-ai-q]")) {
+    qb.onclick = () => {
+      const q = qb.dataset.aiQ || "";
+      if (q) sendAiSummary("custom", q);
+    };
+  }
+  for (const ptb of document.querySelectorAll("#aiPopoutQaBar [data-ai-pop-tpl]")) {
+    ptb.onclick = () => {
+      if (!popInput) return;
+      popInput.value = ptb.dataset.aiPopTpl || "";
+      popInput.focus();
+      showToast("已填入定时模板，改好时间与发送对象后点发送即可");
+    };
+  }
+}
+
 (async function bootstrap() {
   initTheme();
   bindEvents();
+  initAiDialogResizeAndPopout();
   initMascotLifeEngine();
   try {
     if (window.outerWidth < 680 && window.screen && window.screen.availHeight >= 760) {
@@ -10906,6 +15044,9 @@ async function loadStartupGreeting(force = false) {
     $("aiShotStatusPill").textContent = data.ai_meta.latest_shot_label ? ("已就绪 · " + data.ai_meta.latest_shot_label) : "数据就绪";
     if (data.ai_meta.data_brief) applyDataBriefUI(data.ai_meta.data_brief);
     renderAiChatFeed(cachedChatHistory);
+  }
+  if (data.global_logic && data.global_logic.announcement) {
+    applyAnnouncementToDom(data.global_logic.announcement, false);
   }
   if (data.profile) {
     memberProfile = data.profile;
@@ -10956,6 +15097,13 @@ def _find_static_asset(filename):
 
 def _make_handler(ctrl, token):
     class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            try:
+                self.request.settimeout(30.0)
+            except Exception:
+                pass
+
         def log_message(self, format, *args):
             return
 
@@ -10980,6 +15128,150 @@ def _make_handler(ctrl, token):
             self.end_headers()
             self.wfile.write(data)
 
+        def _ann_media_dir(self, ctrl):
+            base = ctrl.app.app_dir() if hasattr(ctrl.app, "app_dir") else Path(".")
+            return Path(base) / "announcement_media"
+
+        def _handle_ann_media_upload(self, ctrl):
+            length = _safe_int(self.headers.get("Content-Length"), 0)
+            if length <= 0:
+                self._send_json({"ok": False, "message": "上传内容为空"}, HTTPStatus.BAD_REQUEST)
+                return
+            if length > MAX_ANN_MEDIA_UPLOAD_BYTES:
+                self._send_json({"ok": False, "message": "媒体文件超出 25 MB 上限"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            raw_bytes = self.rfile.read(length)
+            if len(raw_bytes) < length:
+                self._send_json({"ok": False, "message": "上传数据不完整，请重试"}, HTTPStatus.BAD_REQUEST)
+                return
+            ext, mime, kind = _validate_ann_media_bytes(raw_bytes)
+            if not ext or not mime:
+                self._send_json(
+                    {"ok": False, "message": "仅支持合法 MP4 / WebM 视频或 GIF / WebP / PNG / JPG 图片"},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if len(raw_bytes) <= MAX_ANN_MEDIA_INLINE_BYTES:
+                b64 = base64.b64encode(raw_bytes).decode("ascii")
+                data_url = f"data:{mime};base64,{b64}"
+                self._send_json({
+                    "ok": True,
+                    "sync_mode": "cloud",
+                    "kind": kind,
+                    "src": data_url,
+                    "bytes": len(raw_bytes),
+                    "message": "小体积动画/视频已转为云同步格式（发布后所有电脑自动同步）",
+                })
+                return
+            mdir = self._ann_media_dir(ctrl)
+            mdir.mkdir(parents=True, exist_ok=True)
+            fname = f"{secrets.token_hex(12)}.{ext}"
+            fpath = mdir / fname
+            tmp_p = mdir / f".tmp_{fname}"
+            try:
+                tmp_p.write_bytes(raw_bytes)
+                os.replace(tmp_p, fpath)
+                files = sorted(
+                    (f for f in mdir.iterdir() if f.is_file() and not f.name.startswith(".tmp_")),
+                    key=lambda x: x.stat().st_mtime,
+                    reverse=True,
+                )
+                for old_f in files[MAX_ANN_MEDIA_DISK_KEEP:]:
+                    try:
+                        old_f.unlink()
+                    except Exception:
+                        pass
+            except Exception as exc_up:
+                try:
+                    tmp_p.unlink()
+                except Exception:
+                    pass
+                self._send_json({"ok": False, "message": f"保存媒体文件失败：{exc_up}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            self._send_json({
+                "ok": True,
+                "sync_mode": "local",
+                "kind": kind,
+                "src": f"/api/ann-media/{fname}",
+                "bytes": len(raw_bytes),
+                "message": "高清视频/动图已存入本机媒体库；若需多电脑全部同步请用公网 https 链接或 500KB 内文件",
+            })
+
+        def _serve_ann_media_get(self, ctrl, rel_name):
+            m = _ANN_MEDIA_FNAME_RE.fullmatch(str(rel_name or ""))
+            if not m:
+                self._send_json({"ok": False, "message": "Invalid media name"}, HTTPStatus.BAD_REQUEST)
+                return
+            fname = f"{m.group(1).lower()}.{m.group(2).lower()}"
+            ext = m.group(2).lower()
+            mime = (_ANN_MEDIA_EXT_MIME.get(ext) or ("application/octet-stream", ""))[0]
+            mdir = self._ann_media_dir(ctrl)
+            try:
+                mdir_res = mdir.resolve()
+                fpath = (mdir / fname).resolve()
+                if fpath.parent != mdir_res or not fpath.is_file():
+                    self._send_json({"ok": False, "message": "Media not found"}, HTTPStatus.NOT_FOUND)
+                    return
+                total = fpath.stat().st_size
+            except Exception:
+                self._send_json({"ok": False, "message": "Media not found"}, HTTPStatus.NOT_FOUND)
+                return
+
+            rng_hdr = (self.headers.get("Range") or "").strip()
+            start = 0
+            end = max(0, total - 1)
+            is_partial = False
+            if rng_hdr.lower().startswith("bytes=") and "," not in rng_hdr:
+                spec = rng_hdr[6:].strip()
+                if "-" in spec:
+                    s_part, e_part = spec.split("-", 1)
+                    try:
+                        if not s_part and e_part:
+                            suf_len = int(e_part)
+                            if suf_len <= 0 or total == 0:
+                                raise ValueError("bad suffix")
+                            start = max(0, total - suf_len)
+                            end = total - 1
+                        elif s_part:
+                            start = int(s_part)
+                            end = int(e_part) if e_part else (total - 1)
+                            end = min(end, total - 1)
+                        else:
+                            raise ValueError("empty range")
+                        if start < 0 or start >= total or start > end:
+                            self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                            self._send_security_headers()
+                            self.send_header("Content-Range", f"bytes */{total}")
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                            return
+                        is_partial = True
+                    except ValueError:
+                        is_partial = False
+
+            send_len = (end - start + 1) if total > 0 else 0
+            try:
+                self.send_response(HTTPStatus.PARTIAL_CONTENT if is_partial else HTTPStatus.OK)
+                self._send_security_headers()
+                self.send_header("Content-Type", mime)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "private, max-age=3600")
+                if is_partial:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+                self.send_header("Content-Length", str(send_len))
+                self.end_headers()
+                with open(fpath, "rb") as fp:
+                    fp.seek(start)
+                    rem = send_len
+                    while rem > 0:
+                        chunk = fp.read(min(65536, rem))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        rem -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
         def _read_json(self):
             length = _safe_int(self.headers.get("Content-Length"), 0)
             if length <= 0:
@@ -10988,7 +15280,8 @@ def _make_handler(ctrl, token):
                 raise ValueError("PayloadTooLarge")
             raw = self.rfile.read(length)
             try:
-                return json.loads(raw.decode("utf-8"))
+                obj = json.loads(raw.decode("utf-8"))
+                return obj if isinstance(obj, dict) else {}
             except Exception:
                 return {}
 
@@ -11015,6 +15308,10 @@ def _make_handler(ctrl, token):
                 self._send_json({"ok": False, "message": "Forbidden"}, HTTPStatus.FORBIDDEN)
                 return
 
+            if parsed.path.startswith("/api/ann-media/"):
+                self._serve_ann_media_get(ctrl, parsed.path[len("/api/ann-media/"):])
+                return
+
             if parsed.path == "/":
                 ctrl.close_requested_at = 0.0
                 ctrl.last_heartbeat = time.time()
@@ -11035,11 +15332,17 @@ def _make_handler(ctrl, token):
                 return
 
             if parsed.path == "/api/config":
+                pub_gl = (
+                    ctrl._public_global_logic(ctrl.hub.get_effective_global_overrides())
+                    if getattr(ctrl, "hub", None) is not None
+                    else {}
+                )
                 self._send_json({
                     "ok": True,
                     "config": ctrl.get_public_config(),
                     "timetable": ctrl.get_timetable(),
                     "ai_meta": ctrl.get_ai_meta(),
+                    "global_logic": pub_gl,
                     "cloud_account": ctrl.get_account_status_payload(),
                     **(ctrl.get_profile_payload() if hasattr(ctrl, "get_profile_payload") else {}),
                 })
@@ -11119,6 +15422,10 @@ def _make_handler(ctrl, token):
                 self._send_json(ctrl.start_capture_only())
                 return
 
+            if parsed.path == "/api/run-raw-sync":
+                self._send_json(ctrl.start_raw_sync_now())
+                return
+
             if parsed.path == "/api/schedule":
                 body = self._read_json()
                 enable = body.get("enable") if isinstance(body, dict) and "enable" in body else None
@@ -11191,7 +15498,7 @@ def _make_handler(ctrl, token):
 
             if parsed.path == "/api/reset":
                 saved = ctrl.reset_config()
-                self._send_json({"ok": True, "config": saved, "timetable": ctrl.get_timetable()})
+                self._send_json({"ok": True, "config": ctrl._sanitize_config_for_client(saved), "timetable": ctrl.get_timetable()})
                 return
 
             if parsed.path == "/api/clear-logs":
@@ -11205,6 +15512,22 @@ def _make_handler(ctrl, token):
                     self._send_json({"ok": bool(res.get("ok")), **res})
                 else:
                     self._send_json({"ok": False, "summary": "当前版本不支持环境自检"})
+                return
+
+            if parsed.path == "/api/verify-dingtalk-target":
+                body = self._read_json()
+                tgt_name = str(body.get("name") or "").strip()
+                self._send_json(ctrl.verify_dingtalk_target(tgt_name))
+                return
+
+            if parsed.path == "/api/confirm-dingtalk-target":
+                body = self._read_json()
+                self._send_json(ctrl.resolve_target_confirmation(
+                    action=str(body.get("action") or "").strip(),
+                    new_target=str(body.get("new_target") or "").strip(),
+                    pending_id=str(body.get("pending_id") or "").strip(),
+                    source_device="pc",
+                ))
                 return
 
             if parsed.path == "/api/open-shots":
@@ -11271,6 +15594,9 @@ def _make_handler(ctrl, token):
                 atok = self.headers.get("X-Admin-Token") or ""
                 if not ctrl.admin_is_authed(atok):
                     self._send_json({"ok": False, "auth_required": True, "message": "需要超级管理员验证"}, HTTPStatus.FORBIDDEN)
+                    return
+                if parsed.path == "/api/admin/ann-media":
+                    self._handle_ann_media_upload(ctrl)
                     return
                 body = self._read_json()
                 if parsed.path == "/api/admin/unlock":
