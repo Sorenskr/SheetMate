@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
 """
-暗号表助手 SheetMate 核心自动化引擎（v2.9.4）：
+暗号表助手 SheetMate 核心自动化引擎（v2.9.5）：
 - 自动登录数据后台拉取、格式清洗与 WPS 在线表格自动写入
 - 汇总表自定义格位校准、高清选区截图与多尺度无坐标钉钉静音发群
 - 支持白天/夜间自定义排期、AI 个人习惯持久化记忆与跨电脑云同步扩展
@@ -348,9 +348,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.9.4"
+APP_VERSION = "2.9.5"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.9.4","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.9.5","url":"新版exe的下载直链"}
 DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
 GEMINI_MODEL_CANDIDATES = (
     "gemini-flash-latest",
@@ -1715,7 +1715,7 @@ def _sanitize_ai_reply_brands(text):
     return s
 
 
-def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens=900, timeout_sec=22, max_models=None):
+def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens=900, timeout_sec=22, max_models=None, total_budget_sec=40):
     """底层统一云端智能接口调度器（支持管理员切换不同服务接口，对外严格隐藏厂商与模型信息）。"""
     norm = normalize_config(cfg if isinstance(cfg, dict) else {})
     ai_cfg = norm.get("ai_assistant") or {}
@@ -1768,7 +1768,13 @@ def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens
     if not _validate_safe_http_url(base_host, require_https=False):
         return {"ok": False, "source": "invalid_url", "model": "", "error": "接口地址协议不安全或格式无效"}
 
+    t_start = time.monotonic()
     for model_name in models_to_try:
+        rem = float(total_budget_sec) - (time.monotonic() - t_start)
+        if rem < 4.0:
+            last_err = last_err or "请求总耗时已接近上限，已快速切换离线兜底"
+            break
+        per_timeout = max(5.0, min(float(timeout_sec), rem))
         url = f"{base_host}/v1beta/models/{model_name}:generateContent?key={api_key}"
         req = urllib.request.Request(
             url,
@@ -1776,7 +1782,7 @@ def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens
             headers={"Content-Type": "application/json", "User-Agent": f"SheetMate/{APP_VERSION}"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl_ctx) as resp:
+            with urllib.request.urlopen(req, timeout=per_timeout, context=ssl_ctx) as resp:
                 raw = json.loads(resp.read().decode("utf-8", errors="ignore"))
             cands = raw.get("candidates") or []
             if not cands:
@@ -1795,6 +1801,9 @@ def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens
                 break
         except Exception as e:
             last_err = str(e)[:180]
+            low_e = last_err.lower()
+            if any(k in low_e for k in ("getaddrinfo", "10061", "nameresolutionerror", "actively refused", "winerror 10051")):
+                break
 
     return {"ok": False, "source": "network_error", "model": "", "error": last_err}
 
@@ -1810,6 +1819,29 @@ def _encode_image_b64_scaled(img_path, max_dim=3072):
         buf = io.BytesIO()
         im.save(buf, format="PNG", optimize=True)
         return base64.b64encode(buf.getvalue()).decode("ascii")
+    finally:
+        im.close()
+
+
+def _encode_image_for_ai(img_path, max_dim=2200):
+    """将汇总表截图智能缩放并择优编码为更轻量的 JPEG/PNG base64，显著缩短 AI 总结网络上传耗时。"""
+    import base64
+    im = Image.open(img_path).convert("RGB")
+    try:
+        if max(im.width, im.height) > max_dim:
+            ratio = max_dim / float(max(im.width, im.height))
+            im = im.resize((max(1, int(im.width * ratio)), max(1, int(im.height * ratio))), Image.Resampling.LANCZOS)
+        buf_jpg = io.BytesIO()
+        im.save(buf_jpg, format="JPEG", quality=88, optimize=True)
+        jpg_bytes = buf_jpg.getvalue()
+
+        buf_png = io.BytesIO()
+        im.save(buf_png, format="PNG", optimize=True)
+        png_bytes = buf_png.getvalue()
+
+        if len(jpg_bytes) <= len(png_bytes):
+            return "image/jpeg", base64.b64encode(jpg_bytes).decode("ascii")
+        return "image/png", base64.b64encode(png_bytes).decode("ascii")
     finally:
         im.close()
 
@@ -3765,11 +3797,15 @@ def collect_report_context_for_ai(include_prev_shot=False, extra_img_path=None, 
     want_n = 2 if include_prev_shot else 1
     for p, mtime in picked_imgs[:want_n]:
         try:
-            b64 = _encode_image_b64_scaled(p, max_dim=3072) if encode_images else ""
+            if encode_images:
+                mime_t, b64 = _encode_image_for_ai(p, max_dim=2200)
+            else:
+                mime_t, b64 = "image/png", ""
             images_out.append({
                 "name": p.name,
                 "path": str(p),
                 "mtime_str": time.strftime("%m-%d %H:%M", time.localtime(mtime)),
+                "mime_type": mime_t,
                 "b64": b64,
             })
         except Exception:
@@ -5091,7 +5127,24 @@ def summarize_report_with_ai(cfg, style_id="brief", user_prompt="", chat_history
             "reply": guard_reply,
         }
 
-    ctx = collect_report_context_for_ai(include_prev_shot=(sid == "delta"), extra_img_path=extra_img_path)
+    _need_visual_img = (
+        bool(extra_img_path)
+        or sid != "custom"
+        or not raw_user
+        or any(
+            k in raw_user.lower()
+            for k in (
+                "表", "图", "截图", "汇总", "数据", "团队", "小组", "排行", "排名",
+                "注册", "转化", "华人", "暗号", "渠道", "对比", "增量", "变化",
+                "总结", "汇报", "简报", "业绩", "趋势", "昨天", "今天", "本周", "点评", "复盘",
+            )
+        )
+    )
+    ctx = collect_report_context_for_ai(
+        include_prev_shot=(sid == "delta"),
+        extra_img_path=extra_img_path,
+        encode_images=_need_visual_img,
+    )
 
     custom_tail = str(ai_cfg.get("custom_summary_prompt") or "").strip()
     effective_prompt = raw_user
@@ -5145,9 +5198,11 @@ def summarize_report_with_ai(cfg, style_id="brief", user_prompt="", chat_history
         )
     }]
     for idx, im_item in enumerate(ctx["images"]):
+        if not im_item.get("b64"):
+            continue
         label = "【最新一轮汇总表高清截图" if idx == 0 else "【上一轮对比汇总表高清截图"
         first_parts.append({"text": f"{label}（拍摄时间：{im_item['mtime_str']}，文件：{im_item['name']}）】"})
-        first_parts.append({"inlineData": {"mimeType": "image/png", "data": im_item["b64"]}})
+        first_parts.append({"inlineData": {"mimeType": im_item.get("mime_type") or "image/png", "data": im_item["b64"]}})
     if ctx["tsv_text"]:
         first_parts.append({"text": f"【桌面明细表精确文本摘录】\n{ctx['tsv_text']}"})
 
@@ -5166,7 +5221,7 @@ def summarize_report_with_ai(cfg, style_id="brief", user_prompt="", chat_history
         first_parts.append({"text": effective_prompt})
         contents.append({"role": "user", "parts": first_parts})
 
-    call_res = _call_gemini_generate(norm, sys_prompt, contents, temperature=0.35, max_tokens=1050, timeout_sec=26)
+    call_res = _call_gemini_generate(norm, sys_prompt, contents, temperature=0.35, max_tokens=1050, timeout_sec=24, max_models=2, total_budget_sec=42)
 
     if call_res.get("ok"):
         return {
@@ -11171,7 +11226,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 target_titles=None)
             if not tops:
                 return None
-            return ua.ControlFromHandle(tops[0][0])
+            return _safe_control_from_handle(ua, tops[0][0])
 
         def _close_link_box():
             box = _link_box()
@@ -11193,13 +11248,17 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
 
         def _search_controls():
             out = []
-            for h, c, t in _enum_top_windows():
-                if "ToolSaveBits" in c:
-                    ctl = ua.ControlFromHandle(h)
-                    if ctl is not None:
-                        out.append((h, ctl))
+            try:
+                for h, c, t in _enum_top_windows():
+                    if "ToolSaveBits" in c:
+                        ctl = _safe_control_from_handle(ua, h)
+                        if ctl is not None:
+                            out.append((h, ctl))
+            except Exception:
+                pass
             return out
 
+        def _search_doc():
             for h, ctl in _search_controls():
                 try:
                     d = ctl.DocumentControl(searchDepth=12, Name="advancedSearch")

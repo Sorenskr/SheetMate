@@ -1083,7 +1083,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="m-dl-card" id="mDownloadCard">
       <div class="m-dl-head">
         <div class="m-dl-title">电脑还没装软件？免费下载客户端</div>
-        <span class="m-dl-badge">v2.9.4 纯净单文件版</span>
+        <span class="m-dl-badge">v2.9.5 纯净单文件版</span>
       </div>
       <div class="m-dl-desc">
         下载这单个 SheetMate.exe 双击直接运行（绝不生成杂乱文件夹、无需安装环境、关闭窗口直接结束退出），支持自动抓数写 WPS 表、钉钉静音发群与云端异地遥控。
@@ -1880,7 +1880,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     renderChats(cachedChatHistory);
     try {
       if (connMode === "cloud" && relayCred) {
-        const res = await sendRelayCommand("chat", { prompt: msg, style_id: "custom" }, 32000);
+        const res = await sendRelayCommand("chat", { prompt: msg, style_id: "custom" }, 58000);
         const idx = pendingUserMsgs.indexOf(msg);
         if (idx >= 0) pendingUserMsgs.splice(idx, 1);
         if (res && res.result) {
@@ -1895,7 +1895,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
           renderChats(cachedChatHistory);
         }
       } else {
-        const res = await mApi("/api/mobile/chat", "POST", { prompt: msg });
+        const res = await mApi("/api/mobile/chat", "POST", { prompt: msg }, null, 65000);
         const idx = pendingUserMsgs.indexOf(msg);
         if (idx >= 0) pendingUserMsgs.splice(idx, 1);
         if (res && Array.isArray(res.history)) {

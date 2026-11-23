@@ -417,7 +417,7 @@ def _safe_zlib_decompress(data, max_bytes=MAX_DECOMPRESSED_BYTES):
     return out + tail
 
 
-def _acct_mqtt_pull_all(topic, timeout=2.2):
+def _acct_mqtt_pull_all(topic, timeout=4.5):
     """并发从国内/海外双公共云节点拉取账号加密保留包，返回所有读到的密文列表。"""
     results = []
     res_lock = threading.Lock()
@@ -438,8 +438,8 @@ def _acct_mqtt_pull_all(topic, timeout=2.2):
                     s_vh = struct.pack("!H", 1)
                     s_pl = _th_mqtt_str(topic) + b"\x00"
                     ss.sendall(b"\x82" + _th_mqtt_enc_varlen(len(s_vh) + len(s_pl)) + s_vh + s_pl)
-                    ss.settimeout(0.55)
-                    deadline = time.monotonic() + 0.70
+                    ss.settimeout(1.6)
+                    deadline = time.monotonic() + 1.9
                     while time.monotonic() < deadline:
                         try:
                             hdr, body = _th_mqtt_read_packet(ss)
@@ -465,15 +465,15 @@ def _acct_mqtt_pull_all(topic, timeout=2.2):
     for th in ths:
         th.start()
     for th in ths:
-        th.join(timeout=timeout + 0.9)
+        th.join(timeout=timeout + 2.5)
     return results
 
 
-def _acct_mqtt_push_all(topic, text, timeout=2.8):
-    """并发将账号加密保留包推送至双节点云服务，确保跨地域登录即得最新配置。"""
+def _acct_mqtt_push_all(topic, text, timeout=5.0):
+    """并发将账号加密保留包推送至双节点云服务（QoS 1 确认落盘），确保跨地域登录即得最新配置。"""
     data_b = str(text or "").encode("utf-8")
-    vh_p = _th_mqtt_str(topic)
-    pub_pkt = b"\x31" + _th_mqtt_enc_varlen(len(vh_p) + len(data_b)) + vh_p + data_b
+    vh_p = _th_mqtt_str(topic) + struct.pack("!H", 1)
+    pub_pkt = b"\x33" + _th_mqtt_enc_varlen(len(vh_p) + len(data_b)) + vh_p + data_b
     ctx = ssl.create_default_context()
     ok_flags = []
     ok_lock = threading.Lock()
@@ -491,12 +491,14 @@ def _acct_mqtt_push_all(topic, text, timeout=2.8):
                     if (hdr0 & 0xF0) != 0x20:
                         return
                     ss.sendall(pub_pkt)
+                    hdr1, _ = _th_mqtt_read_packet(ss)
+                    if (hdr1 & 0xF0) == 0x40:
+                        with ok_lock:
+                            ok_flags.append(True)
                     try:
                         ss.sendall(b"\xe0\x00")
                     except Exception:
                         pass
-                    with ok_lock:
-                        ok_flags.append(True)
         except Exception:
             pass
 
@@ -504,7 +506,7 @@ def _acct_mqtt_push_all(topic, text, timeout=2.8):
     for th in ths:
         th.start()
     for th in ths:
-        th.join(timeout=timeout + 0.8)
+        th.join(timeout=timeout + 2.5)
     return bool(ok_flags)
 
 
@@ -2781,7 +2783,7 @@ class AccountCloudSyncManager:
             except Exception:
                 pass
             if getattr(self._hub, "_auto_cloud_enabled", False):
-                for mp in _acct_mqtt_pull_all(topic, timeout=2.2):
+                for mp in _acct_mqtt_pull_all(topic, timeout=4.5):
                     _add(mp)
         return cands
 
@@ -2797,7 +2799,7 @@ class AccountCloudSyncManager:
             except Exception:
                 pass
             if getattr(self._hub, "_auto_cloud_enabled", False):
-                if _acct_mqtt_push_all(topic, pkt, timeout=2.8):
+                if _acct_mqtt_push_all(topic, pkt, timeout=5.0):
                     cloud_ok = True
         return cloud_ok
 

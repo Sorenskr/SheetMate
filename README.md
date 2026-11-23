@@ -1,6 +1,6 @@
-# 暗号表助手（SheetMate）v2.9.4
+# 暗号表助手（SheetMate）v2.9.5
 
-[![最新版本](https://img.shields.io/badge/Release-v2.9.4-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
+[![最新版本](https://img.shields.io/badge/Release-v2.9.5-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![运行平台](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-34C759?style=flat-square&logo=windows)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![云端远程入口](https://img.shields.io/badge/Cloud%20Web-点击打开远程控制台-5856D6?style=flat-square&logo=googlechrome)](https://sorenskr.github.io/SheetMate/)
 
@@ -20,7 +20,13 @@
 
 ---
 
-## ✨ v2.9.4 核心功能一览
+## ✨ v2.9.5 核心功能一览
+
+- **AI 总结全链路提速防超时（体积直降 73% + 永不 500）**
+  - 高清汇总截图智能缩放并择优编码为轻量图片（约缩减 **73%** 传输体积），纯软件操作咨询自动免传大图极速响应。
+  - 桌面端与局域网手机端超时统一放宽至 **65 秒**（云端中继 **58 秒**），后端增加总耗时预算控制与断网秒切离线智能分析兜底，接口路由绝不因临时网络波动报 500 错误。
+- **全链路稳定性深度加固（钉钉搜索修复 + 防 `COMError` + 防冷启动误退）**
+  - 彻底修复钉钉搜索 `_search_doc` 缺失隐患，全面将裸 UIA 句柄调用替换为带异常重试保护的安全封装；延长未收到首次心跳时的冷启动与浏览器进程合并宽限窗口至 **12 秒**，兼顾稳定启动与正常关窗即退。
 
 - **钉钉贴图与直发全链路加固（关闭静音免点静音 + 可调等待直发）**
   - 搜索并定位目标会话后精准锁定聊天发送框、自动清空待发送框残留内容并按 Enter 激活输入区；采用 `CF_DIB + PNG` 双格式图片剪贴板与四重粘贴回退策略，保障截图与时间后缀稳定写入。

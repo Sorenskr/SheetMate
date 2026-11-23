@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.9.4 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.9.5 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import copy
 import ctypes
@@ -2523,8 +2523,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/png" href="/icon.png?v=2.9.4" />
-<link rel="shortcut icon" href="/favicon.ico?v=2.9.4" />
+<link rel="icon" type="image/png" href="/icon.png?v=2.9.5" />
+<link rel="shortcut icon" href="/favicon.ico?v=2.9.5" />
 <style>
   :root {
     --bg: #EAF0F8;
@@ -4890,9 +4890,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.9.4" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.9.5" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.9.4</span>
+          <span class="ver-pill" id="verBadge">v2.9.5</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -8747,7 +8747,7 @@ async function sendAiSummary(styleId, rawPrompt) {
   renderAiChatFeed(cachedChatHistory, label);
   try {
     await flushPendingSave();
-    const res = await api("/api/ai-summary", "POST", { style_id: styleId, prompt: promptText, action: "send" });
+    const res = await api("/api/ai-summary", "POST", { style_id: styleId, prompt: promptText, action: "send" }, null, 65000);
     if (res && res.updated_config) {
       cfg = res.updated_config;
       if (Array.isArray(res.updated_timetable)) latestTimetable = res.updated_timetable;
@@ -8759,18 +8759,25 @@ async function sendAiSummary(styleId, rawPrompt) {
       renderTimetable(latestTimetable);
       showToast("AI 已为您改好设置，请查看下方核对结果");
     }
-    if (Array.isArray(res.history)) {
+    if (res && res.ok === false && res.reply) {
+      showToast(res.reply);
+    }
+    if (res && Array.isArray(res.history)) {
       cachedChatHistory = res.history;
       if (typeof res.chat_seq === "number") lastChatSeq = res.chat_seq;
-    } else if (res.reply) {
+    } else if (res && res.reply) {
       cachedChatHistory.push({ role: "user", text: label, time: "" });
       cachedChatHistory.push({ role: "model", text: res.reply, model: res.model, source: res.source, shot_info: res.shot_info });
     }
-    if (res.shot_info) $("aiShotStatusPill").textContent = res.shot_info;
+    if (res && res.shot_info) $("aiShotStatusPill").textContent = res.shot_info;
     renderAiChatFeed(cachedChatHistory);
   } catch (e) {
     renderAiChatFeed(cachedChatHistory);
-    showToast("AI 总结请求失败");
+    if (e && e.name === "AbortError") {
+      showToast("AI 总结响应超时，请稍后再试");
+    } else {
+      showToast("AI 总结请求波动，请稍后重试");
+    }
   } finally {
     $("aiSendBtn").disabled = false;
   }
@@ -9113,7 +9120,7 @@ function bindEvents() {
     panel.classList.add("show");
     $("autoHealNowBtn").disabled = true;
     try {
-      const res = await api("/api/ai-auto-heal", "POST", {});
+      const res = await api("/api/ai-auto-heal", "POST", {}, null, 65000);
       const tag = (res.source === "gemini_vision" || res.source === "gemini" || res.source === "ai_vision" || res.source === "ai_cloud")
         ? "智能视觉调试"
         : "AI 自动调试引擎";
@@ -9132,7 +9139,7 @@ function bindEvents() {
     panel.textContent = "智能管家正在对照历次运行日志整理分析建议，请稍候…";
     panel.classList.add("show");
     try {
-      const res = await api("/api/ai-diagnose", "POST", { mode: "diagnose" });
+      const res = await api("/api/ai-diagnose", "POST", { mode: "diagnose" }, null, 65000);
       const tag = (res.source === "gemini" || res.source === "ai_cloud") ? "智能历史复盘" : "专家历史复盘";
       panel.innerHTML = `<div class="md-h3">${escapeHtmlStr(tag)}</div>${formatSafeMarkdown(res.reply || "")}`;
       renderErrorDiagCard(currentErrorDetail, res, false);
@@ -9160,7 +9167,7 @@ function bindEvents() {
     renderAiChatFeed(cachedChatHistory, "请审核我当前的排期、表格日期和钉钉配置，给几条防踩坑优化建议");
     try {
       await api("/api/config", "POST", collectConfigFromDOM());
-      const res = await api("/api/ai-diagnose", "POST", { mode: "suggest" });
+      const res = await api("/api/ai-diagnose", "POST", { mode: "suggest" }, null, 65000);
       cachedChatHistory.push({ role: "user", text: "请审核我当前的排期、表格日期和钉钉配置，给几条优化建议", time: "" });
       cachedChatHistory.push({ role: "model", text: res.reply || "暂无建议", time: res.time || "", model: res.model || "", source: res.source || "" });
       renderAiChatFeed(cachedChatHistory);
@@ -9309,7 +9316,7 @@ function bindEvents() {
   $("checkDingBtn").onclick = async () => {
     $("dingCheckVal").textContent = "检测中…";
     try {
-      const r = await api("/api/check-dingtalk", "POST");
+      const r = await api("/api/check-dingtalk", "POST", null, null, 25000);
       $("dingCheckVal").textContent = r.ok ? "环境正常" : "需排查";
       await iosAlert(r.ok ? "钉钉环境检测通过" : "钉钉环境待排查", r.summary || "检测完成");
     } catch (_e) { $("dingCheckVal").textContent = "检测失败"; }
@@ -10853,7 +10860,7 @@ async function loadStartupGreeting(force = false) {
     nextBtn.textContent = "换词中…";
   }
   try {
-    const r = await api(`/api/ai-greeting?force=${force ? "1" : "0"}&_t=${Date.now()}`);
+    const r = await api(`/api/ai-greeting?force=${force ? "1" : "0"}&_t=${Date.now()}`, "GET", null, null, 20000);
     if (r && r.show && r.reply && $("aiMascotGreetingBar") && txtEl) {
       if ($("aiGreetingPeriodBadge")) {
         $("aiGreetingPeriodBadge").textContent = r.period || "小猫开麦";
@@ -11169,7 +11176,16 @@ def _make_handler(ctrl, token):
                 sid = (body.get("style_id") if isinstance(body, dict) else None) or "brief"
                 prompt = (body.get("prompt") if isinstance(body, dict) else None) or ""
                 act = (body.get("action") if isinstance(body, dict) else None) or "send"
-                res = ctrl.summarize_ai(style_id=sid, prompt=prompt, action=act)
+                try:
+                    res = ctrl.summarize_ai(style_id=sid, prompt=prompt, action=act)
+                except Exception as exc:
+                    res = {
+                        "ok": True,
+                        "source": "error_fallback",
+                        "model": "",
+                        "shot_info": "安全兜底",
+                        "reply": f"本次 AI 总结遇到临时波动（{exc}），已自动保护未中断；请重试或稍后再问。",
+                    }
                 self._send_json(res)
                 return
 
@@ -11427,9 +11443,11 @@ def show_settings_window(app):
         if ctrl.close_requested_at > 0 and (now - ctrl.close_requested_at) > 0.45:
             _shutdown()
             return
-        if proc is not None and not win_state["seen"] and (now - launched_at) > 4.0 and proc.poll() is not None and (now - ctrl.last_heartbeat) > 2.5:
-            _shutdown()
-            return
+        has_hb = ctrl.last_heartbeat > 0
+        if proc is not None and not win_state["seen"] and proc.poll() is not None:
+            if (has_hb and (now - ctrl.last_heartbeat) > 3.5) or (not has_hb and (now - launched_at) > 12.0):
+                _shutdown()
+                return
         tk_root.after(220, _watch_lifecycle)
 
     tk_root.after(600, _watch_lifecycle)
