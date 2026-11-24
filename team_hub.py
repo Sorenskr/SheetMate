@@ -331,8 +331,29 @@ def sanitize_announcement_media_src(src, kind=""):
     host = u.hostname.strip(".").lower()
     if not host or host in ("localhost", "localhost.localdomain") or host.endswith((".localhost", ".local", ".internal", ".arpa")):
         return "", ""
-    try:
-        ip_obj = ipaddress.ip_address(host)
+    def _parse_any_ipv4_or_ip(h):
+        try:
+            return ipaddress.ip_address(h)
+        except ValueError:
+            pass
+        parts = h.split(".")
+        if 1 <= len(parts) <= 4 and all(re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)", pt) for pt in parts):
+            try:
+                vals = [int(pt, 0) for pt in parts]
+                if len(vals) == 1 and 0 <= vals[0] <= 0xFFFFFFFF:
+                    return ipaddress.IPv4Address(vals[0])
+                if len(vals) == 2 and 0 <= vals[0] <= 255 and 0 <= vals[1] <= 0xFFFFFF:
+                    return ipaddress.IPv4Address((vals[0] << 24) | vals[1])
+                if len(vals) == 3 and all(0 <= v <= 255 for v in vals[:2]) and 0 <= vals[2] <= 0xFFFF:
+                    return ipaddress.IPv4Address((vals[0] << 24) | (vals[1] << 16) | vals[2])
+                if len(vals) == 4 and all(0 <= v <= 255 for v in vals):
+                    return ipaddress.IPv4Address((vals[0] << 24) | (vals[1] << 16) | (vals[2] << 8) | vals[3])
+            except Exception:
+                return None
+        return None
+
+    ip_obj = _parse_any_ipv4_or_ip(host)
+    if ip_obj is not None:
         if (
             ip_obj.is_private
             or ip_obj.is_loopback
@@ -342,8 +363,6 @@ def sanitize_announcement_media_src(src, kind=""):
             or ip_obj.is_unspecified
         ):
             return "", ""
-    except ValueError:
-        pass
 
     path_l = (u.path or "").lower()
     k_clean = str(kind or "").strip().lower()
@@ -577,11 +596,13 @@ def _th_mqtt_read_packet(sock):
     hdr = _th_mqtt_recv_exact(sock, 1)[0]
     mult = 1
     rem = 0
-    for _ in range(4):
+    for idx in range(4):
         b = _th_mqtt_recv_exact(sock, 1)[0]
         rem += (b & 0x7F) * mult
         if (b & 0x80) == 0:
             break
+        if idx == 3:
+            raise ValueError("Malformed MQTT remaining length")
         mult *= 128
     if rem > MAX_HUB_BODY_BYTES:
         raise ValueError("MQTT payload too large")
@@ -636,8 +657,8 @@ def _th_mqtt_retained_pull(topic, timeout=2.2):
 def _th_mqtt_retained_push(topic, text, timeout=3.0):
     ctx = ssl.create_default_context()
     data_b = str(text or "").encode("utf-8")
-    vh_p = _th_mqtt_str(topic)
-    pub_pkt = b"\x31" + _th_mqtt_enc_varlen(len(vh_p) + len(data_b)) + vh_p + data_b
+    vh_p = _th_mqtt_str(topic) + struct.pack("!H", 1)
+    pub_pkt = b"\x33" + _th_mqtt_enc_varlen(len(vh_p) + len(data_b)) + vh_p + data_b
     ok_any = False
     for host, port in _AUTO_CLOUD_BROKERS:
         try:
@@ -648,13 +669,24 @@ def _th_mqtt_retained_push(topic, text, timeout=3.0):
                     vh = _th_mqtt_str("MQTT") + bytes([4, 2, 0, 20])
                     pl = _th_mqtt_str(cid)
                     ss.sendall(b"\x10" + _th_mqtt_enc_varlen(len(vh) + len(pl)) + vh + pl)
-                    hdr0, _ = _th_mqtt_read_packet(ss)
-                    if (hdr0 & 0xF0) != 0x20:
+                    hdr0, body0 = _th_mqtt_read_packet(ss)
+                    if (hdr0 & 0xF0) != 0x20 or (len(body0) >= 2 and body0[1] != 0):
                         continue
                     ss.sendall(pub_pkt)
-                    ss.sendall(b"\xe0\x00")
-                    ok_any = True
-                    break
+                    dl = time.monotonic() + min(2.0, float(timeout))
+                    acked = False
+                    while time.monotonic() < dl:
+                        hdr1, body1 = _th_mqtt_read_packet(ss)
+                        if (hdr1 & 0xF0) == 0x40 and len(body1) >= 2 and struct.unpack("!H", body1[:2])[0] == 1:
+                            acked = True
+                            break
+                    try:
+                        ss.sendall(b"\xe0\x00")
+                    except Exception:
+                        pass
+                    if acked:
+                        ok_any = True
+                        break
         except Exception:
             continue
     return ok_any
@@ -670,9 +702,10 @@ def _safe_zlib_decompress(data, max_bytes=MAX_DECOMPRESSED_BYTES):
     return out + tail
 
 
-def _acct_mqtt_pull_all(topic, timeout=4.5):
-    """并发从国内/海外双公共云节点拉取账号加密保留包，返回所有读到的密文列表。"""
+def _acct_mqtt_pull_all(topic, timeout=4.5, return_meta=False):
+    """并发从国内/海外双公共云节点拉取账号加密保留包，返回密文列表（可选返回连通状态）。"""
     results = []
+    reachable_flags = []
     res_lock = threading.Lock()
     ctx = ssl.create_default_context()
 
@@ -685,8 +718,8 @@ def _acct_mqtt_pull_all(topic, timeout=4.5):
                     vh = _th_mqtt_str("MQTT") + bytes([4, 2, 0, 20])
                     pl = _th_mqtt_str(cid)
                     ss.sendall(b"\x10" + _th_mqtt_enc_varlen(len(vh) + len(pl)) + vh + pl)
-                    hdr0, _ = _th_mqtt_read_packet(ss)
-                    if (hdr0 & 0xF0) != 0x20:
+                    hdr0, body0 = _th_mqtt_read_packet(ss)
+                    if (hdr0 & 0xF0) != 0x20 or (len(body0) >= 2 and body0[1] != 0):
                         return
                     s_vh = struct.pack("!H", 1)
                     s_pl = _th_mqtt_str(topic) + b"\x00"
@@ -698,7 +731,12 @@ def _acct_mqtt_pull_all(topic, timeout=4.5):
                             hdr, body = _th_mqtt_read_packet(ss)
                         except (socket.timeout, TimeoutError, ConnectionError, OSError):
                             break
-                        if (hdr & 0xF0) == 0x30 and len(body) >= 2:
+                        if (hdr & 0xF0) == 0x90:
+                            with res_lock:
+                                reachable_flags.append(True)
+                        elif (hdr & 0xF0) == 0x30 and len(body) >= 2:
+                            with res_lock:
+                                reachable_flags.append(True)
                             tlen = struct.unpack("!H", body[:2])[0]
                             pos = 2 + tlen + (2 if (hdr & 0x06) != 0 else 0)
                             if pos <= len(body):
@@ -719,6 +757,8 @@ def _acct_mqtt_pull_all(topic, timeout=4.5):
         th.start()
     for th in ths:
         th.join(timeout=timeout + 2.5)
+    if return_meta:
+        return {"results": results, "reachable": bool(reachable_flags)}
     return results
 
 
@@ -740,12 +780,12 @@ def _acct_mqtt_push_all(topic, text, timeout=5.0):
                     vh = _th_mqtt_str("MQTT") + bytes([4, 2, 0, 20])
                     pl = _th_mqtt_str(cid)
                     ss.sendall(b"\x10" + _th_mqtt_enc_varlen(len(vh) + len(pl)) + vh + pl)
-                    hdr0, _ = _th_mqtt_read_packet(ss)
-                    if (hdr0 & 0xF0) != 0x20:
+                    hdr0, body0 = _th_mqtt_read_packet(ss)
+                    if (hdr0 & 0xF0) != 0x20 or (len(body0) >= 2 and body0[1] != 0):
                         return
                     ss.sendall(pub_pkt)
-                    hdr1, _ = _th_mqtt_read_packet(ss)
-                    if (hdr1 & 0xF0) == 0x40:
+                    hdr1, body1 = _th_mqtt_read_packet(ss)
+                    if (hdr1 & 0xF0) == 0x40 and len(body1) >= 2 and struct.unpack("!H", body1[:2])[0] == 1:
                         with ok_lock:
                             ok_flags.append(True)
                     try:
@@ -985,8 +1025,13 @@ def check_config_edit_permission(old_cfg, new_cfg, perms):
         if p.get(perm_key, True):
             continue
         for f in fields:
-            if f in old_c and safe_cfg.get(f) != old_c.get(f):
-                safe_cfg[f] = copy.deepcopy(old_c.get(f))
+            if f in old_c:
+                if safe_cfg.get(f) != old_c.get(f):
+                    safe_cfg[f] = copy.deepcopy(old_c.get(f))
+                    if label not in denied:
+                        denied.append(label)
+            elif f in safe_cfg and safe_cfg.get(f) is not None:
+                safe_cfg.pop(f, None)
                 if label not in denied:
                     denied.append(label)
     return (len(denied) == 0), denied, safe_cfg
@@ -1075,6 +1120,46 @@ def _parse_dt_str(s):
     return None
 
 
+_GIST_ID_RE = re.compile(r"^[A-Fa-f0-9]{8,64}$")
+
+
+def _safe_hub_http_url(raw_url):
+    s = str(raw_url or "").strip().rstrip("/")
+    if not s:
+        return ""
+    try:
+        u = urlparse(s)
+    except Exception:
+        return ""
+    if u.scheme.lower() not in ("http", "https") or not u.netloc:
+        return ""
+    return s
+
+
+def _safe_gist_id(raw_gid):
+    gid = str(raw_gid or "").strip()
+    return gid if _GIST_ID_RE.fullmatch(gid) else ""
+
+
+def _hub_atomic_write_json(path_obj, data):
+    p = Path(path_obj)
+    tmp = p.with_name(f".{p.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8", newline="") as fp:
+            fp.write(json.dumps(data, ensure_ascii=False, indent=2))
+            fp.flush()
+        os.replace(str(tmp), str(p))
+        return True
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
 class TeamHubManager:
     """线程安全的本地 + 共享盘 + 跨网 HTTP/Gist 多人锁与超级管理员中心控制器。"""
 
@@ -1118,10 +1203,7 @@ class TeamHubManager:
                     data["avatar"] = new_av
                     data.setdefault("initialized", bool(data.get("nickname")))
                     if new_av != old_av:
-                        try:
-                            self._profile_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-                        except Exception:
-                            pass
+                        _hub_atomic_write_json(self._profile_path, data)
                     return data
             except Exception:
                 pass
@@ -1135,18 +1217,11 @@ class TeamHubManager:
             "initialized": False,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        try:
-            self._profile_path.parent.mkdir(parents=True, exist_ok=True)
-            self._profile_path.write_text(json.dumps(prof, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        _hub_atomic_write_json(self._profile_path, prof)
         return prof
 
     def _save_profile(self):
-        try:
-            self._profile_path.write_text(json.dumps(self._profile, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        _hub_atomic_write_json(self._profile_path, self._profile)
 
     def get_profile(self):
         with self._lock:
@@ -1369,19 +1444,26 @@ class TeamHubManager:
         mode = sync.get("mode", "local_or_shared")
         if mode == "local_or_shared":
             sf = self._shared_state_file()
-            if sf is not None and sf.exists():
-                try:
-                    remote = json.loads(sf.read_text(encoding="utf-8"))
-                    if isinstance(remote, dict):
-                        with self._lock:
-                            self._merge_remote_state(remote)
-                except Exception:
-                    pass
-        elif mode in ("http_hub", "gist_cloud"):
+            if sf is None:
+                return True
+            if not sf.exists():
+                return True
+            try:
+                remote = json.loads(sf.read_text(encoding="utf-8"))
+                if isinstance(remote, dict):
+                    with self._lock:
+                        self._merge_remote_state(remote)
+                return True
+            except Exception:
+                return False
+        if mode in ("http_hub", "gist_cloud"):
             remote = self._fetch_remote_state_unlocked(sync)
             if isinstance(remote, dict):
                 with self._lock:
                     self._merge_remote_state(remote)
+                return True
+            return False
+        return True
 
     def _push_account_vault_to_hub_sources(self):
         with self._lock:
@@ -1509,7 +1591,7 @@ class TeamHubManager:
     def _fetch_remote_state_unlocked(self, sync):
         mode = sync.get("mode", "local_or_shared")
         if mode == "http_hub":
-            url = str(sync.get("hub_url") or "").strip().rstrip("/")
+            url = _safe_hub_http_url(sync.get("hub_url"))
             if url:
                 try:
                     req = urllib.request.Request(
@@ -1524,7 +1606,7 @@ class TeamHubManager:
                     return None
         elif mode == "gist_cloud":
             tok = str(sync.get("gist_token") or "").strip()
-            gid = str(sync.get("gist_id") or "").strip()
+            gid = _safe_gist_id(sync.get("gist_id"))
             if tok and gid:
                 try:
                     req = urllib.request.Request(
@@ -1586,13 +1668,15 @@ class TeamHubManager:
 
             def _pull_worker():
                 try:
+                    pull_t0 = time.monotonic()
                     remote = self._fetch_remote_state_unlocked(sync_snap)
                     if isinstance(remote, dict):
                         with self._lock:
+                            skip_vol = float(getattr(self, "_last_local_mutation_m", 0.0)) > pull_t0
                             old_ann = normalize_announcement(
                                 (self._state.get("global_logic") or {}).get("announcement")
                             )
-                            self._merge_remote_state(remote)
+                            self._merge_remote_state(remote, skip_volatile=skip_vol)
                             new_ann = normalize_announcement(
                                 (self._state.get("global_logic") or {}).get("announcement")
                             )
@@ -1643,9 +1727,10 @@ class TeamHubManager:
                 "provider": "gemini", "api_base": "", "api_key": "", "model": "",
             }
         else:
-            new_ai = new_gl.get("global_ai_api") if isinstance(new_gl.get("global_ai_api"), dict) else {}
+            new_ai = dict(new_gl["global_ai_api"]) if isinstance(new_gl.get("global_ai_api"), dict) else {}
             if not new_ai.get("api_key") and old_ai.get("api_key"):
-                new_gl.setdefault("global_ai_api", {})["api_key"] = old_ai["api_key"]
+                new_ai["api_key"] = old_ai["api_key"]
+            new_gl["global_ai_api"] = new_ai
         old_ann = normalize_announcement(old_gl.get("announcement"))
         if isinstance(incoming_gl.get("announcement"), dict):
             cand_ann = normalize_announcement(incoming_gl.get("announcement"))
@@ -1656,7 +1741,27 @@ class TeamHubManager:
             new_gl["announcement"] = old_ann
         self._state["global_logic"] = new_gl
 
-    def _merge_remote_state(self, remote):
+    @staticmethod
+    def _lock_ver_ts(lk):
+        if not isinstance(lk, dict):
+            return 0.0
+        return max(
+            float(lk.get("released_ts") or 0.0),
+            float(lk.get("unlocked_ts") or 0.0),
+            float(lk.get("heartbeat_ts") or 0.0),
+            float(lk.get("acquired_ts") or 0.0),
+        )
+
+    @staticmethod
+    def _pending_cfg_sig(cfg_dict):
+        try:
+            return hashlib.sha256(
+                json.dumps(cfg_dict, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()[:16]
+        except Exception:
+            return ""
+
+    def _merge_remote_state(self, remote, allow_admin_auth=True, skip_volatile=False):
         if not isinstance(remote, dict):
             return
         cur_sync = dict(self._state.get("sync_settings") or {})
@@ -1696,10 +1801,13 @@ class TeamHubManager:
                 self._state["account_vaults"] = dict(keep_v)
 
         if remote.get("compact") or from_public:
-            if isinstance(remote.get("lock"), dict):
-                self._state["lock"] = remote["lock"]
-            if isinstance(remote.get("queue"), list):
-                self._state["queue"] = remote["queue"]
+            if not skip_volatile and isinstance(remote.get("lock"), dict):
+                cur_lk = self._state.get("lock") if isinstance(self._state.get("lock"), dict) else {}
+                rem_lk = copy.deepcopy(remote["lock"])
+                if self._lock_ver_ts(rem_lk) >= self._lock_ver_ts(cur_lk):
+                    self._state["lock"] = rem_lk
+            if not skip_volatile and isinstance(remote.get("queue"), list):
+                self._state["queue"] = copy.deepcopy(remote["queue"])
             if isinstance(remote.get("global_logic"), dict):
                 self._merge_global_logic_locked(remote["global_logic"], from_public=from_public)
             if isinstance(remote.get("members"), dict):
@@ -1707,12 +1815,25 @@ class TeamHubManager:
                 for uid, rmem in remote["members"].items():
                     if not isinstance(rmem, dict):
                         continue
-                    old_m = mems.get(uid) if isinstance(mems.get(uid), dict) else {}
-                    merged_m = {**old_m, **rmem}
-                    old_ov = old_m.get("ai_api_override") if isinstance(old_m.get("ai_api_override"), dict) else {}
-                    new_ov = merged_m.get("ai_api_override") if isinstance(merged_m.get("ai_api_override"), dict) else {}
-                    if not new_ov.get("api_key") and old_ov.get("api_key"):
-                        merged_m["ai_api_override"] = {**new_ov, "api_key": old_ov["api_key"]}
+                    old_m = copy.deepcopy(mems.get(uid)) if isinstance(mems.get(uid), dict) else {}
+                    in_m = copy.deepcopy(rmem)
+                    if from_public:
+                        # 公共云严格剥离权限、远程强推配置与 AI 接口覆盖，阻断全网投毒与窃取密钥
+                        for _sens_k in ("pending_remote_config", "pending_remote_config_ts", "permissions", "ai_api_override"):
+                            in_m.pop(_sens_k, None)
+                    merged_m = {**old_m, **in_m}
+                    if not from_public:
+                        cleared_ts = float(old_m.get("pending_config_cleared_ts") or 0.0)
+                        cleared_sig = str(old_m.get("pending_config_cleared_sig") or "")
+                        cand_p = merged_m.get("pending_remote_config")
+                        if isinstance(cand_p, dict) and cleared_ts > 0.0:
+                            cand_pts = float(in_m.get("pending_remote_config_ts") or 0.0)
+                            if (cand_pts > 0.0 and cand_pts <= cleared_ts) or (cleared_sig and self._pending_cfg_sig(cand_p) == cleared_sig):
+                                merged_m["pending_remote_config"] = None
+                        old_ov = old_m.get("ai_api_override") if isinstance(old_m.get("ai_api_override"), dict) else {}
+                        new_ov = merged_m.get("ai_api_override") if isinstance(merged_m.get("ai_api_override"), dict) else {}
+                        if not new_ov.get("api_key") and old_ov.get("api_key"):
+                            merged_m["ai_api_override"] = {**new_ov, "api_key": old_ov["api_key"]}
                     if merged_m.get("avatar"):
                         merged_m["avatar"] = sanitize_avatar_url(upgrade_legacy_avatar(merged_m.get("avatar")))
                     mems[uid] = merged_m
@@ -1726,7 +1847,7 @@ class TeamHubManager:
                             continue
                         sig = json.dumps(it, sort_keys=True, ensure_ascii=False)
                         if sig not in seen_sigs:
-                            exist.append(it)
+                            exist.append(copy.deepcopy(it))
                             seen_sigs.add(sig)
                     self._state[lk] = exist[-800:]
         else:
@@ -1742,11 +1863,35 @@ class TeamHubManager:
             }
             for k, expected_t in typed_checks.items():
                 if k in remote and isinstance(remote[k], expected_t):
-                    if k == "members":
+                    if k == "lock":
+                        if skip_volatile:
+                            continue
+                        cur_lk = self._state.get("lock") if isinstance(self._state.get("lock"), dict) else {}
+                        rem_lk = copy.deepcopy(remote["lock"])
+                        if self._lock_ver_ts(rem_lk) >= self._lock_ver_ts(cur_lk):
+                            self._state["lock"] = rem_lk
+                    elif k == "queue":
+                        if not skip_volatile:
+                            self._state["queue"] = copy.deepcopy(remote["queue"])
+                    elif k == "members":
+                        old_mems = self._state.get("members") if isinstance(self._state.get("members"), dict) else {}
                         clean_mems = {}
                         for uid, mem in remote[k].items():
                             if isinstance(mem, dict):
                                 mem_c = copy.deepcopy(mem)
+                                old_m = old_mems.get(uid) if isinstance(old_mems.get(uid), dict) else {}
+                                if old_m:
+                                    cleared_ts = float(old_m.get("pending_config_cleared_ts") or 0.0)
+                                    cleared_sig = str(old_m.get("pending_config_cleared_sig") or "")
+                                    if cleared_ts > 0.0:
+                                        mem_c.setdefault("pending_config_cleared_ts", cleared_ts)
+                                        if cleared_sig:
+                                            mem_c.setdefault("pending_config_cleared_sig", cleared_sig)
+                                        cand_p = mem_c.get("pending_remote_config")
+                                        if isinstance(cand_p, dict):
+                                            cand_pts = float(mem_c.get("pending_remote_config_ts") or 0.0)
+                                            if (cand_pts > 0.0 and cand_pts <= cleared_ts) or (cleared_sig and self._pending_cfg_sig(cand_p) == cleared_sig):
+                                                mem_c["pending_remote_config"] = None
                                 if mem_c.get("avatar"):
                                     mem_c["avatar"] = sanitize_avatar_url(upgrade_legacy_avatar(mem_c.get("avatar")))
                                 clean_mems[uid] = mem_c
@@ -1755,7 +1900,7 @@ class TeamHubManager:
                         self._merge_global_logic_locked(remote[k], from_public=False)
                     else:
                         self._state[k] = copy.deepcopy(remote[k])
-            if isinstance(remote.get("admin_auth"), dict) and remote["admin_auth"].get("custom_set") is True:
+            if allow_admin_auth and not from_public and isinstance(remote.get("admin_auth"), dict) and remote["admin_auth"].get("custom_set") is True:
                 self._state["admin_auth"] = copy.deepcopy(remote["admin_auth"])
         self._state["sync_settings"] = cur_sync
         self._ensure_state_schema()
@@ -1763,7 +1908,7 @@ class TeamHubManager:
     def _push_remote_snapshot(self, sync_cfg, payload_data):
         mode = sync_cfg.get("mode", "local_or_shared")
         if mode == "http_hub":
-            url = str(sync_cfg.get("hub_url") or "").strip().rstrip("/")
+            url = _safe_hub_http_url(sync_cfg.get("hub_url"))
             if url:
                 payload = json.dumps(payload_data, ensure_ascii=False).encode("utf-8")
                 req = urllib.request.Request(
@@ -1776,12 +1921,13 @@ class TeamHubManager:
                     method="POST",
                 )
                 try:
-                    urllib.request.urlopen(req, timeout=4.0).read()
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        resp.read()
                 except Exception:
                     pass
         elif mode == "gist_cloud":
             tok = str(sync_cfg.get("gist_token") or "").strip()
-            gid = str(sync_cfg.get("gist_id") or "").strip()
+            gid = _safe_gist_id(sync_cfg.get("gist_id"))
             if tok and gid:
                 payload = json.dumps({
                     "files": {
@@ -1802,19 +1948,14 @@ class TeamHubManager:
                     method="PATCH",
                 )
                 try:
-                    urllib.request.urlopen(req, timeout=6.0).read()
+                    with urllib.request.urlopen(req, timeout=6.0) as resp:
+                        resp.read()
                 except Exception:
                     pass
         else:
             sf = self._shared_state_file()
             if sf is not None:
-                try:
-                    sf.parent.mkdir(parents=True, exist_ok=True)
-                    tmp_s = sf.with_suffix(".tmp")
-                    tmp_s.write_text(json.dumps(payload_data, ensure_ascii=False, indent=2), encoding="utf-8")
-                    tmp_s.replace(sf)
-                except Exception:
-                    pass
+                _hub_atomic_write_json(sf, payload_data)
             elif self._auto_cloud_enabled:
                 try:
                     slim_members = {}
@@ -1881,12 +2022,8 @@ class TeamHubManager:
         self._state["ai_chats"] = (self._state.get("ai_chats") or [])[-300:]
         self._state["feedbacks"] = (self._state.get("feedbacks") or [])[-150:]
         self._state["backfilled_keys"] = (self._state.get("backfilled_keys") or [])[-300:]
-        try:
-            tmp = self._state_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self._state, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(self._state_path)
-        except Exception:
-            pass
+        self._last_local_mutation_m = time.monotonic()
+        _hub_atomic_write_json(self._state_path, self._state)
         if not push_remote:
             return
         sync = self._state.get("sync_settings") or {}
@@ -1903,7 +2040,7 @@ class TeamHubManager:
             self._schedule_async_remote_push()
 
     def _export_sync_payload(self):
-        return {
+        return copy.deepcopy({
             "admin_auth": self._state.get("admin_auth"),
             "global_logic": self._state.get("global_logic"),
             "lock": self._state.get("lock"),
@@ -1913,8 +2050,8 @@ class TeamHubManager:
             "errors": (self._state.get("errors") or [])[-200:],
             "ai_chats": (self._state.get("ai_chats") or [])[-300:],
             "feedbacks": (self._state.get("feedbacks") or [])[-150:],
-            "account_vaults": dict(self._state.get("account_vaults") or {}),
-        }
+            "account_vaults": self._state.get("account_vaults") or {},
+        })
 
     def _backfill_local_runs_once(self):
         """从已有的 run_journal.jsonl 与 run.log 补录历史运行次数到统计池。"""
@@ -2056,9 +2193,11 @@ class TeamHubManager:
             self._sync_pull_if_needed(force=True)
             lk = self._state["lock"]
             if not lk.get("holder_id") or lk.get("holder_id") == uid:
+                now_rel = time.time()
                 self._state["lock"] = {
                     "holder_id": "", "holder_name": "", "holder_avatar": "", "holder_code": "",
                     "mode_label": "", "step_text": "", "acquired_ts": 0.0, "heartbeat_ts": 0.0,
+                    "released_ts": now_rel,
                 }
                 self._save_state_local_and_push()
                 return True
@@ -2067,9 +2206,11 @@ class TeamHubManager:
     def force_unlock_all(self, clear_queue=False):
         with self._lock:
             self._sync_pull_if_needed(force=True)
+            now_rel = time.time()
             self._state["lock"] = {
                 "holder_id": "", "holder_name": "", "holder_avatar": "", "holder_code": "",
                 "mode_label": "", "step_text": "", "acquired_ts": 0.0, "heartbeat_ts": 0.0,
+                "released_ts": now_rel,
             }
             if clear_queue:
                 self._state["queue"] = []
@@ -2172,6 +2313,8 @@ class TeamHubManager:
                 pending = mem.get("pending_remote_config")
                 if isinstance(pending, dict):
                     mem["pending_remote_config"] = None
+                    mem["pending_config_cleared_ts"] = time.time()
+                    mem["pending_config_cleared_sig"] = self._pending_cfg_sig(pending)
                     restored = copy.deepcopy(pending)
                     if isinstance(cur_cfg, dict):
                         if not restored.get("luya_pass") and cur_cfg.get("luya_pass"):
@@ -2247,6 +2390,8 @@ class TeamHubManager:
             pending = mem.get("pending_remote_config")
             if isinstance(pending, dict):
                 mem["pending_remote_config"] = None
+                mem["pending_config_cleared_ts"] = time.time()
+                mem["pending_config_cleared_sig"] = self._pending_cfg_sig(pending)
                 restored = copy.deepcopy(pending)
                 if isinstance(cur_cfg, dict):
                     if not restored.get("luya_pass") and cur_cfg.get("luya_pass"):
@@ -2323,6 +2468,9 @@ class TeamHubManager:
                 "recent_logs": list(recent_logs or existing.get("recent_logs") or [])[-25:],
                 "last_error": error_detail if error_detail is not None else existing.get("last_error"),
                 "pending_remote_config": existing.get("pending_remote_config"),
+                "pending_remote_config_ts": existing.get("pending_remote_config_ts", 0.0),
+                "pending_config_cleared_ts": existing.get("pending_config_cleared_ts", 0.0),
+                "pending_config_cleared_sig": existing.get("pending_config_cleared_sig", ""),
             }
             self._save_state_local_and_push()
             return members[prof["user_id"]]
@@ -2522,6 +2670,9 @@ class TeamHubManager:
             if rec.get("until", 0.0) > now:
                 wait_s = max(1, int(rec["until"] - now))
                 return {"ok": False, "locked": True, "message": f"管理员验证连续失败过多，请 {wait_s} 秒后再试"}
+            if rec.get("until", 0.0) > 0.0 and rec["until"] <= now:
+                rec = {"cnt": 0, "until": 0.0}
+                self._admin_fail_tracker.pop(client_id, None)
 
             pc_norm = _norm_admin_passcode(passcode)
             pw_norm = _norm_admin_password(password)
@@ -2602,6 +2753,7 @@ class TeamHubManager:
                 "admin_v3_migrated": True,
                 "admin_v4_migrated": True,
             }
+            self._admin_tokens.clear()
             self._save_state_local_and_push()
             return {"ok": True, "message": "管理员姓名与密码已更新保存"}
 
@@ -2655,8 +2807,10 @@ class TeamHubManager:
             if isinstance(permissions, dict):
                 mem["permissions"] = normalize_permissions(permissions)
             if isinstance(new_config, dict):
-                mem["config"] = new_config
-                mem["pending_remote_config"] = new_config
+                mem["config"] = copy.deepcopy(new_config)
+                mem["pending_remote_config"] = copy.deepcopy(new_config)
+                mem["pending_remote_config_ts"] = time.time()
+                mem.pop("pending_config_cleared_sig", None)
                 mem["config_audit"] = audit_member_config(new_config)
             if isinstance(ai_api_override, dict):
                 m_mode = str(ai_api_override.get("mode") or "default").strip()
@@ -2737,13 +2891,20 @@ class TeamHubManager:
         p = patch if isinstance(patch, dict) else {}
         if p.get("action") == "cloud_refresh":
             return self.force_cloud_sync()
+        need_gist_token = ""
+        gist_payload = None
         with self._lock:
             sc = self._state.setdefault("sync_settings", {})
             if p.get("mode") in ("local_or_shared", "http_hub", "gist_cloud"):
                 sc["mode"] = p["mode"]
             for k in ("shared_dir", "hub_url", "hub_secret", "gist_token", "gist_id"):
                 if k in p:
-                    sc[k] = str(p[k] or "").strip()
+                    val = str(p[k] or "").strip()
+                    if k == "hub_url" and val:
+                        val = _safe_hub_http_url(val) or ""
+                    elif k == "gist_id" and val:
+                        val = _safe_gist_id(val) or ""
+                    sc[k] = val
             if "server_port" in p:
                 try:
                     sc["server_port"] = max(1025, min(65530, int(p["server_port"])))
@@ -2751,25 +2912,45 @@ class TeamHubManager:
                     pass
             if "server_autostart" in p:
                 sc["server_autostart"] = bool(p["server_autostart"])
-            # 若选了 Gist 模式且有 Token 但没有 gist_id，自动创建云端 Gist
             if sc.get("mode") == "gist_cloud" and sc.get("gist_token") and not sc.get("gist_id"):
-                created_id = self._create_cloud_gist(sc["gist_token"])
-                if created_id:
-                    sc["gist_id"] = created_id
-            self._save_state_local_and_push(push_remote=False)
-            self._sync_pull_if_needed()
-            if sc.get("server_autostart") and self._server is None:
-                self.start_center_server(sc.get("server_port", 18790))
-            elif not sc.get("server_autostart") and self._server is not None:
-                self.stop_center_server()
-            return {"ok": True, "sync_settings": dict(sc), "message": "多人联机同步方式已保存"}
+                need_gist_token = sc["gist_token"]
+                gist_payload = self._export_sync_payload()
+            else:
+                self._save_state_local_and_push(push_remote=False)
+            sc_snap = dict(sc)
 
-    def _create_cloud_gist(self, token):
+        if need_gist_token:
+            created_id = self._create_cloud_gist(need_gist_token, payload_obj=gist_payload)
+            with self._lock:
+                sc = self._state.setdefault("sync_settings", {})
+                if created_id and not sc.get("gist_id"):
+                    sc["gist_id"] = created_id
+                self._save_state_local_and_push(push_remote=False)
+                sc_snap = dict(sc)
+
+        with self._lock:
+            self._sync_pull_if_needed()
+            want_auto = bool(sc_snap.get("server_autostart"))
+            want_port = int(sc_snap.get("server_port", 18790) or 18790)
+            srv_is_none = (self._server is None)
+
+        if want_auto and srv_is_none:
+            self.start_center_server(want_port)
+        elif not want_auto and not srv_is_none:
+            self.stop_center_server()
+        with self._lock:
+            sc_final = dict(self._state.get("sync_settings") or sc_snap)
+        return {"ok": True, "sync_settings": sc_final, "message": "多人联机同步方式已保存"}
+
+    def _create_cloud_gist(self, token, payload_obj=None):
         try:
+            if payload_obj is None:
+                with self._lock:
+                    payload_obj = self._export_sync_payload()
             body = json.dumps({
                 "description": "SheetMate 暗号表助手多端防撞锁与超管中心同步档案",
                 "public": False,
-                "files": {"sheetmate_hub.json": {"content": json.dumps(self._export_sync_payload(), ensure_ascii=False)}},
+                "files": {"sheetmate_hub.json": {"content": json.dumps(payload_obj, ensure_ascii=False)}},
             }, ensure_ascii=False).encode("utf-8")
             req = urllib.request.Request(
                 "https://api.github.com/gists",
@@ -2849,7 +3030,8 @@ class TeamHubManager:
                     return
 
                 def _authorized(self):
-                    want = str((mgr._state.get("sync_settings") or {}).get("hub_secret") or "sheetmate-hub")
+                    with mgr._lock:
+                        want = str((mgr._state.get("sync_settings") or {}).get("hub_secret") or "sheetmate-hub")
                     got = str(self.headers.get("X-Hub-Secret") or "")
                     return (not want) or hmac.compare_digest(got, want)
 
@@ -2872,7 +3054,8 @@ class TeamHubManager:
                         return
                     if self.path.startswith("/hub/state"):
                         with mgr._lock:
-                            self._json(mgr._export_sync_payload())
+                            snap = mgr._export_sync_payload()
+                        self._json(snap)
                         return
                     self._json({"ok": False}, HTTPStatus.NOT_FOUND)
 
@@ -2887,7 +3070,7 @@ class TeamHubManager:
                         return
                     if self.path.startswith("/hub/state") and isinstance(body, dict):
                         with mgr._lock:
-                            mgr._merge_remote_state(body)
+                            mgr._merge_remote_state(body, allow_admin_auth=False)
                             mgr._save_state_local_and_push(push_remote=False)
                         self._json({"ok": True})
                         return
@@ -2938,25 +3121,6 @@ class TeamHubManager:
 
 class AccountAuthError(ValueError):
     """账号云同步密码错误或密文校验失败异常。"""
-
-
-def _hub_atomic_write_json(path_obj, data):
-    p = Path(path_obj)
-    tmp = p.with_name(f".{p.name}.tmp.{os.getpid()}.{threading.get_ident()}")
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8", newline="") as fp:
-            fp.write(json.dumps(data, ensure_ascii=False, indent=2))
-            fp.flush()
-        os.replace(str(tmp), str(p))
-        return True
-    except Exception:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
-        return False
 
 
 def _derive_account_credentials(account, password):
@@ -3095,9 +3259,11 @@ class AccountCloudSyncManager:
                 "logged_in_at": s.get("logged_in_at", "") if logged else "",
             }
 
-    def _collect_cloud_vault_candidates(self, topic):
+    def _collect_cloud_vault_candidates(self, topic, return_meta=False):
         cands = []
         seen = set()
+        reachable = False
+        has_remote = False
 
         def _add(pkt):
             ps = str(pkt or "").strip()
@@ -3106,16 +3272,33 @@ class AccountCloudSyncManager:
                 cands.append(ps)
 
         if self._hub is not None:
+            with self._hub._lock:
+                sync_s = dict(self._hub._state.get("sync_settings") or {})
+                auto_on = bool(getattr(self._hub, "_auto_cloud_enabled", False))
+            if sync_s.get("mode") in ("http_hub", "gist_cloud") or sync_s.get("shared_dir"):
+                has_remote = True
             try:
-                self._hub._pull_account_vault_from_hub_sources()
+                if self._hub._pull_account_vault_from_hub_sources():
+                    if has_remote:
+                        reachable = True
                 rec = self._hub._get_account_vault_record(topic)
                 if isinstance(rec, dict):
                     _add(rec.get("pkt"))
             except Exception:
                 pass
-            if getattr(self._hub, "_auto_cloud_enabled", False):
-                for mp in _acct_mqtt_pull_all(topic, timeout=4.5):
+            if auto_on:
+                has_remote = True
+                meta = _acct_mqtt_pull_all(topic, timeout=4.5, return_meta=True)
+                for mp in meta["results"]:
                     _add(mp)
+                if meta["reachable"]:
+                    reachable = True
+            if not has_remote:
+                reachable = True
+        else:
+            reachable = True
+        if return_meta:
+            return {"cands": cands, "reachable": reachable, "has_remote": has_remote}
         return cands
 
     def _publish_vault_packet(self, topic, pkt, rev, updated_ts):
@@ -3124,7 +3307,8 @@ class AccountCloudSyncManager:
             try:
                 self._hub._set_account_vault_record(topic, pkt, rev, updated_ts)
                 self._hub._push_account_vault_to_hub_sources()
-                sync = (self._hub._state.get("sync_settings") or {})
+                with self._hub._lock:
+                    sync = dict(self._hub._state.get("sync_settings") or {})
                 if sync.get("shared_dir") or sync.get("hub_url") or sync.get("gist_id"):
                     cloud_ok = True
             except Exception:
@@ -3163,6 +3347,8 @@ class AccountCloudSyncManager:
             if rec.get("until", 0.0) > now:
                 wait_s = max(1, int(rec["until"] - now))
                 return {"ok": False, "locked": True, "message": f"账号密码连续输错过多，请 {wait_s} 秒后再试"}
+            if rec.get("until", 0.0) > 0.0 and rec["until"] <= now:
+                self._fail_tracker.pop(client_id, None)
 
         try:
             raw_acct, acct_key, topic, master_key = _derive_account_credentials(account, password)
@@ -3183,7 +3369,8 @@ class AccountCloudSyncManager:
             except Exception:
                 pass
 
-        cands = self._collect_cloud_vault_candidates(topic)
+        cand_meta = self._collect_cloud_vault_candidates(topic, return_meta=True)
+        cands = cand_meta["cands"]
         best_obj, best_pkt, _had_cands, auth_failed = self._decrypt_best_vault(master_key, cands)
 
         if auth_failed:
@@ -3212,6 +3399,12 @@ class AccountCloudSyncManager:
         now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
 
         if best_obj is None:
+            if cand_meta.get("has_remote") and not cand_meta.get("reachable"):
+                return {
+                    "ok": False,
+                    "network_error": True,
+                    "message": "当前网络连接失败，无法确认云端是否已注册该账号（为防误覆盖原有同步配置，请联网后再登录/注册）",
+                }
             rev = 1
             vault = {
                 "schema_v": 1,
@@ -3356,13 +3549,20 @@ class AccountCloudSyncManager:
         if not st["logged_in"]:
             return {"ok": False, "not_logged_in": True, "message": "当前为免登录默认模式，请先登录同步账号"}
         pulled = self.pull_if_newer()
-        if direction == "pull" and pulled.get("updated"):
+        if direction == "pull":
+            if pulled.get("updated"):
+                return {
+                    "ok": True,
+                    "action": "pulled",
+                    "bundle": pulled["bundle"],
+                    "account_status": self.get_status(),
+                    "message": f"已从云端拉取最新配置与 AI 话术（v{pulled.get('rev')}）",
+                }
             return {
                 "ok": True,
-                "action": "pulled",
-                "bundle": pulled["bundle"],
+                "action": "up_to_date",
                 "account_status": self.get_status(),
-                "message": f"已从云端拉取最新配置与 AI 话术（v{pulled.get('rev')}）",
+                "message": "云端暂无更新版本，已保持本机配置（未反向覆盖云端）",
             }
         if direction == "auto" and pulled.get("updated"):
             return {

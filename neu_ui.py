@@ -148,32 +148,44 @@ def render_card(w, h, radius, base, pad=14):
 
 
 class NeuFactory:
+    MAX_CACHE = 256
+
     def __init__(self, base_hex):
         self.base_hex = base_hex
         self.base = hex2rgb(base_hex)
         self._cache = {}
 
+    def _put(self, key, val):
+        if len(self._cache) >= self.MAX_CACHE:
+            try:
+                oldest = next(iter(self._cache))
+                self._cache.pop(oldest, None)
+            except StopIteration:
+                pass
+        self._cache[key] = val
+        return val
+
     def img(self, w, h, radius, state, pad=14, fill_hex=None):
         key = (w, h, radius, state, pad, fill_hex)
         if key not in self._cache:
-            self._cache[key] = ImageTk.PhotoImage(
+            return self._put(key, ImageTk.PhotoImage(
                 render_neu(w, h, radius, hex2rgb(fill_hex) if fill_hex else self.base,
-                           state, pad))
+                           state, pad)))
         return self._cache[key]
 
     def flat_img(self, w, h, radius, state, pad=8, fill_hex=None):
         key = ("flat", w, h, radius, state, pad, fill_hex)
         if key not in self._cache:
             color = hex2rgb(fill_hex) if fill_hex else self.base
-            self._cache[key] = ImageTk.PhotoImage(
-                render_flat(w, h, radius, color, state, pad))
+            return self._put(key, ImageTk.PhotoImage(
+                render_flat(w, h, radius, color, state, pad)))
         return self._cache[key]
 
     def card_img(self, w, h, radius, pad=14):
         key = ("card", w, h, radius, pad)
         if key not in self._cache:
-            self._cache[key] = ImageTk.PhotoImage(
-                render_card(w, h, radius, self.base, pad))
+            return self._put(key, ImageTk.PhotoImage(
+                render_card(w, h, radius, self.base, pad)))
         return self._cache[key]
 
 
@@ -189,15 +201,28 @@ class NeuContext:
         self.base = hex2rgb(base_hex)
         self.fac = NeuFactory(base_hex)
 
-    def register(self, w):
-        self.widgets.append(w)
+    def unregister(self, w):
+        self.widgets = [item for item in self.widgets if item is not w]
 
-    def redraw_all(self):
-        for w in self.widgets:
+    def register(self, w):
+        if w not in self.widgets:
+            self.widgets.append(w)
             try:
-                w.redraw()
+                w.bind("<Destroy>", lambda ev, ref=w: self.unregister(ref) if ev.widget is ref else None, add="+")
             except Exception:
                 pass
+
+    def redraw_all(self):
+        alive = []
+        for w in list(self.widgets):
+            try:
+                if not w.winfo_exists():
+                    continue
+                w.redraw()
+                alive.append(w)
+            except Exception:
+                pass
+        self.widgets = alive
 
 
 # ==================== 基础画布 ====================
@@ -360,7 +385,16 @@ class NeuButton(_NeuCanvas):
         inside = 0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height()
         self._animate_visual("hover" if inside else "raised", -1.2 if inside else 0)
         if inside and self.command:
-            self.after(70, self.command)
+            def _fire():
+                try:
+                    if self.winfo_exists() and self.command:
+                        self.command()
+                except tk.TclError:
+                    pass
+            try:
+                self.after(70, _fire)
+            except tk.TclError:
+                pass
         return "break"
 
 
@@ -403,24 +437,45 @@ class NeuSwitch(_NeuCanvas):
             self.command(self.on)
 
     def set(self, v):
+        aid = getattr(self, "_switch_anim_id", None)
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+            self._switch_anim_id = None
         self.on = bool(v)
         self._x = self._knob_target()
-        self._draw()
+        if self.winfo_exists():
+            self._draw()
 
     def get(self):
         return self.on
 
     def _animate(self, target):
+        aid = getattr(self, "_switch_anim_id", None)
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+            self._switch_anim_id = None
         step = 2 if target > self._x else -2
 
         def frame():
-            self._x += step
-            if (step > 0 and self._x >= target) or (step < 0 and self._x <= target):
-                self._x = target
-                self._draw()
-                return
-            self._draw(self._x)
-            self.after(10, frame)
+            self._switch_anim_id = None
+            try:
+                if not self.winfo_exists():
+                    return
+                self._x += step
+                if (step > 0 and self._x >= target) or (step < 0 and self._x <= target):
+                    self._x = target
+                    self._draw()
+                    return
+                self._draw(self._x)
+                self._switch_anim_id = self.after(10, frame)
+            except tk.TclError:
+                self._switch_anim_id = None
         frame()
 
 
@@ -518,10 +573,26 @@ class NeuStepper(_NeuCanvas):
             self._pstate = "pressed"
         self._draw()
 
+        prev_bid = getattr(self, "_bump_id", None)
+        if prev_bid is not None:
+            try:
+                self.after_cancel(prev_bid)
+            except Exception:
+                pass
+
         def back():
-            self._mstate = self._pstate = "raised"
-            self._draw()
-        self.after(90, back)
+            self._bump_id = None
+            try:
+                if not self.winfo_exists():
+                    return
+                self._mstate = self._pstate = "raised"
+                self._draw()
+            except tk.TclError:
+                pass
+        try:
+            self._bump_id = self.after(90, back)
+        except tk.TclError:
+            self._bump_id = None
 
     def _wheel(self, e):
         if e.delta > 0:
@@ -552,23 +623,32 @@ class NeuStepper(_NeuCanvas):
 
         def tick():
             nonlocal step
-            step += 1
-            t = ease_out_cubic(step / frames)
-            self.coords(self._val, vx, cy - shift * t)
-            self.itemconfig(self._val, fill=rgb2hex(mix(ink, base, t)))
-            self.coords(self._val2, vx, cy + shift * (1 - t))
-            self.itemconfig(self._val2, fill=rgb2hex(mix(base, ink, t)))
-            if step >= frames:
-                self.itemconfig(self._val, text="%02d" % new,
-                                fill=rgb2hex(ink))
-                self.coords(self._val, vx, cy)
-                self.itemconfig(self._val2, state="hidden")
+            try:
+                if not self.winfo_exists():
+                    self._anim = None
+                    return
+                step += 1
+                t = ease_out_cubic(step / frames)
+                self.coords(self._val, vx, cy - shift * t)
+                self.itemconfig(self._val, fill=rgb2hex(mix(ink, base, t)))
+                self.coords(self._val2, vx, cy + shift * (1 - t))
+                self.itemconfig(self._val2, fill=rgb2hex(mix(base, ink, t)))
+                if step >= frames:
+                    self.itemconfig(self._val, text="%02d" % new,
+                                    fill=rgb2hex(ink))
+                    self.coords(self._val, vx, cy)
+                    self.itemconfig(self._val2, state="hidden")
+                    self._anim = None
+                    if self.command:
+                        self.command()
+                else:
+                    self._anim = self.after(12, tick)
+            except tk.TclError:
                 self._anim = None
-                if self.command:
-                    self.command()
-            else:
-                self._anim = self.after(12, tick)
-        self._anim = self.after(12, tick)
+        try:
+            self._anim = self.after(12, tick)
+        except tk.TclError:
+            self._anim = None
 
     def inc(self):
         if self.value < self.high:
@@ -699,26 +779,48 @@ class AnimatedNumber(_NeuCanvas):
         self.itemconfig(self._t, fill=self.color)
 
     def set(self, new):
-        if new == self.value:
+        if new == self.value or not self.winfo_exists():
             return
+        prev_aid = getattr(self, "_anim_id", None)
+        if prev_aid is not None:
+            try:
+                self.after_cancel(prev_aid)
+            except Exception:
+                pass
+            self._anim_id = None
+        prev_other = getattr(self, "_anim_other", None)
+        if prev_other is not None:
+            try:
+                self.delete(prev_other)
+            except Exception:
+                pass
+            self._anim_other = None
         self.value = new
         base = self.ctx.base
         other = self.create_text(self.cx, self.cy + 18, text=str(new),
                                  fill=rgb2hex(mix(hex2rgb(self.color), base, 0.8)),
                                  font=("Microsoft YaHei UI", self.fs, "bold"))
+        self._anim_other = other
         n = 16
 
         def frame(i=0):
-            e = ease_out_cubic(i / n)
-            self.coords(self._t, self.cx, self.cy - 18 * e)
-            self.itemconfig(self._t, fill=rgb2hex(mix(hex2rgb(self.color), base, e)))
-            self.coords(other, self.cx, self.cy + 18 * (1 - e))
-            self.itemconfig(other, fill=rgb2hex(mix(base, hex2rgb(self.color), e)))
-            if i < n:
-                self.after(12, lambda: frame(i + 1))
-            else:
-                self.delete(self._t)
-                self._t = other
+            self._anim_id = None
+            try:
+                if not self.winfo_exists():
+                    return
+                e = ease_out_cubic(i / n)
+                self.coords(self._t, self.cx, self.cy - 18 * e)
+                self.itemconfig(self._t, fill=rgb2hex(mix(hex2rgb(self.color), base, e)))
+                self.coords(other, self.cx, self.cy + 18 * (1 - e))
+                self.itemconfig(other, fill=rgb2hex(mix(base, hex2rgb(self.color), e)))
+                if i < n:
+                    self._anim_id = self.after(12, lambda ni=i + 1: frame(ni))
+                else:
+                    self.delete(self._t)
+                    self._t = other
+                    self._anim_other = None
+            except tk.TclError:
+                self._anim_id = None
         frame()
 
 
@@ -839,16 +941,26 @@ class PulseSpinner(_Spinner):
 
 # ==================== 入场动画（上滑） ====================
 def slide_in(widget, parent, x, y, distance=26, duration=260, **place_kw):
+    if not widget.winfo_exists():
+        return
     widget.place(x=x, y=y + distance, **place_kw)
     steps = max(1, int(duration / 16))
     id_ = getattr(parent, "_slide_id", [0])
 
     def frame(i=0):
-        e = ease_out_cubic(i / steps)
-        widget.place(x=x, y=y + distance * (1 - e), **place_kw)
-        if i < steps:
-            widget.after(16, lambda: frame(i + 1))
-    widget.after(60 + id_[0] * 70, frame)
+        try:
+            if not widget.winfo_exists():
+                return
+            e = ease_out_cubic(i / steps)
+            widget.place(x=x, y=y + distance * (1 - e), **place_kw)
+            if i < steps:
+                widget.after(16, lambda ni=i + 1: frame(ni))
+        except tk.TclError:
+            pass
+    try:
+        widget.after(60 + id_[0] * 70, frame)
+    except tk.TclError:
+        pass
     id_[0] += 1
     parent._slide_id = id_
 
@@ -890,6 +1002,12 @@ class GlassProgress:
             },
         }
         self._action_widgets = []
+        self._built = False
+        self._destroyed = False
+        self._pump_id = None
+        self._fade_in_id = None
+        self._fade_out_id = None
+        self._text_anim_id = None
         self.OPACITY = 0.96
         self.W = 508
         self.H_COMPACT = 154
@@ -900,9 +1018,9 @@ class GlassProgress:
         self.x, self.y = max(12, (sw - self.W) // 2), 18
         self._ui_queue = queue.SimpleQueue()
         try:
-            self.master.after(35, self._pump_ui)
+            self._pump_id = self.master.after(35, self._pump_ui)
         except Exception:
-            pass
+            self._pump_id = None
 
     def set_callbacks(self, on_pause=None, on_resume=None, on_cancel=None):
         if on_pause is not None:
@@ -912,10 +1030,35 @@ class GlassProgress:
         if on_cancel is not None:
             self._on_cancel = on_cancel
 
+    def _win_alive(self):
+        if self._destroyed or self.win is None:
+            return False
+        try:
+            return bool(self.win.winfo_exists())
+        except Exception:
+            return False
+
+    def _cancel_win_after(self, attr_name):
+        aid = getattr(self, attr_name, None)
+        if aid is not None and self.win is not None:
+            try:
+                self.win.after_cancel(aid)
+            except Exception:
+                pass
+        setattr(self, attr_name, None)
+
     def _ensure_win(self):
         # 延迟到第一次 show 时才真正创建窗口，避免初始窗口闪现/未隐藏
-        if self.win is not None:
+        if self._destroyed:
             return
+        if self.win is not None:
+            try:
+                if self.win.winfo_exists():
+                    return
+            except Exception:
+                pass
+            self.win = None
+            self._built = False
         self.win = tk.Toplevel(self.master)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
@@ -924,9 +1067,21 @@ class GlassProgress:
         self.win.update_idletasks()
         self._apply_glass()
         self._build()
+        self._built = True
         self.win.withdraw()
 
     def _apply_glass(self):
+        try:
+            self._apply_glass_inner()
+        except Exception:
+            self.glass_ok = False
+            try:
+                if self._win_alive():
+                    self.win.configure(bg="#151822")
+            except Exception:
+                pass
+
+    def _apply_glass_inner(self):
         import ctypes
         from ctypes import wintypes
         user32 = ctypes.windll.user32
@@ -972,15 +1127,20 @@ class GlassProgress:
 
     def _bind_drag(self, widget):
         def drag_start(e):
+            if not self._win_alive():
+                return
             self._drag_offset = (e.x_root - self.win.winfo_x(),
                                  e.y_root - self.win.winfo_y())
 
         def drag_move(e):
-            if self._drag_offset is None:
+            if self._drag_offset is None or not self._win_alive():
                 return
             self.x = e.x_root - self._drag_offset[0]
             self.y = e.y_root - self._drag_offset[1]
-            self.win.geometry(f"+{self.x}+{self.y}")
+            try:
+                self.win.geometry(f"+{self.x}+{self.y}")
+            except tk.TclError:
+                pass
 
         def drag_end(_e):
             self._drag_offset = None
@@ -1117,7 +1277,7 @@ class GlassProgress:
                 pass
 
     def _layout_mode(self, mode, prompt=None):
-        if self.win is None or not hasattr(self, "hint_lab"):
+        if not self._win_alive() or not hasattr(self, "hint_lab"):
             return
         prompt = prompt or {}
         btn_h = self._rebuild_buttons(mode, prompt.get("actions") or [])
@@ -1232,7 +1392,7 @@ class GlassProgress:
         self._ui(lambda: self._apply_runtime_prompt(state_dict))
 
     def _apply_runtime_prompt(self, state_dict):
-        if self.closed or self.win is None:
+        if self.closed or not self._win_alive() or not self._built:
             return
         self._rt_state = dict(state_dict or {})
         prompt = self._rt_state.get("prompt") or {}
@@ -1255,7 +1415,7 @@ class GlassProgress:
         self.cv.create_rectangle(x0 + h / 2, y0, x1 - h / 2, y1, fill=color, outline="")
 
     def _draw_bar(self, frac):
-        if self.win is None or not hasattr(self, "cv"):
+        if not self._win_alive() or not hasattr(self, "cv"):
             return
         self.cv.delete("all")
         self._draw_capsule(0, 0, self.bw, 8, "#2c313d")
@@ -1269,6 +1429,7 @@ class GlassProgress:
 
     # ---- 线程安全：使用 SimpleQueue 由主线程定时消费，杜绝跨线程调用 Tcl 崩溃或丢消息 ----
     def _drain_ui(self):
+        import sys
         while True:
             try:
                 fn = self._ui_queue.get_nowait()
@@ -1276,34 +1437,70 @@ class GlassProgress:
                 break
             try:
                 fn()
-            except Exception:
+            except tk.TclError:
                 pass
+            except Exception as exc:
+                try:
+                    sys.stderr.write(f"[GlassProgress] UI callback error: {exc}\n")
+                except Exception:
+                    pass
 
     def _pump_ui(self):
+        self._pump_id = None
+        if self._destroyed:
+            return
         self._drain_ui()
+        if self._destroyed:
+            return
         try:
-            self.master.after(35, self._pump_ui)
+            if self.master and self.master.winfo_exists():
+                self._pump_id = self.master.after(35, self._pump_ui)
         except Exception:
-            pass
+            self._pump_id = None
 
     def _ui(self, fn):
+        if self._destroyed:
+            return
         try:
             self._ui_queue.put(fn)
         except Exception:
             pass
+
+    def destroy(self):
+        """安全销毁浮窗并停止所有定时器，幂等可重复调用。"""
+        self._destroyed = True
+        self.closed = True
+        if self._pump_id is not None and self.master is not None:
+            try:
+                self.master.after_cancel(self._pump_id)
+            except Exception:
+                pass
+            self._pump_id = None
+        for attr in ("_close_timer", "_fade_in_id", "_fade_out_id", "_text_anim_id", "_bar_id"):
+            self._cancel_win_after(attr)
+        if self.win is not None:
+            try:
+                if self.win.winfo_exists():
+                    self.win.destroy()
+            except Exception:
+                pass
+            self.win = None
+        self._built = False
 
     # ---- 生命周期（公开方法可在任意线程调用） ----
     def show(self):
         self._ui(self._show)
 
     def _show(self):
+        if self._destroyed:
+            return
         self._ensure_win()
-        if self._close_timer is not None:
-            try:
-                self.win.after_cancel(self._close_timer)
-            except Exception:
-                pass
-            self._close_timer = None
+        if not self._win_alive():
+            return
+        self._cancel_win_after("_close_timer")
+        self._cancel_win_after("_fade_out_id")
+        self._cancel_win_after("_fade_in_id")
+        self._cancel_win_after("_bar_id")
         # 每次显示都重置为初始蓝色、进度归零、恢复紧凑运行态与按键
         self.closed = False
         self._bar_color = "#0a84ff"
@@ -1319,11 +1516,15 @@ class GlassProgress:
             self._bar_tick()
 
     def _fade_in(self, i, n):
-        if self.closed or self.win is None:
+        self._fade_in_id = None
+        if self.closed or not self._win_alive():
             return
-        self.win.attributes("-alpha", self.OPACITY * ease_out_cubic(i / n))
-        if i < n:
-            self.win.after(18, lambda: self._fade_in(i + 1, n))
+        try:
+            self.win.attributes("-alpha", self.OPACITY * ease_out_cubic(i / n))
+            if i < n:
+                self._fade_in_id = self.win.after(18, lambda ni=i + 1: self._fade_in(ni, n))
+        except tk.TclError:
+            self._fade_in_id = None
 
     @staticmethod
     def _clean_text(text):
@@ -1335,7 +1536,7 @@ class GlassProgress:
         self._ui(lambda: self._update_step(text, progress, color))
 
     def _update_step(self, text, progress, color=None):
-        if self.closed or self.win is None or not hasattr(self, "step_lab"):
+        if self.closed or not self._win_alive() or not hasattr(self, "step_lab"):
             return
         text = self._clean_text(text)
         self._target = max(0.0, min(1.0, progress))
@@ -1347,44 +1548,52 @@ class GlassProgress:
             self._bar_tick()
 
     def _text_anim(self, text):
-        if self.win is None or not hasattr(self, "step_lab"):
+        if not self._win_alive() or not hasattr(self, "step_lab"):
             return
+        self._cancel_win_after("_text_anim_id")
         self.step_lab.config(text=text)
         start = hex2rgb("#7b8290")
         end = hex2rgb("#ffffff")
         n = 8
 
         def f(i=0):
-            if self.win is None or not hasattr(self, "step_lab"):
+            self._text_anim_id = None
+            if not self._win_alive() or not hasattr(self, "step_lab"):
                 return
-            e = ease_out_cubic(i / n)
-            col = rgb2hex(tuple(
-                int(start[k] + (end[k] - start[k]) * e) for k in range(3)))
-            self.step_lab.config(fg=col)
-            if i < n:
-                self.win.after(16, lambda: f(i + 1))
+            try:
+                e = ease_out_cubic(i / n)
+                col = rgb2hex(tuple(
+                    int(start[k] + (end[k] - start[k]) * e) for k in range(3)))
+                self.step_lab.config(fg=col)
+                if i < n:
+                    self._text_anim_id = self.win.after(16, lambda ni=i + 1: f(ni))
+            except tk.TclError:
+                self._text_anim_id = None
         f()
 
     def _bar_tick(self):
-        if self.win is None:
+        if not self._win_alive():
             self._bar_id = None
             return
-        diff = self._target - self._cur
-        if abs(diff) < 0.002:
-            self._cur = self._target
-        else:
-            self._cur += diff * 0.25
-        self._draw_bar(self._cur)
-        if self._cur != self._target and not self.closed:
-            self._bar_id = self.win.after(16, self._bar_tick)
-        else:
+        try:
+            diff = self._target - self._cur
+            if abs(diff) < 0.002:
+                self._cur = self._target
+            else:
+                self._cur += diff * 0.25
+            self._draw_bar(self._cur)
+            if self._cur != self._target and not self.closed and self._win_alive():
+                self._bar_id = self.win.after(16, self._bar_tick)
+            else:
+                self._bar_id = None
+        except tk.TclError:
             self._bar_id = None
 
     def finish(self, text="本轮已完成"):
         self._ui(lambda: self._finish(text))
 
     def _finish(self, text):
-        if self.closed or self.win is None or not hasattr(self, "step_lab"):
+        if self.closed or not self._win_alive() or not hasattr(self, "step_lab"):
             return
         text = self._clean_text(text) or "本轮已完成"
         self._bar_color = "#34c759"
@@ -1400,7 +1609,7 @@ class GlassProgress:
         self._ui(lambda: self._fail(text))
 
     def _fail(self, text):
-        if self.win is None or not hasattr(self, "step_lab"):
+        if not self._win_alive() or not hasattr(self, "step_lab"):
             return
         text = self._clean_text(text)
         self._bar_color = "#ff3b30"
@@ -1413,30 +1622,33 @@ class GlassProgress:
         self._ui(lambda: self._close(delay))
 
     def _close(self, delay):
-        if self.win is None:
+        if not self._win_alive():
             return
-        if self._close_timer is not None:
-            try:
-                self.win.after_cancel(self._close_timer)
-            except Exception:
-                pass
-        self._close_timer = self.win.after(delay, self._do_close)
+        self._cancel_win_after("_close_timer")
+        try:
+            self._close_timer = self.win.after(delay, self._do_close)
+        except tk.TclError:
+            self._close_timer = None
 
     def _do_close(self):
         self._close_timer = None
-        if self.closed or self.win is None:
+        if self.closed or not self._win_alive():
             return
         self.closed = True
         self._fade_out(0, 8)
 
     def _fade_out(self, i, n):
-        if not self.closed or self.win is None:
+        self._fade_out_id = None
+        if not self.closed or not self._win_alive():
             return  # 新一轮已开始，旧关闭动画不得隐藏新浮窗
-        self.win.attributes("-alpha", self.OPACITY * max(0, 1 - i / n))
-        if i < n:
-            self.win.after(18, lambda: self._fade_out(i + 1, n))
-        else:
-            self.win.withdraw()   # 隐藏并保留，供下一轮复用
+        try:
+            self.win.attributes("-alpha", self.OPACITY * max(0, 1 - i / n))
+            if i < n:
+                self._fade_out_id = self.win.after(18, lambda ni=i + 1: self._fade_out(ni, n))
+            else:
+                self.win.withdraw()   # 隐藏并保留，供下一轮复用
+        except tk.TclError:
+            self._fade_out_id = None
 
 
 # ==================== Liquid Glass 模态弹窗 ====================
@@ -1497,16 +1709,21 @@ def glass_dialog(parent, title, message, ok_text="好", cancel_text=None,
         result["value"] = value
 
         def out(i=0):
-            if i <= 6:
-                top.attributes("-alpha", 0.96 * (1 - i / 6))
-                card.place(y=14 + i)
-                top.after(16, lambda: out(i + 1))
-            else:
-                try:
-                    top.grab_release()
-                except Exception:
-                    pass
-                top.destroy()
+            try:
+                if not top.winfo_exists():
+                    return
+                if i <= 6:
+                    top.attributes("-alpha", 0.96 * (1 - i / 6))
+                    card.place(y=14 + i)
+                    top.after(16, lambda ni=i + 1: out(ni))
+                else:
+                    try:
+                        top.grab_release()
+                    except Exception:
+                        pass
+                    top.destroy()
+            except tk.TclError:
+                pass
         out()
 
     button_y = inner_h - 72
@@ -1521,21 +1738,25 @@ def glass_dialog(parent, title, message, ok_text="好", cancel_text=None,
         NeuButton(card.inner, ctx, 132, 40, ok_text,
                   command=lambda: close(True), accent=accent,
                   filled=True, radius=15).place(x=inner_w - 156, y=button_y)
+    top.protocol("WM_DELETE_WINDOW", lambda: close(False))
     top.bind("<Escape>", lambda _: close(False))
     top.bind("<Return>", lambda _: close(True))
     top.transient(parent)
     top.grab_set()
 
     def enter(i=0):
-        if not top.winfo_exists():
-            return
-        t = ease_out_cubic(i / 7)
-        top.attributes("-alpha", 0.96 * t)
-        card.place(y=20 - 6 * t)
-        if i < 7:
-            top.after(16, lambda: enter(i + 1))
-        else:
-            top.focus_force()
+        try:
+            if closing["on"] or not top.winfo_exists():
+                return
+            t = ease_out_cubic(i / 7)
+            top.attributes("-alpha", 0.96 * t)
+            card.place(y=20 - 6 * t)
+            if i < 7:
+                top.after(16, lambda ni=i + 1: enter(ni))
+            else:
+                top.focus_force()
+        except tk.TclError:
+            pass
     enter()
     parent.wait_window(top)
     return result["value"]

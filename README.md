@@ -1,6 +1,6 @@
-# 暗号表助手（SheetMate）v2.9.6
+# 暗号表助手（SheetMate）v2.9.7
 
-[![最新版本](https://img.shields.io/badge/Release-v2.9.6-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
+[![最新版本](https://img.shields.io/badge/Release-v2.9.7-0A84FF?style=flat-square&logo=github)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![运行平台](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-34C759?style=flat-square&logo=windows)](https://github.com/Sorenskr/SheetMate/releases/latest)
 [![云端远程入口](https://img.shields.io/badge/Cloud%20Web-点击打开远程控制台-5856D6?style=flat-square&logo=googlechrome)](https://sorenskr.github.io/SheetMate/)
 
@@ -10,7 +10,7 @@
 
 ## 📥 立即下载与在线访问
 
-不管您是第一次拿到这个工具的新同事，还是需要在外出差用手机查看电脑跑表进度，都可以直接通过下方入口下载或打开：
+不管是第一次使用的新同事，还是需要在外出差用手机查看电脑跑表进度，都可以直接通过下方入口下载或打开：
 
 | 用途 | 直达链接 | 特点说明 |
 | :--- | :--- | :--- |
@@ -20,8 +20,15 @@
 
 ---
 
-## ✨ v2.9.6 核心功能一览
+## ✨ v2.9.7 核心功能一览
 
+- **WPS 200% 缩放 C6（`#364C74`）深蓝标题栏精准锁定 + AI 反复确认防 A1 误点 + 复制后稳等 5 秒**
+  - 放大 200% 后自动识别第 6 行深蓝标题栏（`#364C74`），结合 A1 参考差分框选与 TSV 行列核验屏蔽第 1 行图标与远端绿色卡片干扰；AI 本地多帧 + 视觉双检反复确认右键菜单落点，严防误点 A1 单元格，成功复制为图片后稳定等待 **5 秒**再切换钉钉粘贴。
+- **全仓库五大模块深度 Bug 修复与稳定安全全面加固**
+  - **取消不中断值守、不撞锁**：取消当前任务时正确穿透停止信号并保留“自动值守”调度，严防前后任务锁碰撞，拦截即将发出的定时文字误发。
+  - **防误清空配置与权限安全**：拦截损坏/截断/空 JSON 写入 `/api/config` 防配置洗白，强化公共云脱敏、混淆 IP SSRF 防护、自定义/第三方 AI 接口默认密钥零泄露。
+  - **手机与桌面端零串台 + 改密踢旧设备**：修复移动端状态同步与存储兼容，手机轮询改为纯只读不抢桌面更新；修改远程密码（`set_pin`）后立即失效历史旧手机令牌，防止未授权续用。
+  - **浮窗内存上限与界面打磨**：修复灵动岛浮窗及弹窗生命周期定时销毁保护与图标缓存上限（256 项），修复超管后台媒体列表作用域、时间快捷胶囊及多弹窗队列问题。
 - **运行期间 AI 随时暂停 / 继续 / 取消（桌面与手机双端零阻塞直控）**
   - 软件跑表或发钉钉期间，随时直接在桌面 AI 对话框或手机远程网页对 AI 说「暂停运行」「先停一下」「继续运行」「取消当前任务」「停掉」或点快捷指令胶囊，AI 毫秒级挂起/恢复进度或安全停止任务并释放团队锁定，同时即时刷新灵动岛与手机端控制状态。
 - **顶部冻结公告栏横幅动画 / 视频 / GIF 多模式播放 + 默认静音**

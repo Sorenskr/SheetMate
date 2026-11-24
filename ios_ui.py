@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""SheetMate v2.9.6 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
+"""SheetMate v2.9.7 多端协同控制中心界面、动态昼夜光效与纯云端异地调度后端。"""
 
 import base64
 import copy
@@ -124,7 +124,7 @@ def _find_app_shell_browser():
     return None, None
 
 
-def _apply_square_rounded_win32(wx, wy, win_w, win_h=None, win_state=None):
+def _apply_square_rounded_win32(wx, wy, win_w, win_h=None, win_state=None, target_pid=None):
     """为桌面 --app 窗口应用 Windows 11 原生四角大圆角，并记录主窗口句柄用于关窗即退监测。"""
     if win_h is None:
         win_h = win_w
@@ -140,6 +140,8 @@ def _apply_square_rounded_win32(wx, wy, win_w, win_h=None, win_state=None):
         user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
         user32.SetWindowPos.argtypes = [
             wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int, wintypes.UINT,
@@ -166,6 +168,11 @@ def _apply_square_rounded_win32(wx, wy, win_w, win_h=None, win_state=None):
                     title = tbuf.value or ""
                     cls = cbuf.value or ""
                     if "暗号表助手" in title and cls.startswith("Chrome_WidgetWin"):
+                        if target_pid:
+                            w_pid = wintypes.DWORD(0)
+                            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(w_pid))
+                            if int(w_pid.value) != int(target_pid):
+                                return True
                         rc_chk = wintypes.RECT()
                         if user32.GetWindowRect(hwnd, ctypes.byref(rc_chk)):
                             if (rc_chk.right - rc_chk.left) >= 240 and (rc_chk.bottom - rc_chk.top) >= 200:
@@ -284,6 +291,9 @@ class _SheetMateController:
         self._holds_team_lock = False
         self._queue_auto_starting = False
         self._last_sched_busy_log = 0.0
+        self._active_worker_thread = None
+        self._raw_sync_fail_streak = 0
+        self._raw_sync_next_retry_ts = 0.0
 
         base_dir = self.app.app_dir() if hasattr(self.app, "app_dir") else Path.cwd()
         self.hub = team_hub.TeamHubManager(base_dir, app=self.app) if team_hub is not None else None
@@ -813,6 +823,21 @@ class _SheetMateController:
             new_cfg = self.app.apply_recommended_tuning(cfg_snap, use_patch)
         else:
             new_cfg = cfg_snap
+        if self.hub is not None and team_hub is not None:
+            with self._lock:
+                old_norm = self.app.normalize_config(self.cfg)
+            merged_in = self._merge_server_ai_secrets(new_cfg, old_norm)
+            new_norm = self.app.normalize_config(merged_in)
+            perms = self.hub.get_my_permissions()
+            allowed, denied, safe_cfg = team_hub.check_config_edit_permission(old_norm, new_norm, perms)
+            if not allowed:
+                saved = self.save_config(safe_cfg)
+                return {
+                    "ok": False,
+                    "denied": denied,
+                    "config": self._sanitize_config_for_client(saved),
+                    "message": f"当前该项采用团队标准设置，暂无法自动修改：{'、'.join(denied)}",
+                }
         saved = self.save_config(new_cfg)
         self._on_log("🔧 已按 AI 建议自动调整内部模块执行顺序与等待参数")
         resumed = False
@@ -1179,14 +1204,22 @@ class _SheetMateController:
                 if targets
                 else "准备执行全流程抓数与写表…"
             )
-            lres = self.hub.acquire_run_lock(mode_label="AI即时指令", step_text=lock_step)
+            try:
+                lres = self.hub.acquire_run_lock(mode_label="AI即时指令", step_text=lock_step)
+            except Exception as exc_lk:
+                try:
+                    self._task_lock.release()
+                except Exception:
+                    pass
+                return {"ok": False, "message": f"申请团队运行锁失败：{exc_lk}"}
             if not lres.get("ok"):
                 try:
                     self._task_lock.release()
                 except Exception:
                     pass
                 holder = lres.get("locked_by") or {}
-                return {"ok": False, "message": f"「{holder.get('display_name') or '同事'}」正在使用表格，为防混乱已为您暂缓"}
+                hname = holder.get("holder_name") or holder.get("display_name") or "同事"
+                return {"ok": False, "message": f"「{hname}」正在使用表格，为防混乱已为您暂缓"}
 
         def _done_cb(ok_flag, err_tip=""):
             tgt_txt = "、".join(targets)
@@ -1231,11 +1264,14 @@ class _SheetMateController:
                 self.status_level = "running"
                 self.progress = 0.25
                 self.step_text = f"正在准备文字结果发给钉钉 {'、'.join(targets)}…"
-            threading.Thread(
+            t = threading.Thread(
                 target=self._text_send_worker,
                 args=(ep, run_cfg, targets, "", _done_cb, date_lbl),
                 daemon=True,
-            ).start()
+            )
+            with self._lock:
+                self._active_worker_thread = t
+            t.start()
             return {"ok": True}
 
         with self._lock:
@@ -1265,7 +1301,10 @@ class _SheetMateController:
                 self.step_text = f"AI 正在按{date_lbl}截图发钉钉（{'、'.join(targets)}）…"
                 worker_fn = self._capture_only_worker
                 worker_args = (ep, run_cfg, _done_cb)
-        threading.Thread(target=worker_fn, args=worker_args, daemon=True).start()
+        t = threading.Thread(target=worker_fn, args=worker_args, daemon=True)
+        with self._lock:
+            self._active_worker_thread = t
+        t.start()
         return {"ok": True}
 
     def summarize_ai(self, style_id="brief", prompt="", action="send", source_device="pc", speaker_name=""):
@@ -1377,8 +1416,27 @@ class _SheetMateController:
                             self.ai_chat_history = self.ai_chat_history[-25:]
                         self._prune_old_chat_images_locked(2)
                         self._chat_seq += 1
-                        hist_out = list(self.ai_chat_history)
+                        hist_out = copy.deepcopy(self.ai_chat_history)
                         seq_out = self._chat_seq
+                    if hasattr(self.app, "append_ai_chat_turn"):
+                        try:
+                            self.app.append_ai_chat_turn(
+                                "model",
+                                rep_cfm,
+                                time_str=m_t,
+                                source="target_confirm_reply",
+                                shot_info="双端看图确认回执",
+                                via="pc",
+                            )
+                        except Exception:
+                            pass
+                    if self.mobile_bridge is not None and hasattr(self.mobile_bridge, "notify_state_changed"):
+                        try:
+                            self.mobile_bridge.notify_state_changed(force_push=True)
+                        except TypeError:
+                            self.mobile_bridge.notify_state_changed()
+                        except Exception:
+                            pass
                     return {
                         "ok": True,
                         "source": "target_confirm_reply",
@@ -2065,12 +2123,40 @@ class _SheetMateController:
     def reset_config(self):
         with self._lock:
             default = self.app.normalize_config({})
-            self.app.save_config(default)
-            self.cfg = copy.deepcopy(default)
+            merged_def = self._merge_server_ai_secrets(default, self.cfg)
+            normed = self.app.normalize_config(merged_def)
+            self.app.save_config(normed)
+            self.cfg = copy.deepcopy(normed)
             saved = copy.deepcopy(self.cfg)
         self._schedule_snapshot_sync(cfg=saved)
         self._schedule_account_vault_push()
         return saved
+
+    def reset_config_checked(self):
+        with self._lock:
+            old_norm = self.app.normalize_config(self.cfg)
+            default = self.app.normalize_config({})
+            merged_def = self._merge_server_ai_secrets(default, old_norm)
+            new_norm = self.app.normalize_config(merged_def)
+        if self.hub is not None and team_hub is not None:
+            perms = self.hub.get_my_permissions()
+            allowed, denied, safe_cfg = team_hub.check_config_edit_permission(old_norm, new_norm, perms)
+            if not allowed:
+                saved = self.save_config(safe_cfg)
+                return {
+                    "ok": False,
+                    "denied": denied,
+                    "message": f"当前该项采用团队标准设置，已保留受保护项并还原其余默认项：{'、'.join(denied)}",
+                    "config": self._sanitize_config_for_client(saved),
+                    "timetable": self.get_timetable(),
+                }
+        saved = self.reset_config()
+        return {
+            "ok": True,
+            "message": "已恢复默认设置",
+            "config": self._sanitize_config_for_client(saved),
+            "timetable": self.get_timetable(),
+        }
 
     def clear_logs(self):
         with self._lock:
@@ -2242,7 +2328,10 @@ class _SheetMateController:
         if self.hub is None:
             return {"ok": False, "message": "协同模块未加载"}
         b = body if isinstance(body, dict) else {}
-        return self.hub.force_unlock_all(clear_queue=bool(b.get("clear_queue")))
+        res = self.hub.force_unlock_all(clear_queue=bool(b.get("clear_queue")))
+        if isinstance(res, dict):
+            return res
+        return {"ok": bool(res), "message": "已强制释放锁定" if res else "释放锁定失败"}
 
     def admin_member_payload(self, body):
         if self.hub is None:
@@ -2274,8 +2363,7 @@ class _SheetMateController:
         ai_d = dict(test_cfg.get("ai_assistant") or {})
         ai_d["provider"] = prov
         ai_d["api_base"] = str(ai_patch.get("api_base") or "").strip()
-        if str(ai_patch.get("api_key") or "").strip():
-            ai_d["api_key"] = str(ai_patch["api_key"]).strip()
+        ai_d["api_key"] = str(ai_patch.get("api_key") or "").strip()
         ai_d["model"] = str(ai_patch.get("model") or "").strip()
         test_cfg["ai_assistant"] = ai_d
         if hasattr(self.app, "_call_gemini_generate"):
@@ -2305,7 +2393,8 @@ class _SheetMateController:
         if b.get("enable", True):
             port = max(1024, min(65535, _safe_int(b.get("port"), 18790)))
             res = self.hub.start_center_server(port=port)
-            self.hub.admin_update_sync_settings({"server_port": port, "server_autostart": True})
+            if isinstance(res, dict) and res.get("ok"):
+                self.hub.admin_update_sync_settings({"server_port": port, "server_autostart": True})
             return res
         self.hub.admin_update_sync_settings({"server_autostart": False})
         self.hub.stop_center_server()
@@ -2332,10 +2421,11 @@ class _SheetMateController:
             ai_blk.pop("api_key", None)
         return out
 
-    def get_state(self, since=0):
+    def get_state(self, since=0, source="pc"):
+        is_pc = str(source or "pc").strip().lower() == "pc"
         remote_pulled = False
         bundle = None
-        if self.hub is not None:
+        if self.hub is not None and is_pc:
             try:
                 bundle = self.hub.get_ui_poll_bundle(self.cfg)
                 pending_cfg = bundle.get("pending_cfg") if isinstance(bundle, dict) else None
@@ -2346,10 +2436,11 @@ class _SheetMateController:
             except Exception:
                 bundle = None
         with self._lock:
-            if self._pending_ui_config_reload:
+            if is_pc and self._pending_ui_config_reload:
                 self._pending_ui_config_reload = False
                 remote_pulled = True
-            self.last_heartbeat = time.time()
+            if is_pc:
+                self.last_heartbeat = time.time()
             delta = [item for item in self.logs if item["id"] > since]
             rt = self.runtime_state or {}
             prompt = rt.get("prompt") or {}
@@ -2397,7 +2488,7 @@ class _SheetMateController:
                 "spotlight_seq": self._spotlight_seq,
                 "latest_spotlight": self.latest_spotlight,
                 "chat_seq": self._chat_seq,
-                "ai_history": [dict(x) if isinstance(x, dict) else x for x in self.ai_chat_history],
+                "ai_history": copy.deepcopy(self.ai_chat_history),
                 "pending_target_confirm": copy.deepcopy(self._pending_target_confirm),
             }
         # 锁外计算磁盘统计/跨锁状态，彻底避免持 ctrl._lock 时读写磁盘或嵌套获取 mobile_bridge._lock
@@ -2435,14 +2526,21 @@ class _SheetMateController:
             if not self._task_lock.acquire(blocking=False):
                 return {"ok": False, "message": "当前已有任务正在运行，请稍候"}
         if self.hub is not None:
-            lres = self.hub.acquire_run_lock(mode_label="全流程", step_text="准备开始手动任务…")
+            try:
+                lres = self.hub.acquire_run_lock(mode_label="全流程", step_text="准备开始手动任务…")
+            except Exception as exc_lk:
+                try:
+                    self._task_lock.release()
+                except Exception:
+                    pass
+                return {"ok": False, "message": f"申请团队运行锁失败：{exc_lk}"}
             if not lres.get("ok"):
                 try:
                     self._task_lock.release()
                 except Exception:
                     pass
                 holder = lres.get("locked_by") or {}
-                hname = holder.get("display_name") or "其他成员"
+                hname = holder.get("holder_name") or holder.get("display_name") or "其他成员"
                 return {
                     "ok": False,
                     "locked": True,
@@ -2464,7 +2562,10 @@ class _SheetMateController:
             self.status_level = "running"
             self.progress = 0.02
             self.step_text = "准备开始手动任务…"
-        threading.Thread(target=self._run_once_worker, args=("手动", True, None, None, None, ep), daemon=True).start()
+        t = threading.Thread(target=self._run_once_worker, args=("手动", True, None, None, None, ep), daemon=True)
+        with self._lock:
+            self._active_worker_thread = t
+        t.start()
         return {"ok": True, "message": "已开始全流程任务"}
 
     def start_capture_only(self):
@@ -2479,14 +2580,21 @@ class _SheetMateController:
             if not self._task_lock.acquire(blocking=False):
                 return {"ok": False, "message": "当前已有任务正在运行，请稍候"}
         if self.hub is not None:
-            lres = self.hub.acquire_run_lock(mode_label="仅截图发送", step_text="正在打开WPS汇总表…")
+            try:
+                lres = self.hub.acquire_run_lock(mode_label="仅截图发送", step_text="正在打开WPS汇总表…")
+            except Exception as exc_lk:
+                try:
+                    self._task_lock.release()
+                except Exception:
+                    pass
+                return {"ok": False, "message": f"申请团队运行锁失败：{exc_lk}"}
             if not lres.get("ok"):
                 try:
                     self._task_lock.release()
                 except Exception:
                     pass
                 holder = lres.get("locked_by") or {}
-                hname = holder.get("display_name") or "其他成员"
+                hname = holder.get("holder_name") or holder.get("display_name") or "其他成员"
                 return {
                     "ok": False,
                     "locked": True,
@@ -2508,7 +2616,10 @@ class _SheetMateController:
             self.status_level = "running"
             self.progress = 0.04
             self.step_text = "正在打开WPS汇总表…"
-        threading.Thread(target=self._capture_only_worker, args=(ep,), daemon=True).start()
+        t = threading.Thread(target=self._capture_only_worker, args=(ep,), daemon=True)
+        with self._lock:
+            self._active_worker_thread = t
+        t.start()
         return {"ok": True, "message": "已开始仅截图发送"}
 
     def start_raw_sync_now(self):
@@ -2523,14 +2634,21 @@ class _SheetMateController:
             if not self._task_lock.acquire(blocking=False):
                 return {"ok": False, "message": "当前已有任务正在运行，请稍候"}
         if self.hub is not None:
-            lres = self.hub.acquire_run_lock(mode_label="刷底表(仅三表+R4)", step_text="正在更新三份底表与 R4…")
+            try:
+                lres = self.hub.acquire_run_lock(mode_label="刷底表(仅三表+R4)", step_text="正在更新三份底表与 R4…")
+            except Exception as exc_lk:
+                try:
+                    self._task_lock.release()
+                except Exception:
+                    pass
+                return {"ok": False, "message": f"申请团队运行锁失败：{exc_lk}"}
             if not lres.get("ok"):
                 try:
                     self._task_lock.release()
                 except Exception:
                     pass
                 holder = lres.get("locked_by") or {}
-                hname = holder.get("display_name") or "其他成员"
+                hname = holder.get("holder_name") or holder.get("display_name") or "其他成员"
                 return {
                     "ok": False,
                     "locked": True,
@@ -2555,11 +2673,16 @@ class _SheetMateController:
             self.status_level = "running"
             self.progress = 0.02
             self.step_text = "正在刷底表（仅三表+R4）…"
-        threading.Thread(
+            self._raw_sync_fail_streak = 0
+            self._raw_sync_next_retry_ts = 0.0
+        t = threading.Thread(
             target=self._run_once_worker,
             args=("手动刷底表", True, rs_cfg, None, None, ep, None, True),
             daemon=True,
-        ).start()
+        )
+        with self._lock:
+            self._active_worker_thread = t
+        t.start()
         return {"ok": True, "message": "已开始刷新三份底表并仅更新 R4（保留数据汇总其他格位）"}
 
     def _run_once_worker(self, round_name, owns_lock=True, run_cfg_override=None, trigger_lt=None, trigger_hm=None, run_epoch=None, on_done=None, raw_sync_only=False):
@@ -2593,6 +2716,9 @@ class _SheetMateController:
             ok_cb = True
             self._last_paste_done_ts = time.time()
             if raw_sync_only:
+                self._raw_sync_fail_streak = 0
+                self._raw_sync_next_retry_ts = 0.0
+            if raw_sync_only:
                 done_text = "三份底表与 R4 已更新"
             else:
                 done_text = "手动任务已完成" if not isinstance(round_name, int) else f"第 {round_name} 轮已完成"
@@ -2623,7 +2749,7 @@ class _SheetMateController:
                         self.error_detail = None
                 if self.hub is not None and self._run_epoch == my_epoch:
                     try:
-                        self.hub.record_run_event(mode="full", trigger_type=trig_type, status="stopped", duration_sec=max(1, int(time.time() - started_ts)))
+                        self.hub.record_run_event(mode=ev_mode, trigger_type=trig_type, status="stopped", duration_sec=max(1, int(time.time() - started_ts)))
                     except Exception:
                         pass
                 if self.glass is not None and self._run_epoch == my_epoch:
@@ -2643,10 +2769,15 @@ class _SheetMateController:
                 if self.glass is not None and self._run_epoch == my_epoch:
                     self.glass.fail(tip)
                     self.glass.close(1800)
+                if raw_sync_only:
+                    with self._lock:
+                        self._raw_sync_fail_streak += 1
+                        backoff = min(1800, 60 * (2 ** min(self._raw_sync_fail_streak - 1, 5)))
+                        self._raw_sync_next_retry_ts = time.time() + backoff
                 if self.hub is not None and self._run_epoch == my_epoch:
                     try:
                         self.hub.record_run_event(
-                            mode="full",
+                            mode=ev_mode,
                             trigger_type=trig_type,
                             status="err",
                             err_code=(det or {}).get("code", "ERR-RUN-900"),
@@ -2657,13 +2788,15 @@ class _SheetMateController:
                 if det is not None and self._run_epoch == my_epoch:
                     try:
                         if run_cfg is not None:
-                            self.app.record_run_journal(run_cfg, status="err", mode="full", round_label=f"第{round_name}轮", error_detail=det)
+                            self.app.record_run_journal(run_cfg, status="err", mode=ev_mode, round_label=f"第{round_name}轮", error_detail=det)
                     except Exception:
                         pass
                     self._maybe_auto_ai_diagnose(det)
         finally:
             rel_hub = False
             with self._lock:
+                if self._active_worker_thread is threading.current_thread():
+                    self._active_worker_thread = None
                 if self._run_epoch == my_epoch:
                     self.job_running = False
                     self.need_login_prompt = False
@@ -2672,11 +2805,11 @@ class _SheetMateController:
                     if self._holds_team_lock:
                         self._holds_team_lock = False
                         rel_hub = True
-                    if owns_lock:
-                        try:
-                            self._task_lock.release()
-                        except Exception:
-                            pass
+                if owns_lock:
+                    try:
+                        self._task_lock.release()
+                    except RuntimeError:
+                        pass
             if rel_hub and self.hub is not None:
                 try:
                     self.hub.release_run_lock()
@@ -2772,6 +2905,8 @@ class _SheetMateController:
         finally:
             rel_hub = False
             with self._lock:
+                if self._active_worker_thread is threading.current_thread():
+                    self._active_worker_thread = None
                 if self._run_epoch == my_epoch:
                     self.capture_running = False
                     self.need_login_prompt = False
@@ -2780,10 +2915,10 @@ class _SheetMateController:
                     if self._holds_team_lock:
                         self._holds_team_lock = False
                         rel_hub = True
-                    try:
-                        self._task_lock.release()
-                    except Exception:
-                        pass
+                try:
+                    self._task_lock.release()
+                except RuntimeError:
+                    pass
             if rel_hub and self.hub is not None:
                 try:
                     self.hub.release_run_lock()
@@ -2816,9 +2951,12 @@ class _SheetMateController:
                 if not msg_use:
                     msg_use = f"{lbl} 数据已为您整理完毕。"
             with self._lock:
-                if self._run_epoch == run_epoch:
+                cancelled_before_send = (self._run_epoch != run_epoch) or bool(getattr(self.app, "_stop_requested", False))
+                if not cancelled_before_send:
                     self.progress = 0.55
                     self.step_text = f"正在将整理结果直发钉钉 {'、'.join(targets)}…"
+            if cancelled_before_send:
+                raise RuntimeError("已手动停止")
             self.app.send_dingtalk_text_message(
                 run_cfg,
                 targets,
@@ -2836,20 +2974,26 @@ class _SheetMateController:
             err_cb = _strip_symbols(self.app.human_error(exc))
             with self._lock:
                 if self._run_epoch == run_epoch:
-                    self.status_level = "err"
-                    self.step_text = f"发送文字到钉钉失败：{err_cb}"
+                    if "手动停止" in str(exc):
+                        self.status_level = "stopped"
+                        self.step_text = "已手动停止"
+                    else:
+                        self.status_level = "err"
+                        self.step_text = f"发送文字到钉钉失败：{err_cb}"
         finally:
             rel_hub = False
             with self._lock:
+                if self._active_worker_thread is threading.current_thread():
+                    self._active_worker_thread = None
                 if self._run_epoch == run_epoch:
                     self.capture_running = False
                     if self._holds_team_lock:
                         self._holds_team_lock = False
                         rel_hub = True
-                    try:
-                        self._task_lock.release()
-                    except Exception:
-                        pass
+                try:
+                    self._task_lock.release()
+                except RuntimeError:
+                    pass
             if rel_hub and self.hub is not None:
                 try:
                     self.hub.release_run_lock()
@@ -2912,19 +3056,23 @@ class _SheetMateController:
             if self._holds_team_lock:
                 self._holds_team_lock = False
                 rel_hub = True
-            if self.schedule_running:
-                self.stop_flag = True
             self.status_level = "stopped"
             self.step_text = "已手动取消"
             self.progress = 0.0
             self.error_text = ""
             self.error_detail = None
-            self._task_lock = threading.Lock()
             if hasattr(self.app, "get_runtime_state"):
                 self.runtime_state = self.app.get_runtime_state()
             if isinstance(self._pending_target_confirm, dict):
+                pid_cancel = str(self._pending_target_confirm.get("pending_id", "") or "")
+                for msg_item in reversed(self.ai_chat_history):
+                    cc = msg_item.get("confirm_card") if isinstance(msg_item, dict) else None
+                    if isinstance(cc, dict) and (not pid_cancel or cc.get("pending_id") == pid_cancel):
+                        cc["status"] = "cancelled"
+                        cc["resolved_text"] = "本轮任务已手动取消"
+                        break
                 self._target_confirm_result = {
-                    "pending_id": self._pending_target_confirm.get("pending_id", ""),
+                    "pending_id": pid_cancel,
                     "action": "cancel_send",
                     "reason": "stopped",
                 }
@@ -2981,6 +3129,8 @@ class _SheetMateController:
             self.stop_flag = False
             self.error_text = ""
             self.error_detail = None
+            self._raw_sync_fail_streak = 0
+            self._raw_sync_next_retry_ts = 0.0
         threading.Thread(target=self._schedule_loop, daemon=True).start()
         return True, "已开启自动值守", True
 
@@ -3018,6 +3168,7 @@ class _SheetMateController:
             self._schedule_started_ts = time.time()
         try:
             while not self.stop_flag:
+              try:
                 cfg = self.get_config()
                 if hasattr(self.app, "set_keep_awake"):
                     self.app.set_keep_awake(bool(cfg.get("prevent_sleep", True)), reason="schedule")
@@ -3070,14 +3221,26 @@ class _SheetMateController:
                     elif self._task_lock.acquire(blocking=False):
                         hub_ok = True
                         if self.hub is not None:
-                            lres = self.hub.acquire_run_lock(mode_label=f"定时 {pt['time']}", step_text=f"定时第 {round_num} 轮准备中…")
-                            if not lres.get("ok"):
+                            try:
+                                lres = self.hub.acquire_run_lock(mode_label=f"定时 {pt['time']}", step_text=f"定时第 {round_num} 轮准备中…")
+                            except Exception as exc_lk:
                                 hub_ok = False
                                 try:
                                     self._task_lock.release()
                                 except Exception:
                                     pass
-                                holder = (lres.get("locked_by") or {}).get("display_name") or "其他成员"
+                                if time.time() - self._last_sched_busy_log > 15:
+                                    self._on_log(f"定时点 {pt['time']} 申请团队锁异常（{exc_lk}），稍后重试")
+                                    self._last_sched_busy_log = time.time()
+                                lres = {"ok": False}
+                            if hub_ok and not lres.get("ok"):
+                                hub_ok = False
+                                try:
+                                    self._task_lock.release()
+                                except Exception:
+                                    pass
+                                h_obj = lres.get("locked_by") or {}
+                                holder = h_obj.get("holder_name") or h_obj.get("display_name") or "其他成员"
                                 if time.time() - self._last_sched_busy_log > 15:
                                     self._on_log(f"定时点 {pt['time']} 遇「{holder}」正在占用表格，自动避让等待其释放…")
                                     self._last_sched_busy_log = time.time()
@@ -3103,6 +3266,8 @@ class _SheetMateController:
 
                             nxt_after = self._compute_next_point(cfg, now_ts, fired_keys)
                             with self._lock:
+                                self._run_epoch += 1
+                                ep_pt = self._run_epoch
                                 self.job_running = True
                                 self._holds_team_lock = True
                                 self._run_started_at = time.time()
@@ -3123,19 +3288,23 @@ class _SheetMateController:
                                 run_cfg_override=run_cfg,
                                 trigger_lt=time.localtime(pt_ts),
                                 trigger_hm=pt["time"],
+                                run_epoch=ep_pt,
                             )
                             round_num += 1
                             continue
 
-                if rs_due.get("due") and not self.job_running and not self.capture_running:
+                if rs_due.get("due") and time.time() >= self._raw_sync_next_retry_ts and not self.job_running and not self.capture_running:
                     can_run_rs = True if self.hub is None else self.hub.get_my_permissions().get("can_run", True)
                     if can_run_rs and self._task_lock.acquire(blocking=False):
                         hub_ok_rs = True
                         if self.hub is not None:
-                            lres_rs = self.hub.acquire_run_lock(
-                                mode_label=f"定时刷底表({raw_round_num})",
-                                step_text="定时刷新三份底表并仅写 R4…",
-                            )
+                            try:
+                                lres_rs = self.hub.acquire_run_lock(
+                                    mode_label=f"定时刷底表({raw_round_num})",
+                                    step_text="定时刷新三份底表并仅写 R4…",
+                                )
+                            except Exception:
+                                lres_rs = {"ok": False}
                             if not lres_rs.get("ok"):
                                 hub_ok_rs = False
                                 try:
@@ -3150,6 +3319,8 @@ class _SheetMateController:
                                 f"到达第 {raw_round_num} 次定时刷底表周期（间隔 {rs_due.get('interval_min', 40)} 分钟），开始仅更新三表与 R4（不动数据汇总其他格位）…"
                             )
                             with self._lock:
+                                self._run_epoch += 1
+                                ep_rs = self._run_epoch
                                 self.job_running = True
                                 self._holds_team_lock = True
                                 self._run_started_at = time.time()
@@ -3166,6 +3337,7 @@ class _SheetMateController:
                                 run_cfg_override=rs_run_cfg,
                                 trigger_lt=now_lt,
                                 trigger_hm=time.strftime("%H:%M", now_lt),
+                                run_epoch=ep_rs,
                                 raw_sync_only=True,
                             )
                             raw_round_num += 1
@@ -3202,6 +3374,12 @@ class _SheetMateController:
                     if self.stop_flag:
                         break
                     time.sleep(1)
+              except Exception as exc_sched:
+                self._on_log(f"⚠️ 自动值守调度轮询捕获异常（已自我恢复）：{exc_sched}")
+                for _ in range(3):
+                    if self.stop_flag:
+                        break
+                    time.sleep(1)
         finally:
             if hasattr(self.app, "set_keep_awake"):
                 self.app.set_keep_awake(False, reason="schedule")
@@ -3224,8 +3402,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>暗号表助手</title>
-<link rel="icon" type="image/png" href="/icon.png?v=2.9.6" />
-<link rel="shortcut icon" href="/favicon.ico?v=2.9.6" />
+<link rel="icon" type="image/png" href="/icon.png?v=2.9.7" />
+<link rel="shortcut icon" href="/favicon.ico?v=2.9.7" />
 <style>
   :root {
     --bg: #EAF0F8;
@@ -6558,9 +6736,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <header class="top-header" id="topHeader">
       <div class="nav-bar">
         <div class="large-title-wrap">
-          <img src="/icon.png?v=2.9.6" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
+          <img src="/icon.png?v=2.9.7" class="nav-app-icon" id="navAppIcon" alt="" title="暗号表助手" />
           <h1 class="large-title">暗号表助手</h1>
-          <span class="ver-pill" id="verBadge">v2.9.6</span>
+          <span class="ver-pill" id="verBadge">v2.9.7</span>
           <span class="ver-pill" id="hdrArchivePill" style="background:rgba(40,205,65,0.14);color:var(--green);">数据档案 0 轮</span>
         </div>
 
@@ -8608,10 +8786,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="admin-box">
             <div class="admin-box-title">
               <span>全员顶部公告栏（跨电脑实时同步 · 冻结置顶）</span>
-              <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;cursor:pointer;">
+              <div style="display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;">
                 <span style="color:var(--sub);">开启展示</span>
                 <label class="ios-switch sm"><input type="checkbox" id="adminAnnEnabled" checked /><span class="ios-slider"></span></label>
-              </label>
+              </div>
             </div>
             <div style="display:grid;grid-template-columns:180px 1fr;gap:10px;font-size:12.5px;">
               <div>
@@ -8669,10 +8847,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div style="border-top:0.5px solid var(--sep);padding-top:10px;margin-top:2px;display:flex;flex-direction:column;gap:9px;font-size:12px;">
               <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
                 <span style="font-weight:700;color:var(--text);">横幅动画 / 视频 / GIF 设置（贴合顶部公告栏横向尺寸）</span>
-                <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+                <div style="display:inline-flex;align-items:center;gap:6px;">
                   <span style="color:var(--sub);">默认静音播放</span>
                   <label class="ios-switch sm"><input type="checkbox" id="adminAnnMuted" checked /><span class="ios-slider"></span></label>
-                </label>
+                </div>
               </div>
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
                 <div>
@@ -8930,7 +9108,13 @@ let aiCandidateTeams = [];
 let memberProfile = null;
 let avatarPresets = [];
 let selectedAvatarUrl = "";
+let _profileAvatarDirty = false;
 let syncSettingsState = {};
+let lastCanRun = true;
+let lastCanUseAi = true;
+let aiSendInFlight = false;
+let adminAnnDraftMediaItems = [];
+let adminAnnActiveIdx = 0;
 let adminToken = sessionStorage.getItem("sheetmate_admin_tok") || "";
 let cloudAccountState = { logged_in: false, account: "", rev: 0, last_synced_ts: 0, last_sync_str: "" };
 let _acctForceFormMode = false;
@@ -9366,6 +9550,8 @@ function renderDtTargets() {
     verifyBtn.textContent = isVerifying ? "识屏中…" : "AI 识屏核对";
     verifyBtn.title = "唤醒桌面钉钉并搜一下这个名字，让 AI 看屏幕核对与您想发送的是否一致";
     verifyBtn.onclick = async () => {
+      const targetRef = cfg.dt_targets[idx];
+      if (!targetRef) return;
       const curName = String(inp.value || "").trim();
       if (!curName) {
         showToast("请先输入群名或联系人名称");
@@ -9377,6 +9563,8 @@ function renderDtTargets() {
       try {
         await flushPendingSave();
         const r = await api("/api/verify-dingtalk-target", "POST", { name: curName }, null, 35000);
+        // 等待期间该行可能被删除或重排，避免把结果写到别的行
+        if (cfg.dt_targets[idx] !== targetRef) return;
         if (r && r.ok && r.matched) {
           const mName = String(r.matched_name || curName).trim();
           const kwUsed = String(r.used_keyword || curName).trim();
@@ -9397,6 +9585,7 @@ function renderDtTargets() {
           };
         }
       } catch (_e) {
+        if (cfg.dt_targets[idx] !== targetRef) return;
         dtVerifyStatusMap[idx] = {
           kind: "warn",
           text: "AI 识屏请求超时或波动，请确认钉钉已登录后再点一次",
@@ -9439,6 +9628,7 @@ function renderDtTargets() {
         useBtn.className = "target-cand-chip";
         useBtn.textContent = `改用钉钉原名：${curSt.matched_name}`;
         useBtn.onclick = () => {
+          if (!cfg.dt_targets[idx]) return;
           cfg.dt_targets[idx].name = curSt.matched_name;
           dtVerifyStatusMap[idx] = {
             kind: "ok",
@@ -9462,6 +9652,7 @@ function renderDtTargets() {
           cBtn.className = "target-cand-chip";
           cBtn.textContent = cand;
           cBtn.onclick = () => {
+            if (!cfg.dt_targets[idx]) return;
             cfg.dt_targets[idx].name = cand;
             dtVerifyStatusMap[idx] = {
               kind: "ok",
@@ -9859,8 +10050,9 @@ function renderAiCustomPhrases() {
   const bar = $("aiCustomPhrasesBar");
   if (!wrap || !bar) return;
   const ai = ensureAiStruct();
+  // 保留原始下标，避免过滤空串后 splice 到错误的条目
   const list = Array.isArray(ai.custom_phrases)
-    ? ai.custom_phrases.map((x) => String(x || "").trim()).filter(Boolean)
+    ? ai.custom_phrases.map((x, i) => ({ phrase: String(x || "").trim(), sourceIdx: i })).filter((e) => e.phrase)
     : [];
   bar.innerHTML = "";
   if (!list.length) {
@@ -9868,7 +10060,8 @@ function renderAiCustomPhrases() {
     return;
   }
   wrap.style.display = "flex";
-  list.forEach((phrase, idx) => {
+  for (const entry of list) {
+    const phrase = entry.phrase;
     const chip = document.createElement("div");
     chip.className = "phrase-chip";
     const btn = document.createElement("button");
@@ -9883,14 +10076,14 @@ function renderAiCustomPhrases() {
     del.title = "删除这条常用话术";
     del.textContent = "\u00D7";
     del.onclick = () => {
-      ensureAiStruct().custom_phrases.splice(idx, 1);
+      ensureAiStruct().custom_phrases.splice(entry.sourceIdx, 1);
       renderAiCustomPhrases();
       scheduleSave(true);
     };
     chip.appendChild(btn);
     chip.appendChild(del);
     bar.appendChild(chip);
-  });
+  }
 }
 
 function saveCurrentAiPhrase() {
@@ -10009,6 +10202,7 @@ function renderDingtalkDatePanel() {
 }
 
 function clampPasteDelay(val, fallback = 3) {
+  if (val === null || val === undefined || val === "") return fallback;
   const n = Number(val);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(0, Math.min(20, Math.round(n)));
@@ -10026,6 +10220,7 @@ function renderDtPasteDelay() {
 }
 
 function clampSendWait(val, fallback = 5) {
+  if (val === null || val === undefined || val === "") return fallback;
   const n = Number(val);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(0, Math.min(30, Math.round(n)));
@@ -10071,6 +10266,7 @@ function renderPipelineTuning() {
 
 function showToast(msg) {
   const el = $("toast");
+  if (!el) return;
   el.textContent = msg;
   el.classList.add("show");
   clearTimeout(el._t);
@@ -10078,7 +10274,11 @@ function showToast(msg) {
 }
 
 async function api(path, method = "GET", body = null, extraHeaders = null, timeoutMs = 15000) {
-  const headers = { "X-Token": TOKEN, "Content-Type": "application/json" };
+  // 仅对本站 /api/ 相对路径附带令牌，避免将来传入外部 URL 时泄露凭据
+  const pathStr = typeof path === "string" ? path : "";
+  const headers = /^\/api\/(?!\/)/.test(pathStr)
+    ? { "X-Token": TOKEN, "Content-Type": "application/json" }
+    : { "Content-Type": "application/json" };
   if (extraHeaders && typeof extraHeaders === "object") {
     Object.assign(headers, extraHeaders);
   }
@@ -10091,8 +10291,21 @@ async function api(path, method = "GET", body = null, extraHeaders = null, timeo
     tm = setTimeout(() => ac.abort(), timeoutMs);
   }
   try {
-    const res = await fetch(path, opts);
-    return await res.json();
+    const res = await fetch(pathStr, opts);
+    // 兼容 204 空响应体与 5xx HTML 错误页，避免 res.json() 直接抛异常
+    let data = null;
+    try {
+      const text = await res.text();
+      data = text ? JSON.parse(text) : {};
+    } catch (_e) {
+      data = {};
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
+    if (!res.ok) {
+      if (data.ok !== false) data.ok = false;
+      if (!data.error) data.error = `HTTP ${res.status}`;
+    }
+    return data;
   } finally {
     if (tm) clearTimeout(tm);
   }
@@ -10157,6 +10370,22 @@ function safeAnnouncementMediaUrl(rawSrc) {
   return "";
 }
 
+function annMediaItemsSig(items) {
+  if (!Array.isArray(items) || !items.length) return "0";
+  let sig = "";
+  for (const it of items) {
+    const src = String((it && it.src) || "");
+    // 对大 base64 负载做 O(n) 滚动哈希，避免每次轮询都分配数 MB 的 JSON 字符串
+    let h = 2166136261;
+    for (let i = 0; i < src.length; i++) {
+      h ^= src.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    sig += `${(it && it.kind) || ""}:${src.length}:${h >>> 0}:${(it && it.title) || ""}:${(it && it.duration_sec) || 0}|`;
+  }
+  return sig;
+}
+
 function normalizeAnnouncementClient(raw) {
   const r = raw && typeof raw === "object" ? raw : {};
   const ef = String(r.effect || "gradient").toLowerCase();
@@ -10209,8 +10438,8 @@ function normalizeAnnouncementClient(raw) {
 }
 
 const _annMediaPlayers = {
-  global: { layerId: "globalAnnMediaLayer", muteBtnId: "globalAnnMuteBtn", mediaSig: "", timer: 0, videoEl: null, index: 0, failCount: 0, pausedByVis: false, lastAnn: null },
-  preview: { layerId: "adminAnnPreviewMediaLayer", muteBtnId: "adminAnnPreviewMuteBtn", mediaSig: "", timer: 0, videoEl: null, index: 0, failCount: 0, pausedByVis: false, lastAnn: null },
+  global: { layerId: "globalAnnMediaLayer", muteBtnId: "globalAnnMuteBtn", mediaSig: "", timer: 0, videoEl: null, index: 0, failCount: 0, pausedByVis: false, lastAnn: null, userToggledMute: false },
+  preview: { layerId: "adminAnnPreviewMediaLayer", muteBtnId: "adminAnnPreviewMuteBtn", mediaSig: "", timer: 0, videoEl: null, index: 0, failCount: 0, pausedByVis: false, lastAnn: null, userToggledMute: false },
 };
 let _annVisBound = false;
 
@@ -10221,6 +10450,8 @@ function _clearAnnVideoEl(st) {
   }
   if (st.videoEl) {
     try {
+      st.videoEl.onloadeddata = null;
+      st.videoEl.onplaying = null;
       st.videoEl.onended = null;
       st.videoEl.onerror = null;
       st.videoEl.pause();
@@ -10283,6 +10514,11 @@ function _mountAnnMediaIndex(slotKey, ann, targetIdx) {
     }
   };
   const armAdvance = (ms, wasErr = false) => {
+    // 先撤销上一次挂载的定时器，避免 onerror 与正常轮播双重触发导致跳播
+    if (st.timer) {
+      clearTimeout(st.timer);
+      st.timer = 0;
+    }
     if (document.hidden) {
       st.pausedByVis = true;
       return;
@@ -10321,6 +10557,8 @@ function _mountAnnMediaIndex(slotKey, ann, targetIdx) {
     const isSingleLoop = (ann.media_mode === "loop_one") || (items.length === 1);
     vid.loop = isSingleLoop;
     vid.src = playUrl;
+    vid.onloadeddata = () => { st.failCount = 0; };
+    vid.onplaying = () => { st.failCount = 0; };
     vid.onended = () => {
       if (!isSingleLoop && ann.media_mode === "loop_all") advanceNext(false);
     };
@@ -10328,15 +10566,21 @@ function _mountAnnMediaIndex(slotKey, ann, targetIdx) {
       armAdvance(220, true);
     };
     st.videoEl = vid;
+    st.userToggledMute = false;
     layer.appendChild(vid);
-    const playP = vid.play();
-    if (playP && typeof playP.catch === "function") playP.catch(() => {});
+    if (document.hidden) {
+      st.pausedByVis = true;
+    } else {
+      const playP = vid.play();
+      if (playP && typeof playP.catch === "function") playP.catch(() => {});
+    }
     if (mbtn) {
       mbtn.classList.add("show");
       mbtn.textContent = vid.muted ? "已静音" : "有声";
       mbtn.onclick = (e) => {
         e.stopPropagation();
         if (!st.videoEl) return;
+        st.userToggledMute = true;
         st.videoEl.muted = !st.videoEl.muted;
         mbtn.textContent = st.videoEl.muted ? "已静音" : "有声";
       };
@@ -10398,9 +10642,9 @@ function renderAnnMediaPlayer(slotKey, ann) {
     return;
   }
   st.lastAnn = ann;
-  const nextMediaSig = `${ann.media_mode}|${ann.media_active_idx}|${JSON.stringify(ann.media_items)}`;
+  const nextMediaSig = `${ann.media_mode}|${ann.media_active_idx}|${annMediaItemsSig(ann.media_items)}`;
   if (st.mediaSig === nextMediaSig) {
-    if (st.videoEl) {
+    if (st.videoEl && !st.userToggledMute) {
       st.videoEl.muted = Boolean(ann.media_muted);
       const mbtn = $(st.muteBtnId);
       if (mbtn) mbtn.textContent = st.videoEl.muted ? "已静音" : "有声";
@@ -10425,7 +10669,7 @@ function applyAnnouncementToDom(annRaw, isPreview = false) {
   const hasActiveMedia = Boolean(ann.media_mode !== "none" && ann.media_items.length > 0);
   const shouldHide = !isPreview && (!ann.enabled || (!ann.text && !hasActiveMedia));
   const hideTextEffective = hasActiveMedia && (ann.text_overlay === "hide" || (!ann.text && !isPreview));
-  const sig = `${ann.enabled ? 1 : 0}|${ann.badge}|${ann.text}|${ann.effect}|${ann.theme}|${ann.font_size}|${ann.speed}|${ann.media_mode}|${ann.media_active_idx}|${ann.media_muted ? 1 : 0}|${ann.media_fit}|${ann.banner_height}|${ann.text_overlay}|${JSON.stringify(ann.media_items)}|${ann.updated_at}|${ann.rev}`;
+  const sig = `${ann.enabled ? 1 : 0}|${ann.badge}|${ann.text}|${ann.effect}|${ann.theme}|${ann.font_size}|${ann.speed}|${ann.media_mode}|${ann.media_active_idx}|${ann.media_muted ? 1 : 0}|${ann.media_fit}|${ann.banner_height}|${ann.text_overlay}|${annMediaItemsSig(ann.media_items)}|${ann.updated_at}|${ann.rev}`;
   if (!isPreview && sig === _lastGlobalAnnSig) return;
   if (!isPreview) _lastGlobalAnnSig = sig;
 
@@ -10531,11 +10775,18 @@ function scrollStageToElement(el, behavior = "smooth") {
 }
 
 function switchTab(name) {
-  const idx = Math.max(0, TAB_ORDER.indexOf(name));
-  $("tabPillBg").style.transform = `translateX(${idx * 100}%)`;
-  for (const btn of $("tabbar").querySelectorAll(".tab-btn")) {
-    btn.classList.toggle("active", btn.dataset.tab === name);
+  // 未知 tab 名回退到 home，避免出现药丸在首页但内容全空的脏状态
+  const safeName = TAB_ORDER.includes(name) ? name : "home";
+  const idx = TAB_ORDER.indexOf(safeName);
+  const pillBg = $("tabPillBg");
+  if (pillBg) pillBg.style.transform = `translateX(${idx * 100}%)`;
+  const tabbar = $("tabbar");
+  if (tabbar) {
+    for (const btn of tabbar.querySelectorAll(".tab-btn")) {
+      btn.classList.toggle("active", btn.dataset.tab === safeName);
+    }
   }
+  name = safeName;
   for (const pane of document.querySelectorAll(".tab-pane")) {
     pane.classList.toggle("active", pane.id === `pane-${name}`);
   }
@@ -10558,7 +10809,9 @@ function jumpToModule(tabName, targetSelector, focusSelector = "") {
     if (targetSelector === "#summaryPresetsSection" && $("spAccordion")) {
       $("spAccordion").classList.add("open");
     }
-    const tgtEl = targetSelector ? document.querySelector(targetSelector) : null;
+    // 非法选择器会让 querySelector 抛 SyntaxError，这里安全降级为不跳转
+    let tgtEl = null;
+    try { tgtEl = targetSelector ? document.querySelector(targetSelector) : null; } catch (_e) {}
     if (tgtEl) {
       if (tabName === "home" && targetSelector === "#aiCardBox" && window.innerWidth > 680) {
         const stg = $("scrollStage");
@@ -10572,12 +10825,48 @@ function jumpToModule(tabName, targetSelector, focusSelector = "") {
       setTimeout(() => tgtEl.classList.remove("module-focus-pulse"), 2400);
     }
     if (focusSelector) {
-      const fEl = document.querySelector(focusSelector);
+      let fEl = null;
+      try { fEl = document.querySelector(focusSelector); } catch (_e) {}
       if (fEl && typeof fEl.focus === "function") {
         setTimeout(() => { try { fEl.focus(); } catch (_e) {} }, 120);
       }
     }
   }, 60);
+}
+
+const _iosAlertQueue = [];
+let _iosAlertActive = false;
+function _pumpIosAlertQueue() {
+  if (_iosAlertActive || !_iosAlertQueue.length) return;
+  _iosAlertActive = true;
+  const item = _iosAlertQueue.shift();
+  $("alertTitle").textContent = item.title;
+  $("alertMsg").textContent = item.msg;
+  const actions = $("alertActions");
+  const cancelBtn = $("alertCancel");
+  const okBtn = $("alertOk");
+  okBtn.textContent = item.okText;
+  okBtn.className = "alert-btn " + (item.danger ? "danger" : "");
+  if (item.cancelText) {
+    actions.classList.remove("single");
+    cancelBtn.style.display = "block";
+    cancelBtn.textContent = item.cancelText;
+  } else {
+    actions.classList.add("single");
+    cancelBtn.style.display = "none";
+  }
+  const mask = $("modalMask");
+  mask.classList.add("show");
+  const done = (v) => {
+    okBtn.onclick = null;
+    cancelBtn.onclick = null;
+    mask.classList.remove("show");
+    _iosAlertActive = false;
+    item.resolve(v);
+    _pumpIosAlertQueue();
+  };
+  okBtn.onclick = () => done(true);
+  cancelBtn.onclick = () => done(false);
 }
 
 function iosAlert(title, msg, { okText = "好", cancelText = null, danger = false } = {}) {
@@ -10586,26 +10875,8 @@ function iosAlert(title, msg, { okText = "好", cancelText = null, danger = fals
     return Promise.resolve(true);
   }
   return new Promise((resolve) => {
-    $("alertTitle").textContent = title;
-    $("alertMsg").textContent = msg;
-    const actions = $("alertActions");
-    const cancelBtn = $("alertCancel");
-    const okBtn = $("alertOk");
-    okBtn.textContent = okText;
-    okBtn.className = "alert-btn " + (danger ? "danger" : "");
-    if (cancelText) {
-      actions.classList.remove("single");
-      cancelBtn.style.display = "block";
-      cancelBtn.textContent = cancelText;
-    } else {
-      actions.classList.add("single");
-      cancelBtn.style.display = "none";
-    }
-    const mask = $("modalMask");
-    mask.classList.add("show");
-    const done = (v) => { mask.classList.remove("show"); resolve(v); };
-    okBtn.onclick = () => done(true);
-    cancelBtn.onclick = () => done(false);
+    _iosAlertQueue.push({ title, msg, okText, cancelText, danger, resolve });
+    _pumpIosAlertQueue();
   });
 }
 
@@ -11691,7 +11962,15 @@ async function _commitConfigSave(showSavedToast = false) {
       latestTimetable = res.timetable;
       renderTimetable(res.timetable);
     }
+    if (res && res.ok === false) {
+      configDirty = true;
+      showToast(res.message || "保存失败，请稍后重试");
+      return;
+    }
     if (showSavedToast) showToast("设置已保存");
+  } catch (_errSave) {
+    configDirty = true;
+    showToast("保存请求失败，待下次操作或重试自动保存");
   } finally {
     saveInFlight = false;
     if (savePendingResync) {
@@ -12168,6 +12447,15 @@ let cachedChatHistory = [];
 let lastSpotlightSeq = 0;
 let lastChatSeq = -1;
 async function sendAiSummary(styleId, rawPrompt) {
+  if (!lastCanUseAi) {
+    showToast("当前团队设置暂未开放本机 AI 对话功能");
+    return;
+  }
+  if (aiSendInFlight) {
+    showToast("上一条消息仍在回复中，请稍候…");
+    return;
+  }
+  aiSendInFlight = true;
   const input = $("aiChatInput");
   const popInput = $("aiPopoutInput");
   const promptText = String(rawPrompt !== undefined ? rawPrompt : (input ? input.value : "")).trim();
@@ -12230,9 +12518,10 @@ async function sendAiSummary(styleId, rawPrompt) {
       showToast("AI 总结请求波动，请稍后重试");
     }
   } finally {
+    aiSendInFlight = false;
     stopAiThinking();
-    if ($("aiSendBtn")) $("aiSendBtn").disabled = false;
-    if ($("aiPopoutSendBtn")) $("aiPopoutSendBtn").disabled = false;
+    if ($("aiSendBtn")) $("aiSendBtn").disabled = !lastCanUseAi;
+    if ($("aiPopoutSendBtn")) $("aiPopoutSendBtn").disabled = !lastCanUseAi;
   }
 }
 
@@ -12243,6 +12532,7 @@ async function pollState() {
   pollInFlight = true;
   try {
     const st = await api(`/api/state?since=${lastLogSeq}`, "GET", null, null, 4500);
+    if (!st || st.ok === false || !st.version) return;
     $("verBadge").textContent = `v${st.version}`;
     if (previewMemberUid) {
       updateTeamLockBanner(st.lock_status, st.queue_status, st.member_profile);
@@ -12332,9 +12622,12 @@ async function pollState() {
 
     $("lastRun").textContent = st.last_run_str || "—";
     $("sumNextRun").textContent = st.next_run_str && st.next_run_str !== "—" && cd ? `${st.next_run_str} (${cd})` : (st.next_run_str || "—");
-    $("btnNow").disabled = busy;
-    $("btnCapture").disabled = busy;
-    if ($("btnRunRawSyncNow")) $("btnRunRawSyncNow").disabled = busy;
+    if (!previewMemberUid && st.permissions) {
+      applyPermissionsUI(st.permissions);
+    }
+    $("btnNow").disabled = Boolean(busy || !lastCanRun);
+    $("btnCapture").disabled = Boolean(busy || !lastCanRun);
+    if ($("btnRunRawSyncNow")) $("btnRunRawSyncNow").disabled = Boolean(busy || !lastCanRun);
     if ($("rawSyncStatusHint") && cfg && cfg.raw_sync && cfg.raw_sync.enabled) {
       renderRawSyncControls(st.schedule_running ? (st.next_raw_sync_str || "") : "");
     }
@@ -12400,9 +12693,10 @@ async function pollState() {
     if (!previewMemberUid && st.permissions) {
       applyPermissionsUI(st.permissions);
     }
-    if (!previewMemberUid && st.remote_config_pulled) {
+    if (!previewMemberUid && !configDirty && st.remote_config_pulled) {
       const fresh = await api("/api/config");
-      if (fresh && fresh.config) {
+      if (previewMemberUid || configDirty) return;
+      if (fresh && fresh.ok !== false && fresh.config) {
         cfg = fresh.config;
         latestTimetable = Array.isArray(fresh.timetable) ? fresh.timetable : latestTimetable;
         if (fresh.ai_meta) {
@@ -12660,22 +12954,36 @@ function bindEvents() {
     }
   });
   $("aiClearChatBtn").onclick = async () => {
-    await api("/api/ai-summary", "POST", { action: "clear" });
+    const cr = await api("/api/ai-summary", "POST", { action: "clear" });
+    if (cr && typeof cr.chat_seq === "number") lastChatSeq = cr.chat_seq;
     cachedChatHistory = [];
     renderAiChatFeed([]);
     showToast("对话记录已清空");
   };
   $("aiSuggestBtn").onclick = async () => {
+    if (!lastCanUseAi) {
+      showToast("当前团队设置暂未开放本机 AI 对话功能");
+      return;
+    }
+    if (previewMemberUid) {
+      showToast("成员预览模式下不支持数据自检写入，请先退出预览");
+      return;
+    }
     $("aiSendBtn").disabled = true;
+    if ($("aiSuggestBtn")) $("aiSuggestBtn").disabled = true;
     renderAiChatFeed(cachedChatHistory, "请审核我当前的排期、表格日期和钉钉配置，给几条防踩坑优化建议");
     try {
       await api("/api/config", "POST", collectConfigFromDOM());
       const res = await api("/api/ai-diagnose", "POST", { mode: "suggest" }, null, 65000);
       cachedChatHistory.push({ role: "user", text: "请审核我当前的排期、表格日期和钉钉配置，给几条优化建议", time: "" });
-      cachedChatHistory.push({ role: "model", text: res.reply || "暂无建议", time: res.time || "", model: res.model || "", source: res.source || "" });
+      cachedChatHistory.push({ role: "model", text: (res && res.reply) || "暂无建议", time: (res && res.time) || "", model: (res && res.model) || "", source: (res && res.source) || "" });
       renderAiChatFeed(cachedChatHistory);
+    } catch (_e) {
+      renderAiChatFeed(cachedChatHistory);
+      showToast("数据自检请求失败，请稍后重试");
     } finally {
-      $("aiSendBtn").disabled = false;
+      $("aiSendBtn").disabled = !lastCanUseAi;
+      if ($("aiSuggestBtn")) $("aiSuggestBtn").disabled = !lastCanUseAi;
     }
   };
 
@@ -12687,7 +12995,7 @@ function bindEvents() {
     b.onclick = () => { cfg.dt_date_fmt = b.dataset.val; renderDingtalkDatePanel(); scheduleSave(true); };
   }
   for (const b of $("dtOffsetQuickSeg").querySelectorAll(".mini-seg-btn")) {
-    b.onclick = () => { cfg.dt_day_offset = Number(b.dataset.off); renderDingtalkDatePanel(); scheduleSave(true); };
+    b.onclick = () => { cfg.dt_day_offset = clampOff(b.dataset.off, 0); renderDingtalkDatePanel(); scheduleSave(true); };
   }
   $("dtOffMinusBtn").onclick = () => { cfg.dt_day_offset = clampOff((cfg.dt_day_offset || 0) - 1, 0); renderDingtalkDatePanel(); scheduleSave(true); };
   $("dtOffPlusBtn").onclick = () => { cfg.dt_day_offset = clampOff((cfg.dt_day_offset || 0) + 1, 0); renderDingtalkDatePanel(); scheduleSave(true); };
@@ -12933,12 +13241,12 @@ function bindEvents() {
   }
   $("clearSuffixBtn").onclick = () => { $("dtSuffix").value = ""; scheduleSave(true); };
 
-  $("dayStartBtn").onclick = () => openPicker({ title: "白天开始时间", mode: "time", h: cfg.day.sh, m: cfg.day.sm, onConfirm: (h, m) => { cfg.day.sh = h; cfg.day.sm = m; scheduleSave(true); } });
-  $("dayEndBtn").onclick = () => openPicker({ title: "白天结束时间", mode: "time", h: cfg.day.eh, m: cfg.day.em, onConfirm: (h, m) => { cfg.day.eh = h; cfg.day.em = m; scheduleSave(true); } });
-  $("dayGapBtn").onclick = () => openPicker({ title: "白天执行间隔", mode: "gap", h: cfg.day.ih, m: cfg.day.im, onConfirm: (h, m) => { cfg.day.ih = h; cfg.day.im = m; scheduleSave(true); } });
-  $("nightStartBtn").onclick = () => openPicker({ title: "晚上开始时间", mode: "time", h: cfg.night.sh, m: cfg.night.sm, onConfirm: (h, m) => { cfg.night.sh = h; cfg.night.sm = m; scheduleSave(true); } });
-  $("nightEndBtn").onclick = () => openPicker({ title: "晚上结束时间", mode: "time", h: cfg.night.eh, m: cfg.night.em, onConfirm: (h, m) => { cfg.night.eh = h; cfg.night.em = m; scheduleSave(true); } });
-  $("nightGapBtn").onclick = () => openPicker({ title: "晚上执行间隔", mode: "gap", h: cfg.night.ih, m: cfg.night.im, onConfirm: (h, m) => { cfg.night.ih = h; cfg.night.im = m; scheduleSave(true); } });
+  $("dayStartBtn").onclick = () => { const d = (cfg && cfg.day) || (cfg.day = { sh: 9, sm: 0, eh: 18, em: 0, ih: 2, im: 0 }); openPicker({ title: "白天开始时间", mode: "time", h: d.sh, m: d.sm, onConfirm: (h, m) => { d.sh = h; d.sm = m; scheduleSave(true); } }); };
+  $("dayEndBtn").onclick = () => { const d = (cfg && cfg.day) || (cfg.day = { sh: 9, sm: 0, eh: 18, em: 0, ih: 2, im: 0 }); openPicker({ title: "白天结束时间", mode: "time", h: d.eh, m: d.em, onConfirm: (h, m) => { d.eh = h; d.em = m; scheduleSave(true); } }); };
+  $("dayGapBtn").onclick = () => { const d = (cfg && cfg.day) || (cfg.day = { sh: 9, sm: 0, eh: 18, em: 0, ih: 2, im: 0 }); openPicker({ title: "白天执行间隔", mode: "gap", h: d.ih, m: d.im, onConfirm: (h, m) => { d.ih = h; d.im = m; scheduleSave(true); } }); };
+  $("nightStartBtn").onclick = () => { const n = (cfg && cfg.night) || (cfg.night = { sh: 18, sm: 0, eh: 23, em: 0, ih: 2, im: 0 }); openPicker({ title: "晚上开始时间", mode: "time", h: n.sh, m: n.sm, onConfirm: (h, m) => { n.sh = h; n.sm = m; scheduleSave(true); } }); };
+  $("nightEndBtn").onclick = () => { const n = (cfg && cfg.night) || (cfg.night = { sh: 18, sm: 0, eh: 23, em: 0, ih: 2, im: 0 }); openPicker({ title: "晚上结束时间", mode: "time", h: n.eh, m: n.em, onConfirm: (h, m) => { n.eh = h; n.em = m; scheduleSave(true); } }); };
+  $("nightGapBtn").onclick = () => { const n = (cfg && cfg.night) || (cfg.night = { sh: 18, sm: 0, eh: 23, em: 0, ih: 2, im: 0 }); openPicker({ title: "晚上执行间隔", mode: "gap", h: n.ih, m: n.im, onConfirm: (h, m) => { n.ih = h; n.im = m; scheduleSave(true); } }); };
 
   $("pickerCancel").onclick = () => $("pickerMask").classList.remove("show");
   $("pickerMask").onclick = (e) => { if (e.target === $("pickerMask")) $("pickerMask").classList.remove("show"); };
@@ -13251,11 +13559,15 @@ function bindEvents() {
 
   $("resetBtn").onclick = async () => {
     const res = await api("/api/reset", "POST");
+    if (!res || !res.config) {
+      showToast((res && res.message) || "恢复默认设置失败");
+      return;
+    }
     cfg = res.config;
     latestTimetable = Array.isArray(res.timetable) ? res.timetable : [];
     renderConfig();
     renderTimetable(latestTimetable);
-    showToast("已恢复默认设置");
+    showToast((res && res.ok === false && res.message) ? res.message : "已恢复默认设置");
   };
 
   $("updateBtn").onclick = async () => {
@@ -13297,14 +13609,18 @@ function updateMemberTopChip(prof) {
 
 function applyPermissionsUI(perms) {
   const p = perms && typeof perms === "object" ? perms : {};
-  const sig = `${Boolean(lastBusyState)}|${p.can_run !== false}|${p.can_use_ai !== false}`;
+  lastCanRun = p.can_run !== false;
+  lastCanUseAi = p.can_use_ai !== false;
+  const sig = `${Boolean(lastBusyState)}|${lastCanRun}|${lastCanUseAi}`;
   if (sig === lastPermsSig) return;
   lastPermsSig = sig;
-  if ($("btnNow")) $("btnNow").disabled = Boolean(lastBusyState || p.can_run === false);
-  if ($("btnCapture")) $("btnCapture").disabled = Boolean(lastBusyState || p.can_run === false);
-  if ($("btnRunRawSyncNow")) $("btnRunRawSyncNow").disabled = Boolean(lastBusyState || p.can_run === false);
-  if ($("aiSendBtn")) $("aiSendBtn").disabled = (p.can_use_ai === false);
-  if ($("aiChatInput")) $("aiChatInput").disabled = (p.can_use_ai === false);
+  if ($("btnNow")) $("btnNow").disabled = Boolean(lastBusyState || !lastCanRun);
+  if ($("btnCapture")) $("btnCapture").disabled = Boolean(lastBusyState || !lastCanRun);
+  if ($("btnRunRawSyncNow")) $("btnRunRawSyncNow").disabled = Boolean(lastBusyState || !lastCanRun);
+  if ($("aiSendBtn")) $("aiSendBtn").disabled = (!lastCanUseAi || aiSendInFlight);
+  if ($("aiPopoutSendBtn")) $("aiPopoutSendBtn").disabled = (!lastCanUseAi || aiSendInFlight);
+  if ($("aiSuggestBtn")) $("aiSuggestBtn").disabled = !lastCanUseAi;
+  if ($("aiChatInput")) $("aiChatInput").disabled = !lastCanUseAi;
 }
 
 function updateTeamLockBanner(lockSt, queueSt, prof) {
@@ -13342,6 +13658,10 @@ function openLockWaitModal(holder, runType) {
 }
 
 async function applyFocusTeamUpdate(rawTeam, toastMsg = "") {
+  if (previewMemberUid) {
+    showToast("成员预览模式下暂不修改本机聚焦团队");
+    return;
+  }
   const val = String(rawTeam || "").trim();
   const ai = ensureAiStruct();
   ai.focus_team = val;
@@ -13373,6 +13693,7 @@ function renderAvatarPresetsGrid() {
     item.className = "avatar-preset-opt" + (selectedAvatarUrl === safeUrl ? " active" : "");
     item.innerHTML = `<img src="${safeUrl}" alt="" /><span>${escapeHtmlStr(av.name)}</span>`;
     item.onclick = async () => {
+      _profileAvatarDirty = true;
       selectedAvatarUrl = safeUrl;
       $("profileAvatarPreview").src = safeUrl;
       if ($("memberMiniAvatar")) $("memberMiniAvatar").src = safeUrl;
@@ -13392,6 +13713,7 @@ function renderAvatarPresetsGrid() {
 }
 
 async function openProfileModal() {
+  _profileAvatarDirty = false;
   const prof0 = memberProfile || {};
   if (!selectedAvatarUrl) {
     selectedAvatarUrl = safeAvatarUrl(prof0.avatar) || safeAvatarUrl(avatarPresets[0] && avatarPresets[0].url);
@@ -13406,31 +13728,39 @@ async function openProfileModal() {
     if (Array.isArray(data && data.presets) && data.presets.length) avatarPresets = data.presets;
     if (data && data.sync_settings) syncSettingsState = data.sync_settings;
     const prof = memberProfile || {};
-    selectedAvatarUrl = safeAvatarUrl(prof.avatar) || safeAvatarUrl(avatarPresets[0] && avatarPresets[0].url);
+    if (!_profileAvatarDirty) {
+      selectedAvatarUrl = safeAvatarUrl(prof.avatar) || safeAvatarUrl(avatarPresets[0] && avatarPresets[0].url);
+      if ($("profileAvatarPreview")) $("profileAvatarPreview").src = selectedAvatarUrl;
+      renderAvatarPresetsGrid();
+    }
     if ($("profileNicknameInput") && document.activeElement !== $("profileNicknameInput")) {
       $("profileNicknameInput").value = prof.nickname || "";
     }
-    if ($("profileAvatarPreview")) $("profileAvatarPreview").src = selectedAvatarUrl;
-    renderAvatarPresetsGrid();
   } catch (_e) {}
 }
 
 function resizeUploadedAvatar(file) {
   return new Promise((resolve) => {
     const reader = new FileReader();
+    reader.onerror = () => resolve("");
     reader.onload = () => {
       const img = new Image();
+      img.onerror = () => resolve("");
       img.onload = () => {
-        const size = 96;
-        const c = document.createElement("canvas");
-        c.width = size;
-        c.height = size;
-        const ctx = c.getContext("2d");
-        const side = Math.min(img.width, img.height);
-        const sx = Math.max(0, (img.width - side) / 2);
-        const sy = Math.max(0, (img.height - side) / 2);
-        ctx.drawImage(img, sx, sy, side, side, 0, 0, size, size);
-        resolve(c.toDataURL("image/jpeg", 0.85));
+        try {
+          const size = 96;
+          const c = document.createElement("canvas");
+          c.width = size;
+          c.height = size;
+          const ctx = c.getContext("2d");
+          const side = Math.min(img.width, img.height);
+          const sx = Math.max(0, (img.width - side) / 2);
+          const sy = Math.max(0, (img.height - side) / 2);
+          ctx.drawImage(img, sx, sy, side, side, 0, 0, size, size);
+          resolve(c.toDataURL("image/jpeg", 0.85));
+        } catch (_e) {
+          resolve("");
+        }
       };
       img.src = String(reader.result || "");
     };
@@ -13468,12 +13798,142 @@ async function loadAdminDashboard() {
   if (!res || res.auth_required) {
     adminToken = "";
     sessionStorage.removeItem("sheetmate_admin_tok");
+    destroyAnnMediaPlayer("preview");
     $("adminConsoleMask").classList.remove("show");
     $("adminAuthMask").classList.add("show");
     return;
   }
   adminDashData = res;
   renderAdminDashboard(res);
+}
+
+function readAdminAnnouncementForm() {
+  const pick = (segId, defVal) => {
+    const seg = $(segId);
+    const act = seg ? seg.querySelector(".mini-seg-btn.active") : null;
+    return act ? act.dataset.val : defVal;
+  };
+  const txtVal = $("adminAnnText") ? $("adminAnnText").value : "";
+  if ($("adminAnnCharCount")) $("adminAnnCharCount").textContent = `${txtVal.length} / 300`;
+  const clampedIdx = adminAnnDraftMediaItems.length
+    ? Math.max(0, Math.min(adminAnnDraftMediaItems.length - 1, adminAnnActiveIdx))
+    : 0;
+  return {
+    enabled: $("adminAnnEnabled") ? Boolean($("adminAnnEnabled").checked) : true,
+    badge: $("adminAnnBadge") ? $("adminAnnBadge").value.trim() : "全员公告",
+    text: txtVal,
+    effect: pick("adminAnnEffectSeg", "gradient"),
+    theme: pick("adminAnnThemeSeg", "ocean"),
+    font_size: pick("adminAnnSizeSeg", "md"),
+    speed: pick("adminAnnSpeedSeg", "normal"),
+    media_mode: pick("adminAnnMediaModeSeg", "none"),
+    media_active_idx: clampedIdx,
+    media_muted: $("adminAnnMuted") ? Boolean($("adminAnnMuted").checked) : true,
+    media_fit: pick("adminAnnFitSeg", "cover"),
+    banner_height: pick("adminAnnHeightSeg", "normal"),
+    text_overlay: pick("adminAnnTextOverlaySeg", "overlay"),
+    media_items: adminAnnDraftMediaItems.map((x) => ({ ...x })),
+  };
+}
+function refreshAdminAnnPreview() { applyAnnouncementToDom(readAdminAnnouncementForm(), true); }
+
+function renderAdminAnnMediaList() {
+  const listEl = $("adminAnnMediaList");
+  if (!listEl) return;
+  listEl.innerHTML = "";
+  if (!adminAnnDraftMediaItems.length) {
+    const tip = document.createElement("div");
+    tip.className = "empty-rule-tip";
+    tip.textContent = "暂未添加横幅视频、GIF 或动画；可通过上方按钮上传文件、添加内置动画或粘贴链接";
+    listEl.appendChild(tip);
+    return;
+  }
+  const kindLbl = { video: "视频", gif: "动图GIF", image: "图片", anim: "内置动画" };
+  adminAnnDraftMediaItems.forEach((it, idx) => {
+    const row = document.createElement("div");
+    row.className = "target-item-row";
+    row.style.cssText = "gap:8px;flex-wrap:wrap;padding:7px 10px;";
+
+    const leftInfo = document.createElement("div");
+    leftInfo.style.cssText = "flex:1;min-width:160px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;";
+    const tag = document.createElement("span");
+    tag.className = "tt-pill " + (idx === adminAnnActiveIdx ? "tgt-on" : "date-on");
+    tag.textContent = `${idx + 1}. ${kindLbl[it.kind] || "媒体"}`;
+    const tit = document.createElement("span");
+    tit.style.cssText = "font-weight:700;font-size:12px;color:var(--text);";
+    tit.textContent = it.title || "横幅媒体";
+    const srcInfo = document.createElement("span");
+    srcInfo.style.cssText = "font-size:11px;color:var(--sub);max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+    srcInfo.textContent = it.src.startsWith("data:") ? "[云同步内联文件]" : (it.src.startsWith("/api/") ? "[本机高清媒体]" : (it.src.startsWith("anim:") ? "[零流量CSS动效]" : it.src));
+    leftInfo.appendChild(tag);
+    leftInfo.appendChild(tit);
+    leftInfo.appendChild(srcInfo);
+
+    const ctrls = document.createElement("div");
+    ctrls.style.cssText = "display:flex;align-items:center;gap:5px;flex-wrap:wrap;";
+    if (it.kind !== "video") {
+      const secBtn = document.createElement("button");
+      secBtn.type = "button";
+      secBtn.className = "mini-pill";
+      secBtn.textContent = `${it.duration_sec || 8}秒`;
+      secBtn.title = "点击循环切换轮播停留秒数 (5s/8s/12s/20s)";
+      secBtn.onclick = () => {
+        const seq = [5, 8, 12, 20];
+        const cur = Number(it.duration_sec || 8);
+        it.duration_sec = seq[(seq.indexOf(cur) + 1) % seq.length];
+        renderAdminAnnMediaList();
+        refreshAdminAnnPreview();
+      };
+      ctrls.appendChild(secBtn);
+    }
+
+    const pickBtn = document.createElement("button");
+    pickBtn.type = "button";
+    pickBtn.className = "mini-pill" + (idx === adminAnnActiveIdx ? " active" : "");
+    pickBtn.textContent = idx === adminAnnActiveIdx ? "单条选中" : "设为单条";
+    pickBtn.onclick = () => {
+      adminAnnActiveIdx = idx;
+      renderAdminAnnMediaList();
+      refreshAdminAnnPreview();
+    };
+    ctrls.appendChild(pickBtn);
+
+    if (idx > 0) {
+      const upBtn = document.createElement("button");
+      upBtn.type = "button";
+      upBtn.className = "mini-pill";
+      upBtn.textContent = "上移";
+      upBtn.onclick = () => {
+        const tmp = adminAnnDraftMediaItems[idx - 1];
+        adminAnnDraftMediaItems[idx - 1] = adminAnnDraftMediaItems[idx];
+        adminAnnDraftMediaItems[idx] = tmp;
+        if (adminAnnActiveIdx === idx) adminAnnActiveIdx = idx - 1;
+        else if (adminAnnActiveIdx === idx - 1) adminAnnActiveIdx = idx;
+        renderAdminAnnMediaList();
+        refreshAdminAnnPreview();
+      };
+      ctrls.appendChild(upBtn);
+    }
+
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "mini-pill";
+    delBtn.style.color = "var(--red)";
+    delBtn.textContent = "删除";
+    delBtn.onclick = () => {
+      adminAnnDraftMediaItems.splice(idx, 1);
+      if (adminAnnActiveIdx >= adminAnnDraftMediaItems.length) {
+        adminAnnActiveIdx = Math.max(0, adminAnnDraftMediaItems.length - 1);
+      }
+      renderAdminAnnMediaList();
+      refreshAdminAnnPreview();
+    };
+    ctrls.appendChild(delBtn);
+
+    row.appendChild(leftInfo);
+    row.appendChild(ctrls);
+    listEl.appendChild(row);
+  });
 }
 
 function renderAdminDashboard(d) {
@@ -13512,7 +13972,7 @@ function renderAdminDashboard(d) {
   const lckSt = d.lock_status || {};
   const lck = lckSt.lock || {};
   if (lckSt.locked && lck.holder_id) {
-    const qNames = (lckSt.queue || []).map((q) => q.display_name).join("、");
+    const qNames = (lckSt.queue || []).map((q) => q.name || q.display_name || "成员").join("、");
     $("adminLockDetail").innerHTML = `<div><strong>当前占用人：</strong>${escapeHtmlStr(lck.holder_name)} (${escapeHtmlStr(lck.mode_label)}) - ${escapeHtmlStr(lck.step_text)}</div><div style="margin-top:4px;color:var(--sub);">排队队列(${(lckSt.queue || []).length})：${escapeHtmlStr(qNames || "暂无排队")}</div>`;
   } else {
     $("adminLockDetail").textContent = "当前空闲，无人占用表格锁。";
@@ -13548,7 +14008,8 @@ function renderAdminDashboard(d) {
     for (const r of rlist.slice(0, 20)) {
       const row = document.createElement("div");
       row.className = "feed-item";
-      row.innerHTML = `<div style="display:flex;justify-content:space-between;"><strong>${escapeHtmlStr(r.member_name || r.display_name || "成员")} (${r.mode === "capture_only" ? "仅截图" : "全流程"} · ${r.trigger_type === "schedule" ? "定时" : "手动"})</strong><span style="color:${r.status === "ok" ? "var(--green)" : "var(--red)"}">${r.status === "ok" ? "成功" : escapeHtmlStr(r.err_code || r.status || "异常")} · ${Number(r.duration_sec) || 0}s</span></div><div style="color:var(--sub);">${escapeHtmlStr(r.ts)}</div>`;
+      const mLabel = ({ full: "全流程", capture_only: "仅截图", raw_sync: "刷底表", text_send: "发文字" }[r.mode] || "全流程");
+      row.innerHTML = `<div style="display:flex;justify-content:space-between;"><strong>${escapeHtmlStr(r.member_name || r.display_name || "成员")} (${mLabel} · ${r.trigger_type === "schedule" ? "定时" : "手动"})</strong><span style="color:${r.status === "ok" ? "var(--green)" : "var(--red)"}">${r.status === "ok" ? "成功" : escapeHtmlStr(r.err_code || r.status || "异常")} · ${Number(r.duration_sec) || 0}s</span></div><div style="color:var(--sub);">${escapeHtmlStr(r.ts)}</div>`;
       runsWrap.appendChild(row);
     }
   }
@@ -13738,7 +14199,7 @@ function renderAdminDashboard(d) {
           <span style="font-size:11.5px;color:var(--sub);">${escapeHtmlStr(fb.ts || "")}</span>
         </div>
         <div style="font-size:13px;white-space:pre-wrap;">${escapeHtmlStr(fb.content || "")}</div>
-        ${(() => { const cbSnap = fb.config_brief || fb.config_snapshot || {}; return `<div style="font-size:11.5px;color:var(--sub);">附带状态快照：目标群=${escapeHtmlStr(cbSnap.dt_search || "-")} · 粘贴等待=${Number(cbSnap.dt_paste_delay_sec) || 3}s · 静音发送=${Boolean(cbSnap.dt_silent_send)} · 自动发=${Boolean(cbSnap.dt_auto_send)}</div>`; })()}
+        ${(() => { const cbSnap = fb.config_brief || fb.config_snapshot || {}; return `<div style="font-size:11.5px;color:var(--sub);">附带状态快照：目标群=${escapeHtmlStr(cbSnap.dt_search || "-")} · 粘贴等待=${Number.isFinite(Number(cbSnap.dt_paste_delay_sec)) ? Number(cbSnap.dt_paste_delay_sec) : 3}s · 静音发送=${Boolean(cbSnap.dt_silent_send)} · 自动发=${Boolean(cbSnap.dt_auto_send)}</div>`; })()}
         <div style="display:flex;gap:6px;align-items:center;">
           <input type="text" class="small-input js-fb-reply" style="flex:1;" value="${escapeHtmlStr(fb.admin_reply || "")}" placeholder="填写处理回复或备注" />
           <button type="button" class="pill-action-btn ok js-fb-done">标为已处理</button>
@@ -13807,6 +14268,7 @@ function renderAdminDashboard(d) {
 }
 
 function enterAdminMemberPreview(mem) {
+  destroyAnnMediaPlayer("preview");
   if (!selfPreviewBackup) {
     selfPreviewBackup = { cfg: JSON.parse(JSON.stringify(cfg)), logs: allLogItems.slice() };
   }
@@ -14060,7 +14522,13 @@ function bindTeamCollabAndAdminEvents() {
   $("profileAvatarFileInput").onchange = async (ev) => {
     const f = ev.target.files && ev.target.files[0];
     if (!f) return;
-    selectedAvatarUrl = await resizeUploadedAvatar(f);
+    const resized = await resizeUploadedAvatar(f);
+    if (!resized) {
+      showToast("无法读取该图片，请换一张 JPG/PNG/WebP 图片");
+      return;
+    }
+    _profileAvatarDirty = true;
+    selectedAvatarUrl = resized;
     $("profileAvatarPreview").src = selectedAvatarUrl;
     if ($("memberMiniAvatar")) $("memberMiniAvatar").src = selectedAvatarUrl;
     for (const ch of $("avatarPresetsGrid").querySelectorAll(".avatar-preset-opt")) ch.classList.remove("active");
@@ -14356,137 +14824,7 @@ function bindTeamCollabAndAdminEvents() {
     showToast(r.message || "已强制释放锁定");
     loadAdminDashboard();
   };
-  let adminAnnDraftMediaItems = [];
-  let adminAnnActiveIdx = 0;
-
-  const readAdminAnnouncementForm = () => {
-    const pick = (segId, defVal) => {
-      const seg = $(segId);
-      const act = seg ? seg.querySelector(".mini-seg-btn.active") : null;
-      return act ? act.dataset.val : defVal;
-    };
-    const txtVal = $("adminAnnText") ? $("adminAnnText").value : "";
-    if ($("adminAnnCharCount")) $("adminAnnCharCount").textContent = `${txtVal.length} / 300`;
-    const clampedIdx = adminAnnDraftMediaItems.length
-      ? Math.max(0, Math.min(adminAnnDraftMediaItems.length - 1, adminAnnActiveIdx))
-      : 0;
-    return {
-      enabled: $("adminAnnEnabled") ? Boolean($("adminAnnEnabled").checked) : true,
-      badge: $("adminAnnBadge") ? $("adminAnnBadge").value.trim() : "全员公告",
-      text: txtVal,
-      effect: pick("adminAnnEffectSeg", "gradient"),
-      theme: pick("adminAnnThemeSeg", "ocean"),
-      font_size: pick("adminAnnSizeSeg", "md"),
-      speed: pick("adminAnnSpeedSeg", "normal"),
-      media_mode: pick("adminAnnMediaModeSeg", "none"),
-      media_active_idx: clampedIdx,
-      media_muted: $("adminAnnMuted") ? Boolean($("adminAnnMuted").checked) : true,
-      media_fit: pick("adminAnnFitSeg", "cover"),
-      banner_height: pick("adminAnnHeightSeg", "normal"),
-      text_overlay: pick("adminAnnTextOverlaySeg", "overlay"),
-      media_items: adminAnnDraftMediaItems.map((x) => ({ ...x })),
-    };
-  };
-  const refreshAdminAnnPreview = () => applyAnnouncementToDom(readAdminAnnouncementForm(), true);
-
-  function renderAdminAnnMediaList() {
-    const listEl = $("adminAnnMediaList");
-    if (!listEl) return;
-    listEl.innerHTML = "";
-    if (!adminAnnDraftMediaItems.length) {
-      const tip = document.createElement("div");
-      tip.className = "empty-rule-tip";
-      tip.textContent = "暂未添加横幅视频、GIF 或动画；可通过上方按钮上传文件、添加内置动画或粘贴链接";
-      listEl.appendChild(tip);
-      return;
-    }
-    const kindLbl = { video: "视频", gif: "动图GIF", image: "图片", anim: "内置动画" };
-    adminAnnDraftMediaItems.forEach((it, idx) => {
-      const row = document.createElement("div");
-      row.className = "target-item-row";
-      row.style.cssText = "gap:8px;flex-wrap:wrap;padding:7px 10px;";
-
-      const leftInfo = document.createElement("div");
-      leftInfo.style.cssText = "flex:1;min-width:160px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;";
-      const tag = document.createElement("span");
-      tag.className = "tt-pill " + (idx === adminAnnActiveIdx ? "tgt-on" : "date-on");
-      tag.textContent = `${idx + 1}. ${kindLbl[it.kind] || "媒体"}`;
-      const tit = document.createElement("span");
-      tit.style.cssText = "font-weight:700;font-size:12px;color:var(--text);";
-      tit.textContent = it.title || "横幅媒体";
-      const srcInfo = document.createElement("span");
-      srcInfo.style.cssText = "font-size:11px;color:var(--sub);max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
-      srcInfo.textContent = it.src.startsWith("data:") ? "[云同步内联文件]" : (it.src.startsWith("/api/") ? "[本机高清媒体]" : (it.src.startsWith("anim:") ? "[零流量CSS动效]" : it.src));
-      leftInfo.appendChild(tag);
-      leftInfo.appendChild(tit);
-      leftInfo.appendChild(srcInfo);
-
-      const ctrls = document.createElement("div");
-      ctrls.style.cssText = "display:flex;align-items:center;gap:5px;flex-wrap:wrap;";
-      if (it.kind !== "video") {
-        const secBtn = document.createElement("button");
-        secBtn.type = "button";
-        secBtn.className = "mini-pill";
-        secBtn.textContent = `${it.duration_sec || 8}秒`;
-        secBtn.title = "点击循环切换轮播停留秒数 (5s/8s/12s/20s)";
-        secBtn.onclick = () => {
-          const seq = [5, 8, 12, 20];
-          const cur = Number(it.duration_sec || 8);
-          it.duration_sec = seq[(seq.indexOf(cur) + 1) % seq.length];
-          renderAdminAnnMediaList();
-          refreshAdminAnnPreview();
-        };
-        ctrls.appendChild(secBtn);
-      }
-
-      const pickBtn = document.createElement("button");
-      pickBtn.type = "button";
-      pickBtn.className = "mini-pill" + (idx === adminAnnActiveIdx ? " active" : "");
-      pickBtn.textContent = idx === adminAnnActiveIdx ? "单条选中" : "设为单条";
-      pickBtn.onclick = () => {
-        adminAnnActiveIdx = idx;
-        renderAdminAnnMediaList();
-        refreshAdminAnnPreview();
-      };
-      ctrls.appendChild(pickBtn);
-
-      if (idx > 0) {
-        const upBtn = document.createElement("button");
-        upBtn.type = "button";
-        upBtn.className = "mini-pill";
-        upBtn.textContent = "上移";
-        upBtn.onclick = () => {
-          const tmp = adminAnnDraftMediaItems[idx - 1];
-          adminAnnDraftMediaItems[idx - 1] = adminAnnDraftMediaItems[idx];
-          adminAnnDraftMediaItems[idx] = tmp;
-          if (adminAnnActiveIdx === idx) adminAnnActiveIdx = idx - 1;
-          else if (adminAnnActiveIdx === idx - 1) adminAnnActiveIdx = idx;
-          renderAdminAnnMediaList();
-          refreshAdminAnnPreview();
-        };
-        ctrls.appendChild(upBtn);
-      }
-
-      const delBtn = document.createElement("button");
-      delBtn.type = "button";
-      delBtn.className = "mini-pill";
-      delBtn.style.color = "var(--red)";
-      delBtn.textContent = "删除";
-      delBtn.onclick = () => {
-        adminAnnDraftMediaItems.splice(idx, 1);
-        if (adminAnnActiveIdx >= adminAnnDraftMediaItems.length) {
-          adminAnnActiveIdx = Math.max(0, adminAnnDraftMediaItems.length - 1);
-        }
-        renderAdminAnnMediaList();
-        refreshAdminAnnPreview();
-      };
-      ctrls.appendChild(delBtn);
-
-      row.appendChild(leftInfo);
-      row.appendChild(ctrls);
-      listEl.appendChild(row);
-    });
-  }
+  /* adminAnnDraftMediaItems/renderAdminAnnMediaList 已提升至顶层作用域 */
 
   for (const segId of [
     "logicComposeSeg", "logicSilentSeg", "logicMinimizeSeg", "adminGlobalAiProviderSeg",
@@ -14714,9 +15052,22 @@ function bindTeamCollabAndAdminEvents() {
     const minB = $("logicMinimizeSeg").querySelector(".mini-seg-btn.active");
     const minVal = minB ? minB.dataset.val : "none";
     const pdRaw = $("logicPasteDelayInput").value.trim();
+    let enforcePd = null;
+    if (pdRaw !== "") {
+      if (!/^\d+$/.test(pdRaw)) {
+        showToast("全局粘贴等待秒数请填 0~30 的整数，或留空");
+        return;
+      }
+      const pdNum = Number(pdRaw);
+      if (!Number.isInteger(pdNum) || pdNum < 0 || pdNum > 30) {
+        showToast("全局粘贴等待秒数范围应为 0~30");
+        return;
+      }
+      enforcePd = pdNum;
+    }
     const r = await api("/api/admin/global-logic", "POST", {
       lock_timeout_sec: parseInt($("logicLockTimeoutInput").value || "180", 10) || 180,
-      enforce_paste_delay_sec: pdRaw === "" ? null : parseInt(pdRaw, 10),
+      enforce_paste_delay_sec: enforcePd,
       enforce_compose_order: comp ? comp.dataset.val : "",
       enforce_silent_order: sil ? sil.dataset.val : "",
       enforce_minimize_after_send: minVal === "true" ? true : (minVal === "false" ? false : null),
@@ -14868,7 +15219,7 @@ function initAiDialogResizeAndPopout() {
         syncHomeAiStickyHeight();
       }
     });
-    document.addEventListener("mouseup", () => {
+    const finishFeedDrag = () => {
       if (!draggingFeed) return;
       draggingFeed = false;
       handle.classList.remove("dragging");
@@ -14881,7 +15232,9 @@ function initAiDialogResizeAndPopout() {
         if (_homeAiUserMaxH >= maxAvail - 12) _homeAiUserMaxH = null;
         syncHomeAiStickyHeight();
       }
-    });
+    };
+    document.addEventListener("mouseup", finishFeedDrag);
+    window.addEventListener("blur", finishFeedDrag);
   }
 
   const dock = $("aiShortcutsDock");
@@ -14983,11 +15336,13 @@ function initAiDialogResizeAndPopout() {
       winOffsetY = Math.max(-window.innerHeight * 0.4, Math.min(window.innerHeight * 0.4, baseY + dy));
       win.style.transform = `translate(${winOffsetX}px, ${winOffsetY}px)`;
     });
-    document.addEventListener("mouseup", () => {
+    const finishWinDrag = () => {
       if (!draggingWin) return;
       draggingWin = false;
       document.body.style.userSelect = "";
-    });
+    };
+    document.addEventListener("mouseup", finishWinDrag);
+    window.addEventListener("blur", finishWinDrag);
   }
 
   const triggerPopSend = () => {
@@ -15035,6 +15390,10 @@ function initAiDialogResizeAndPopout() {
     }
   } catch (_e) {}
   const data = await api("/api/config");
+  if (!data || data.ok === false || !data.config) {
+    showToast((data && data.message) || "加载配置失败，请刷新重试");
+    return;
+  }
   cfg = data.config;
   latestTimetable = Array.isArray(data.timetable) ? data.timetable : [];
   if (data.ai_meta) {
@@ -15171,16 +15530,6 @@ def _make_handler(ctrl, token):
             try:
                 tmp_p.write_bytes(raw_bytes)
                 os.replace(tmp_p, fpath)
-                files = sorted(
-                    (f for f in mdir.iterdir() if f.is_file() and not f.name.startswith(".tmp_")),
-                    key=lambda x: x.stat().st_mtime,
-                    reverse=True,
-                )
-                for old_f in files[MAX_ANN_MEDIA_DISK_KEEP:]:
-                    try:
-                        old_f.unlink()
-                    except Exception:
-                        pass
             except Exception as exc_up:
                 try:
                     tmp_p.unlink()
@@ -15188,6 +15537,20 @@ def _make_handler(ctrl, token):
                     pass
                 self._send_json({"ok": False, "message": f"保存媒体文件失败：{exc_up}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
+            try:
+                files = sorted(
+                    (f for f in mdir.iterdir() if f.is_file() and not f.name.startswith(".tmp_")),
+                    key=lambda x: x.stat().st_mtime,
+                    reverse=True,
+                )
+                for old_f in files[MAX_ANN_MEDIA_DISK_KEEP:]:
+                    if old_f != fpath:
+                        try:
+                            old_f.unlink()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             self._send_json({
                 "ok": True,
                 "sync_mode": "local",
@@ -15247,6 +15610,8 @@ def _make_handler(ctrl, token):
                             return
                         is_partial = True
                     except ValueError:
+                        start = 0
+                        end = max(0, total - 1)
                         is_partial = False
 
             send_len = (end - start + 1) if total > 0 else 0
@@ -15278,14 +15643,37 @@ def _make_handler(ctrl, token):
                 return {}
             if length > MAX_UI_BODY_BYTES:
                 raise ValueError("PayloadTooLarge")
-            raw = self.rfile.read(length)
+            chunks = []
+            rem = length
+            while rem > 0:
+                part = self.rfile.read(rem)
+                if not part:
+                    break
+                chunks.append(part)
+                rem -= len(part)
+            raw = b"".join(chunks)
+            if len(raw) < length:
+                raise ValueError("InvalidJsonBody")
             try:
                 obj = json.loads(raw.decode("utf-8"))
-                return obj if isinstance(obj, dict) else {}
-            except Exception:
-                return {}
+            except Exception as exc:
+                raise ValueError("InvalidJsonBody") from exc
+            if not isinstance(obj, dict):
+                raise ValueError("InvalidJsonBody")
+            return obj
 
         def do_GET(self):
+            try:
+                self._dispatch_get()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as exc:
+                try:
+                    self._send_json({"ok": False, "message": f"服务器内部异常：{exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                except Exception:
+                    pass
+
+        def _dispatch_get(self):
             parsed = urlparse(self.path)
             if parsed.path in ("/favicon.ico", "/icon.png"):
                 fname = "icon.ico" if parsed.path == "/favicon.ico" else "icon.png"
@@ -15337,14 +15725,15 @@ def _make_handler(ctrl, token):
                     if getattr(ctrl, "hub", None) is not None
                     else {}
                 )
+                prof_payload = ctrl.get_profile_payload() if hasattr(ctrl, "get_profile_payload") else {}
                 self._send_json({
+                    **prof_payload,
                     "ok": True,
                     "config": ctrl.get_public_config(),
                     "timetable": ctrl.get_timetable(),
                     "ai_meta": ctrl.get_ai_meta(),
                     "global_logic": pub_gl,
                     "cloud_account": ctrl.get_account_status_payload(),
-                    **(ctrl.get_profile_payload() if hasattr(ctrl, "get_profile_payload") else {}),
                 })
                 return
 
@@ -15401,7 +15790,14 @@ def _make_handler(ctrl, token):
                         HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                     )
                     return
-                self._send_json({"ok": False, "message": "请求参数异常"}, HTTPStatus.BAD_REQUEST)
+                self._send_json({"ok": False, "message": "请求参数异常或 JSON 格式无效"}, HTTPStatus.BAD_REQUEST)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as exc:
+                try:
+                    self._send_json({"ok": False, "message": f"服务器内部异常：{exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                except Exception:
+                    pass
 
         def _dispatch_post(self):
             parsed = urlparse(self.path)
@@ -15411,6 +15807,9 @@ def _make_handler(ctrl, token):
 
             if parsed.path == "/api/config":
                 body = self._read_json()
+                if not isinstance(body, dict) or not body:
+                    self._send_json({"ok": False, "message": "配置请求体不能为空"}, HTTPStatus.BAD_REQUEST)
+                    return
                 self._send_json(ctrl.save_config_checked(body))
                 return
 
@@ -15497,8 +15896,7 @@ def _make_handler(ctrl, token):
                 return
 
             if parsed.path == "/api/reset":
-                saved = ctrl.reset_config()
-                self._send_json({"ok": True, "config": ctrl._sanitize_config_for_client(saved), "timetable": ctrl.get_timetable()})
+                self._send_json(ctrl.reset_config_checked())
                 return
 
             if parsed.path == "/api/clear-logs":
@@ -15690,7 +16088,7 @@ def show_settings_window(app):
         ]
         try:
             proc = subprocess.Popen(cmd)
-            _apply_square_rounded_win32(wx, wy, win_w, win_h, win_state=win_state)
+            _apply_square_rounded_win32(wx, wy, win_w, win_h, win_state=win_state, target_pid=proc.pid)
         except Exception:
             proc = None
 
@@ -15749,6 +16147,10 @@ def show_settings_window(app):
         try:
             if proc is not None and proc.poll() is None:
                 proc.terminate()
+        except Exception:
+            pass
+        try:
+            glass.destroy()
         except Exception:
             pass
         try:

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
 """
-暗号表助手 SheetMate 核心自动化引擎（v2.9.6）：
+暗号表助手 SheetMate 核心自动化引擎（v2.9.7）：
 - 自动登录数据后台拉取、格式清洗与 WPS 在线表格自动写入
 - 汇总表自定义格位校准、高清选区截图与多尺度无坐标钉钉静音发群
 - 支持白天/夜间自定义排期、AI 个人习惯持久化记忆与跨电脑云同步扩展
@@ -25,6 +25,7 @@ from ctypes import wintypes
 from pathlib import Path
 from datetime import datetime, timedelta
 import json
+import base64
 import ssl
 from PIL import Image
 
@@ -303,23 +304,103 @@ def ensure_browser_installed():
 
 _active_pw_lock = threading.Lock()
 _active_pw_context = None
+_active_pw_thread_id = 0
 
 
 def _set_active_pw_context(ctx):
-    global _active_pw_context
+    global _active_pw_context, _active_pw_thread_id
     with _active_pw_lock:
         _active_pw_context = ctx
+        _active_pw_thread_id = threading.get_ident() if ctx is not None else 0
+
+
+def _terminate_owned_pw_browser_pids():
+    """在非 Playwright 创建线程请求停止时，仅安全终止本进程子树下的 Playwright 浏览器子进程以即时解除阻塞。"""
+    if os.name != "nt":
+        return
+    try:
+        class _PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        k32.Process32FirstW.restype = wintypes.BOOL
+        k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        k32.Process32NextW.restype = wintypes.BOOL
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.TerminateProcess.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+
+        snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if not snap or snap == wintypes.HANDLE(-1).value:
+            return
+        procs = {}
+        try:
+            pe = _PROCESSENTRY32W()
+            pe.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            if k32.Process32FirstW(snap, ctypes.byref(pe)):
+                while True:
+                    procs[int(pe.th32ProcessID)] = (int(pe.th32ParentProcessID), str(pe.szExeFile or "").lower())
+                    if not k32.Process32NextW(snap, ctypes.byref(pe)):
+                        break
+        finally:
+            k32.CloseHandle(snap)
+
+        my_pid = os.getpid()
+        browser_names = ("chrome.exe", "chromium.exe", "chrome-headless-shell.exe", "msedge.exe")
+        for pid, (ppid, exe) in list(procs.items()):
+            if pid == my_pid or exe not in browser_names:
+                continue
+            cur = ppid
+            owned = False
+            for _ in range(6):
+                if cur == my_pid:
+                    owned = True
+                    break
+                info = procs.get(cur)
+                if not info or info[0] == cur or cur <= 4:
+                    break
+                cur = info[0]
+            if owned:
+                h_proc = k32.OpenProcess(0x0001, False, pid)
+                if h_proc:
+                    try:
+                        k32.TerminateProcess(h_proc, 1)
+                    finally:
+                        k32.CloseHandle(h_proc)
+    except Exception:
+        pass
 
 
 def _force_close_active_pw_context():
     with _active_pw_lock:
         ctx = _active_pw_context
+        tid = _active_pw_thread_id
     if ctx is None:
         return
-    try:
-        ctx.close()
-    except Exception:
-        pass
+    if tid and tid == threading.get_ident():
+        try:
+            ctx.close()
+        except Exception:
+            pass
+    else:
+        _terminate_owned_pw_browser_pids()
 
 
 def _launch_context(p, retried=False):
@@ -348,9 +429,9 @@ def _launch_context(p, retried=False):
 
 _gui_logger = None
 
-APP_VERSION = "2.9.6"
+APP_VERSION = "2.9.7"
 # 更新检查地址：GitHub 仓库 version.json 的 raw 直链
-# version.json 格式：{"version":"2.9.6","url":"新版exe的下载直链"}
+# version.json 格式：{"version":"2.9.7","url":"新版exe的下载直链"}
 DEFAULT_GEMINI_API_KEY = os.environ.get("SHEETMATE_AI_KEY", "")
 GEMINI_MODEL_CANDIDATES = (
     "gemini-flash-latest",
@@ -388,6 +469,18 @@ _runtime_prompt = {
     "hands_off": False,
     "hands_off_text": "",
 }
+
+
+_hands_off_depth = 0
+_hands_off_text_cur = ""
+
+
+class TaskStoppedError(RuntimeError):
+    """用户手动停止或取消当前任务时抛出的可控中断异常。"""
+
+
+def _is_stop_exception(exc):
+    return isinstance(exc, TaskStoppedError) or ("手动停止" in str(exc or ""))
 
 
 class DingTalkInterrupted(RuntimeError):
@@ -557,24 +650,43 @@ def _notify_runtime_state():
             pass
 
 
+def _apply_hands_off_to_prompt(prompt_dict):
+    if isinstance(prompt_dict, dict) and _hands_off_depth > 0 and _hands_off_text_cur:
+        prompt_dict["hands_off"] = True
+        prompt_dict["hands_off_text"] = _hands_off_text_cur
+    return prompt_dict
+
+
 def hands_off_guard(action_desc):
     """键鼠敏感粘贴/操作上下文守卫：全程展示『目前XX正在操作，请勿动键鼠』醒目提示。"""
     from contextlib import contextmanager
 
     @contextmanager
     def _cm():
+        global _hands_off_depth, _hands_off_text_cur
+        prev_txt = ""
         with _runtime_lock:
             op = (_active_operator_name or "当前成员").strip() or "当前成员"
             msg = f"目前【{op}】正在{action_desc}，请勿触碰鼠标或键盘！（急停按 F8）"
-            _runtime_prompt["hands_off"] = True
-            _runtime_prompt["hands_off_text"] = msg
+            prev_txt = _hands_off_text_cur
+            _hands_off_depth += 1
+            _hands_off_text_cur = msg
+            if not _pause_requested and not _waiting_recovery and not _stop_requested:
+                _runtime_prompt["hands_off"] = True
+                _runtime_prompt["hands_off_text"] = msg
         _notify_runtime_state()
         try:
             yield
         finally:
             with _runtime_lock:
-                _runtime_prompt["hands_off"] = False
-                _runtime_prompt["hands_off_text"] = ""
+                _hands_off_depth = max(0, _hands_off_depth - 1)
+                _hands_off_text_cur = prev_txt if _hands_off_depth > 0 else ""
+                if _hands_off_depth <= 0 or _stop_requested:
+                    _runtime_prompt["hands_off"] = False
+                    _runtime_prompt["hands_off_text"] = ""
+                elif not _pause_requested and not _waiting_recovery:
+                    _runtime_prompt["hands_off"] = True
+                    _runtime_prompt["hands_off_text"] = _hands_off_text_cur
             _notify_runtime_state()
 
     return _cm()
@@ -626,6 +738,8 @@ def request_pause():
             return False, "任务已取消"
         if _waiting_recovery:
             return False, "当前已在等待排障，请按提示处理后点击恢复按钮"
+        if _runtime_prompt.get("mode") == "login_wps":
+            return False, "当前正在等待 WPS 登录，请扫码后继续"
         if _pause_requested:
             return True, "当前已处于暂停状态"
         _pause_requested = True
@@ -665,7 +779,7 @@ def request_resume(action="continue"):
                 pass
         elif _pause_requested:
             _pause_requested = False
-            _runtime_prompt = _default_running_prompt()
+            _runtime_prompt = _apply_hands_off_to_prompt(_default_running_prompt())
             msg = "已恢复运行，将继续执行下一步"
             need_log = True
         elif _runtime_prompt.get("mode") == "login_wps":
@@ -744,9 +858,15 @@ class _RuntimeHotkeyManager:
     def start(self):
         if os.name != "nt":
             return
+        old_join = None
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive() and self._stop_evt is not None and self._stop_evt.is_set():
+                old_join = self._thread
+        if old_join is not None and old_join is not threading.current_thread():
+            old_join.join(timeout=0.8)
         with self._lock:
             self._ref_count += 1
-            if self._thread is not None and self._thread.is_alive():
+            if self._thread is not None and self._thread.is_alive() and (self._stop_evt is None or not self._stop_evt.is_set()):
                 return
             self._stop_evt = threading.Event()
             ev = self._stop_evt
@@ -765,11 +885,14 @@ class _RuntimeHotkeyManager:
             if self._stop_evt is not None:
                 self._stop_evt.set()
             t_join = self._thread
-            self._thread = None
-            self._f8_label = "F8"
-            self._f9_label = "F9"
         if t_join is not None and t_join is not threading.current_thread():
-            t_join.join(timeout=0.8)
+            t_join.join(timeout=0.9)
+        with self._lock:
+            if self._ref_count == 0:
+                if self._thread is t_join and (t_join is None or not t_join.is_alive()):
+                    self._thread = None
+                self._f8_label = "F8"
+                self._f9_label = "F9"
 
     def _loop(self, stop_evt):
         try:
@@ -846,10 +969,13 @@ def reset_stop():
     global _stop_requested, _pause_requested, _waiting_recovery, _recovery_choice, _runtime_prompt, _last_diagnosed_detail
     with _runtime_cond:
         _stop_requested = False
+        global _hands_off_depth, _hands_off_text_cur
         _pause_requested = False
         _waiting_recovery = False
         _recovery_choice = None
         _last_diagnosed_detail = None
+        _hands_off_depth = 0
+        _hands_off_text_cur = ""
         with _AUTO_CONFIRM_LOCK:
             _auto_confirmed_recovery_titles.clear()
             _auto_confirmed_recovery_counts.clear()
@@ -864,7 +990,7 @@ def check_stop():
     with _runtime_cond:
         while True:
             if _stop_requested:
-                raise RuntimeError("用户手动停止了任务")
+                raise TaskStoppedError("用户手动停止了任务")
             if not _pause_requested:
                 break
             was_paused = True
@@ -880,7 +1006,7 @@ def sleep_check(seconds):
     with _runtime_cond:
         while True:
             if _stop_requested:
-                raise RuntimeError("用户手动停止了任务")
+                raise TaskStoppedError("用户手动停止了任务")
             if _pause_requested:
                 was_paused = True
                 _runtime_cond.wait(timeout=0.5)
@@ -903,8 +1029,12 @@ def probe_network(timeout=2.4):
             req = urllib.request.Request(url, headers={"User-Agent": "SheetMate"})
             with urllib.request.urlopen(req, timeout=timeout):
                 return True
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as he:
             # 只要收到 HTTP 响应（如 401/403/404/302），说明网络与节点是通的
+            try:
+                he.close()
+            except Exception:
+                pass
             return True
         except Exception:
             return False
@@ -1672,11 +1802,34 @@ def _validate_safe_http_url(raw_url, require_https=False, allow_loopback=False):
 class _SafeHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
     """校验 HTTP 重定向目标 URL，阻止通过 302 跳转访问内网、回环或非 HTTPS 资源。"""
 
+    def __init__(self, require_https=True):
+        super().__init__()
+        self.require_https = bool(require_https)
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         abs_url = urllib.parse.urljoin(req.full_url, str(newurl or ""))
-        if not _validate_safe_http_url(abs_url, require_https=True):
+        if not _validate_safe_http_url(abs_url, require_https=self.require_https):
             raise urllib.error.HTTPError(abs_url, code, "Unsafe redirect blocked", headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _is_official_gemini_base(api_base):
+    base = str(api_base or "").strip()
+    if not base:
+        return True
+    try:
+        host = (urllib.parse.urlsplit(base).hostname or "").strip().lower()
+        return host == "generativelanguage.googleapis.com" or host.endswith(".generativelanguage.googleapis.com")
+    except Exception:
+        return False
+
+
+def _open_ai_http(req, timeout_sec, ssl_ctx, require_https=True):
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ssl_ctx),
+        _SafeHttpsRedirectHandler(require_https=require_https),
+    )
+    return opener.open(req, timeout=timeout_sec)
 
 
 def _call_openai_compat_generate(api_base, api_key, model_name, sys_prompt, contents, temperature=0.4, max_tokens=900, timeout_sec=24):
@@ -1732,8 +1885,9 @@ def _call_openai_compat_generate(api_base, api_key, model_name, sys_prompt, cont
             "User-Agent": f"SheetMate/{APP_VERSION}",
         },
     )
+    req_https = url.lower().startswith("https://")
     try:
-        with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl_ctx) as resp:
+        with _open_ai_http(req, timeout_sec, ssl_ctx, require_https=req_https) as resp:
             raw = json.loads(resp.read().decode("utf-8", errors="ignore"))
         choices = raw.get("choices") or []
         if not choices:
@@ -1746,8 +1900,15 @@ def _call_openai_compat_generate(api_base, api_key, model_name, sys_prompt, cont
             return {"ok": True, "source": "ai_cloud", "model": "", "reply": answer}
         return {"ok": False, "source": "network_error", "model": "", "error": "云端返回内容为空"}
     except urllib.error.HTTPError as he:
-        err_body = he.read().decode("utf-8", errors="ignore")[:180]
-        return {"ok": False, "source": "network_error", "model": "", "error": f"HTTP {he.code}: {err_body}"}
+        try:
+            err_body = he.read().decode("utf-8", errors="ignore")[:180]
+            code = he.code
+        finally:
+            try:
+                he.close()
+            except Exception:
+                pass
+        return {"ok": False, "source": "network_error", "model": "", "error": f"HTTP {code}: {err_body}"}
     except Exception as exc:
         return {"ok": False, "source": "network_error", "model": "", "error": str(exc)[:180]}
 
@@ -1780,10 +1941,16 @@ def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens
         return {"ok": False, "source": "local_only", "model": "", "error": "当前设置为仅使用内置本地分析引擎"}
 
     api_base = str(ai_cfg.get("api_base") or "").strip().rstrip("/")
-    api_key = str(ai_cfg.get("api_key") or DEFAULT_GEMINI_API_KEY).strip()
+    raw_key = str(ai_cfg.get("api_key") or "").strip()
+    if raw_key:
+        api_key = raw_key
+    elif provider == "gemini" and _is_official_gemini_base(api_base):
+        api_key = str(DEFAULT_GEMINI_API_KEY or "").strip()
+    else:
+        api_key = ""
     pref_m = str(ai_cfg.get("model") or GEMINI_MODEL_CANDIDATES[0]).strip()
 
-    if provider == "openai_compat" or (api_base and "googleapis.com" not in api_base.lower()):
+    if provider == "openai_compat":
         res_oc = _call_openai_compat_generate(
             api_base=api_base or "https://api.openai.com/v1",
             api_key=api_key,
@@ -1835,7 +2002,8 @@ def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens
             headers={"Content-Type": "application/json", "User-Agent": f"SheetMate/{APP_VERSION}"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=per_timeout, context=ssl_ctx) as resp:
+            req_https = base_host.lower().startswith("https://")
+            with _open_ai_http(req, per_timeout, ssl_ctx, require_https=req_https) as resp:
                 raw = json.loads(resp.read().decode("utf-8", errors="ignore"))
             cands = raw.get("candidates") or []
             if not cands:
@@ -1848,9 +2016,16 @@ def _call_gemini_generate(cfg, sys_prompt, contents, temperature=0.4, max_tokens
                 return {"ok": True, "source": "ai_cloud", "model": "", "reply": _sanitize_ai_reply_brands(answer)}
             last_err = "云端返回文本为空"
         except urllib.error.HTTPError as he:
-            err_body = he.read().decode("utf-8", errors="ignore")[:180]
-            last_err = f"HTTP {he.code}: {err_body}"
-            if he.code in (400, 401, 403):
+            try:
+                err_body = he.read().decode("utf-8", errors="ignore")[:180]
+                h_code = he.code
+            finally:
+                try:
+                    he.close()
+                except Exception:
+                    pass
+            last_err = f"HTTP {h_code}: {err_body}"
+            if h_code in (400, 401, 403):
                 break
         except Exception as e:
             last_err = str(e)[:180]
@@ -2682,6 +2857,8 @@ def record_report_archive(cfg=None, round_label="手动", summary_tsv="", shot_p
     now_ts = time.time()
     # 防止同一次执行既在截图结束又在发送后重复落盘两份完全相同的数据
     cur_sig = f"{int(now_ts // 30)}|{sig_payload}"
+    spot = None
+    sp_cb = None
     with _ARCHIVE_IO_LOCK:
         if cur_sig == _last_archive_sig:
             return None
@@ -2720,16 +2897,16 @@ def record_report_archive(cfg=None, round_label="手动", summary_tsv="", shot_p
             with _runtime_lock:
                 _latest_round_spotlight = spot
                 sp_cb = _spotlight_callback
-            if spot.get("summary_line"):
-                log(f"  💡 [数据变化速递] {spot['summary_line']}")
-            if sp_cb is not None:
-                try:
-                    sp_cb(spot)
-                except Exception:
-                    pass
-            return rec
         except Exception:
             return None
+    if isinstance(spot, dict) and spot.get("summary_line"):
+        log(f"  💡 [数据变化速递] {spot['summary_line']}")
+    if sp_cb is not None and spot is not None:
+        try:
+            sp_cb(spot)
+        except Exception:
+            pass
+    return rec
 
 
 def load_report_archive(limit=30):
@@ -3031,6 +3208,15 @@ def _normalize_ai_user_memory(raw):
                 item["sender"] = str(h["sender"])[:30]
             if isinstance(h.get("on_demand_meta"), dict):
                 item["on_demand_meta"] = copy.deepcopy(h["on_demand_meta"])
+            if isinstance(h.get("thinking_steps"), list) and h["thinking_steps"]:
+                clean_steps = [str(x).strip()[:120] for x in h["thinking_steps"][:6] if str(x).strip()]
+                if clean_steps:
+                    item["thinking_steps"] = clean_steps
+            if h.get("elapsed_sec") is not None:
+                try:
+                    item["elapsed_sec"] = round(max(0.0, float(h["elapsed_sec"])), 1)
+                except (TypeError, ValueError):
+                    pass
             clean_h.append(item)
         base["chat_history"] = clean_h[-30:]
     return base
@@ -3166,6 +3352,7 @@ def _new_empty_run_trace(mode="full", round_label=""):
         "paste_attempts": [],
         "text_methods": [],
         "silent_attempts": [],
+        "wps_capture_attempts": [],
         "heal_events": [],
         "user_recoveries": [],
         "auto_confirms": [],
@@ -3208,6 +3395,12 @@ def record_run_trace_event(kind, detail="", meta=None):
             tr["silent_attempts"].append({"method": d, "ok": True})
         elif k == "silent_fail":
             tr["silent_attempts"].append({"method": d, "ok": False, "reason": str(m.get("reason") or "")})
+        elif k == "wps_capture_ok":
+            tr["wps_capture_attempts"].append({"method": d, "ok": True, "meta": m})
+        elif k == "wps_capture_fail":
+            tr["wps_capture_attempts"].append({"method": d, "ok": False, "reason": str(m.get("reason") or d), "meta": m})
+        elif k == "wps_rclick_a1_guard":
+            tr["wps_capture_attempts"].append({"method": "a1_guard", "ok": False, "reason": d, "meta": m})
         elif k == "heal_applied":
             tr["heal_events"].append({"stage": str(m.get("stage") or ""), "detail": d, "actions": list(m.get("actions") or [])})
         elif k == "user_recovery":
@@ -3234,6 +3427,8 @@ def _default_ai_run_playbook():
         "focus_stats": {},
         "paste_stats": {},
         "silent_stats": {},
+        "wps_capture_stats": {},
+        "wps_capture_anchor": None,
         "recommended_paste_delay_sec": None,
         "last_unresolved_issue": None,
         "problem_lessons": [],
@@ -3267,6 +3462,25 @@ def _normalize_ai_run_playbook(raw):
     base["focus_stats"] = _normalize_stat_map(raw.get("focus_stats"))
     base["paste_stats"] = _normalize_stat_map(raw.get("paste_stats"))
     base["silent_stats"] = _normalize_stat_map(raw.get("silent_stats"))
+    base["wps_capture_stats"] = _normalize_stat_map(raw.get("wps_capture_stats"))
+    anc = raw.get("wps_capture_anchor")
+    if isinstance(anc, dict):
+        try:
+            xp = round(float(anc.get("x_pct")), 4)
+            yp = round(float(anc.get("y_pct")), 4)
+            vw = max(0, int(anc.get("vw") or 0))
+            vh = max(0, int(anc.get("vh") or 0))
+            mth = str(anc.get("method") or "")[:32]
+            if 0.08 <= xp <= 0.85 and 0.30 <= yp <= 0.88:
+                base["wps_capture_anchor"] = {
+                    "x_pct": xp,
+                    "y_pct": yp,
+                    "vw": vw,
+                    "vh": vh,
+                    "method": mth,
+                }
+        except Exception:
+            pass
     rec_d = raw.get("recommended_paste_delay_sec")
     if rec_d is not None and not isinstance(rec_d, bool) and str(rec_d).strip() != "":
         try:
@@ -3365,6 +3579,29 @@ def _rank_playbook_options(default_tuple, stats_map):
     return sorted(list(default_tuple), key=_sort_key)
 
 
+def _record_wps_capture_learned_anchor(method, x_pct=None, y_pct=None, vw=0, vh=0, ok=True):
+    """零阻塞更新 AI 经验库中 WPS 200% 缩放右键/按键胜率与安全内点坐标（严禁记住 A1 区域）。"""
+    try:
+        pb = load_ai_run_playbook()
+        stats = pb.setdefault("wps_capture_stats", {})
+        rec = stats.setdefault(str(method or "unknown")[:32], {"ok": 0, "fail": 0})
+        rec["ok" if ok else "fail"] += 1
+        if ok and x_pct is not None and y_pct is not None:
+            xp = round(float(x_pct), 4)
+            yp = round(float(y_pct), 4)
+            if 0.08 <= xp <= 0.85 and 0.30 <= yp <= 0.88:
+                pb["wps_capture_anchor"] = {
+                    "x_pct": xp,
+                    "y_pct": yp,
+                    "vw": max(0, int(vw or 0)),
+                    "vh": max(0, int(vh or 0)),
+                    "method": str(method or "border_rclick")[:32],
+                }
+        save_ai_run_playbook(pb, notify=False)
+    except Exception:
+        pass
+
+
 def get_dt_runtime_strategy_from_playbook(cfg=None):
     """依据历史成功/失败训练数据动态生成本轮钉钉最优聚焦、粘贴与静音执行顺序。"""
     pb = load_ai_run_playbook()
@@ -3459,6 +3696,11 @@ def finalize_run_training_summary(cfg, status, mode="full", round_label="", dura
         if m_name:
             rec = pb["silent_stats"].setdefault(m_name, {"ok": 0, "fail": 0})
             rec["ok" if sa.get("ok") else "fail"] += 1
+    for wa in trace.get("wps_capture_attempts") or []:
+        m_name = str(wa.get("method") or "")
+        if m_name:
+            rec = pb["wps_capture_stats"].setdefault(m_name, {"ok": 0, "fail": 0})
+            rec["ok" if wa.get("ok") else "fail"] += 1
 
     pb["total_runs"] += 1
     win_focus = next((x.get("strategy") for x in reversed(trace.get("focus_attempts") or []) if x.get("ok")), "")
@@ -3623,8 +3865,9 @@ def append_ai_chat_turn(role, text, time_str="", source="", shot_info="", via="p
                 pass
         mem["chat_history"].append(item)
         mem["chat_history"] = mem["chat_history"][-30:]
-        saved = save_ai_user_memory(mem)
-        return list(saved["chat_history"])
+        saved = save_ai_user_memory(mem, notify=False)
+    _notify_ai_memory_changed("memory")
+    return list(saved["chat_history"])
 
 
 def clear_ai_chat_turns_only():
@@ -3804,7 +4047,9 @@ def learn_user_habits_from_interaction(user_text="", speaker_name="", is_local_s
                 changed = True
 
         if changed:
-            mem = save_ai_user_memory(mem)
+            mem = save_ai_user_memory(mem, notify=False)
+    if changed:
+        _notify_ai_memory_changed("memory")
     return {"learned": learned, "memory": mem}
 
 
@@ -4881,14 +5126,14 @@ _SHORT_RUN_CMD_RE = re.compile(
 )
 
 
-def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=None, is_local_speaker=True, chat_history=None):
+def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=None, is_local_speaker=True, chat_history=None, bypass_schedule_guard=False):
     """识别即时单次执行与值守启停指令（支持同音纠错找人、续跑上下文与严格查无此人直接报错），绝不污染默认配置。"""
     raw = str(user_text or "").strip()
     if not raw or check_ai_security_and_creator_guardrail(raw):
         return {"handled": False}
 
     # 周期计划、排期增删与起始时间配置类词句留给 try_handle_ai_config_command
-    if any(k in raw for k in ("每天", "每日", "每周", "工作日", "周末", "每隔", "定时计划", "排期总览", "帮我设置", "帮我改设置", "设置为")):
+    if not bypass_schedule_guard and any(k in raw for k in ("每天", "每日", "每周", "工作日", "周末", "每隔", "定时计划", "排期总览", "帮我设置", "帮我改设置", "设置为")):
         return {"handled": False}
     if any(k in raw for k in ("新增", "添加", "多加", "加一个", "加一条", "追加", "额外加", "补加", "删除", "删掉", "移除", "去掉")) and any(
         ctx in raw for ctx in ("定时", "排期", "时间点", "节点", "自定义")
@@ -4947,30 +5192,6 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
         )
     )
     if not _has_runtime_ctrl_conflict:
-        if _PAUSE_TASK_RE.search(raw):
-            return {
-                "handled": True,
-                "action": "pause_task",
-                "targets": [],
-                "date_spec": date_spec,
-                "thinking_steps": [
-                    f"识别到运行中暂停指令：{raw[:28]}",
-                    "已直连运行时挂起开关，保留当前浏览器与进度现场",
-                ],
-                "reply": "已收到暂停指令，正在安全暂停当前任务…",
-            }
-        if _RESUME_TASK_RE.search(raw):
-            return {
-                "handled": True,
-                "action": "resume_task",
-                "targets": [],
-                "date_spec": date_spec,
-                "thinking_steps": [
-                    f"识别到继续运行指令：{raw[:28]}",
-                    "正在唤醒挂起点并恢复执行未完成步骤",
-                ],
-                "reply": "已收到继续指令，正在恢复执行当前任务…",
-            }
         if _CANCEL_TASK_RE.search(raw):
             return {
                 "handled": True,
@@ -4982,6 +5203,32 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
                     "已通知执行引擎立即终止当前任务并释放锁定",
                 ],
                 "reply": "已收到取消指令，正在立即停止当前任务…",
+            }
+        m_pause = _PAUSE_TASK_RE.search(raw)
+        if m_pause and not re.search(r"(?:不要|别|不用|别再|无需|停止|取消)\s*$", raw[max(0, m_pause.start() - 6):m_pause.start()]):
+            return {
+                "handled": True,
+                "action": "pause_task",
+                "targets": [],
+                "date_spec": date_spec,
+                "thinking_steps": [
+                    f"识别到运行中暂停指令：{raw[:28]}",
+                    "已直连运行时挂起开关，保留当前浏览器与进度现场",
+                ],
+                "reply": "已收到暂停指令，正在安全暂停当前任务…",
+            }
+        m_resume = _RESUME_TASK_RE.search(raw)
+        if m_resume and not re.search(r"(?:不要|别|不用|别再|无需)\s*$", raw[max(0, m_resume.start() - 6):m_resume.start()]):
+            return {
+                "handled": True,
+                "action": "resume_task",
+                "targets": [],
+                "date_spec": date_spec,
+                "thinking_steps": [
+                    f"识别到继续运行指令：{raw[:28]}",
+                    "正在唤醒挂起点并恢复执行未完成步骤",
+                ],
+                "reply": "已收到继续指令，正在恢复执行当前任务…",
             }
 
     scan_text = re.sub(
@@ -5164,11 +5411,15 @@ def try_handle_ai_on_demand_task(user_text, cfg, speaker_name="", extra_roster=N
             run_cfg["dt_silent_send"] = bool(ai_mem["preferred_silent"])
         run_cfg["dt_targets"] = [{"name": t, "enabled": True} for t in resolved_list]
         run_cfg["dt_search"] = resolved_list[0]
+        run_cfg["point_overrides"] = {}
         run_cfg["_smart_target_candidates"] = search_cand_map
         if any(rt == "我" for rt in raw_targets) and is_local_speaker and resolved_list:
             run_cfg["_resolve_self_for_search"] = resolved_list[0]
 
+    run_cfg["point_overrides"] = {}
     if date_spec.get("explicit"):
+        run_cfg["suffix_rules"] = []
+        run_cfg["dt_use_actual_clock"] = False
         sp = run_cfg.setdefault("summary_presets", {})
         sp["enabled"] = True
         items = sp.setdefault("items", [])
@@ -5293,6 +5544,7 @@ def build_on_demand_task_from_ai_action(action_obj, cfg, speaker_name="", extra_
         extra_roster=extra_roster,
         is_local_speaker=is_local_speaker,
         chat_history=chat_history,
+        bypass_schedule_guard=True,
     )
     if res.get("handled") and res.get("action") != "error_only":
         res["action"] = act
@@ -5532,7 +5784,18 @@ def _extract_schedule_point_attrs(seg):
         if t_list:
             targets = t_list[:10]
 
-    mode = "table_only" if any(k in s for k in ("不发钉钉", "只更新表格", "只更表", "只写表")) else "send"
+    if any(k in s for k in ("不发钉钉", "只更新表格", "只更表", "只写表")):
+        mode = "table_only"
+    elif any(
+        k in s
+        for k in (
+            "发钉钉", "正常发", "恢复发送", "恢复发群", "启用发送", "也要发", "并发送",
+            "发给", "发送到", "发到", "投递到", "新增", "添加", "多加", "加一个", "加一条", "追加", "额外加", "补加",
+        )
+    ) or targets:
+        mode = "send"
+    else:
+        mode = None
     return {
         "d_fmt": d_fmt,
         "t_mode": t_mode,
@@ -5753,6 +6016,8 @@ def _parse_multi_segment_schedule_command(raw, new_cfg, changes):
         sh_off = attrs["sh_off"]
         msg_off = attrs["msg_off"]
         sil = attrs["sil"]
+        seg_targets = attrs.get("targets")
+        seg_mode = attrs.get("mode")
 
         # 清除举例和日期字面量后再提取触发时间点
         clean_seg = re.sub(r"[（(]\s*(?:比如|例如)[^）)]*[）)]", " ", seg)
@@ -5791,6 +6056,7 @@ def _parse_multi_segment_schedule_command(raw, new_cfg, changes):
                     "ih": gap // 60, "im": gap % 60, "gap": gap, "points": pts,
                     "d_fmt": d_fmt, "t_mode": t_mode, "actual": wants_actual,
                     "suf": suf, "sh_off": sh_off, "msg_off": msg_off, "sil": sil,
+                    "targets": seg_targets, "mode": seg_mode,
                 })
                 continue
 
@@ -5808,6 +6074,7 @@ def _parse_multi_segment_schedule_command(raw, new_cfg, changes):
                 "kind": "single", "points": pts_single,
                 "d_fmt": d_fmt, "t_mode": t_mode, "actual": wants_actual,
                 "suf": suf, "sh_off": sh_off, "msg_off": msg_off, "sil": sil,
+                "targets": seg_targets, "mode": seg_mode,
             })
 
     if len(specs) < 2:
@@ -5905,15 +6172,22 @@ def _parse_multi_segment_schedule_command(raw, new_cfg, changes):
                 ov["msg_date_fmt"] = s["d_fmt"]
             if s["suf"] is not None and g_suf is not None and s["suf"] != g_suf:
                 ov["suffix"] = s["suf"]
+            if s.get("targets"):
+                ov["targets"] = list(s["targets"])
+            if s.get("mode") == "table_only":
+                ov["mode"] = "table_only"
+            elif s.get("mode") == "send" and len(specs) > 1 and any(x.get("mode") == "table_only" for x in specs):
+                ov["mode"] = "send"
             if ov:
                 overrides[hm_k] = {
-                    "mode": "default",
+                    "mode": ov.get("mode", "default"),
                     "suffix": ov.get("suffix"),
                     "silent": ov.get("silent"),
                     "sheet_day_offset": ov.get("sheet_day_offset"),
                     "msg_time_mode": ov.get("msg_time_mode"),
                     "msg_day_offset": ov.get("msg_day_offset"),
                     "msg_date_fmt": ov.get("msg_date_fmt"),
+                    "targets": ov.get("targets"),
                 }
     new_cfg["point_overrides"] = overrides
     total_pts = len(build_daily_timetable(new_cfg))
@@ -6088,14 +6362,14 @@ def try_handle_ai_config_command(user_text, cfg):
 
     if not multi_matched:
         range_t = re.search(
-            r"(上午|早上|下午|晚上|夜间)?\s*(\d{1,2})\s*(?:[:：时]|点\s*(?:(半)|(\d{1,2})分?)?)\s*(?:到|至|-|~)\s*(上午|早上|下午|晚上|夜间)?\s*(\d{1,2})\s*(?:[:：时]|点\s*(?:(半)|(\d{1,2})分?)?)?",
+            r"(上午|早上|下午|晚上|夜间)?\s*(\d{1,2})\s*(?:[:：]\s*(\d{1,2})|[点时]\s*(?:(半)|(\d{1,2})\s*分?)?)\s*(?:到|至|-|~|～)\s*(上午|早上|下午|晚上|夜间)?\s*(\d{1,2})\s*(?:[:：]\s*(\d{1,2})|[点时]\s*(?:(半)|(\d{1,2})\s*分?)?)?",
             raw,
         )
         if range_t:
             sh = _norm_h(range_t.group(2), range_t.group(1) or "")
-            sm = 30 if range_t.group(3) else int(range_t.group(4) or 0)
-            eh = _norm_h(range_t.group(6), range_t.group(5) or "")
-            em = 30 if range_t.group(7) else int(range_t.group(8) or 0)
+            sm = 30 if range_t.group(4) else int(range_t.group(3) or range_t.group(5) or 0)
+            eh = _norm_h(range_t.group(7), range_t.group(6) or "")
+            em = 30 if range_t.group(9) else int(range_t.group(8) or range_t.group(10) or 0)
             new_cfg["day"]["sh"], new_cfg["day"]["sm"] = sh, max(0, min(59, sm))
             new_cfg["day"]["eh"], new_cfg["day"]["em"] = eh, max(0, min(59, em))
             iv_m = re.search(r"每(?:隔)?\s*(?:(\d+)\s*(?:个)?小时)?\s*(?:(\d+)\s*分钟?)?", raw)
@@ -6104,13 +6378,13 @@ def try_handle_ai_config_command(user_text, cfg):
                 new_cfg["day"]["im"] = int(iv_m.group(2) or 0)
             if "夜" not in raw and "晚间" not in raw:
                 new_cfg["night_enabled"] = False
-            changes.append(f"运行时间段设为 {sh:02d}:{sm:02d} ~ {eh:02d}:{em:02d}（间隔 {new_cfg['day']['ih']}h{new_cfg['day']['im']}m）")
+            changes.append(f"运行时间段设为 {sh:02d}:{new_cfg['day']['sm']:02d} ~ {eh:02d}:{new_cfg['day']['em']:02d}（间隔 {new_cfg['day']['ih']}h{new_cfg['day']['im']}m）")
         else:
             single_pts = []
-            for tm in re.finditer(r"(上午|早上|下午|晚上|夜间)?\s*(\d{1,2})\s*(?:[:：]\s*(\d{1,2})|点\s*(?:(半)|(\d{1,2})\s*分?)?)", raw):
+            for tm in re.finditer(r"(上午|早上|下午|晚上|夜间)?\s*(\d{1,2})\s*(?:[:：]\s*(\d{1,2})|[点时]\s*(?:(半)|(\d{1,2})\s*分?)?)", raw):
                 hv = _norm_h(tm.group(2), tm.group(1) or "")
                 mv = 30 if tm.group(4) else int(tm.group(3) or tm.group(5) or 0)
-                if 0 <= hv <= 23 and 0 <= mv <= 59:
+                if 0 <= hv <= 23 and 0 <= mv <= 59 and (hv, mv) not in single_pts:
                     single_pts.append((hv, mv))
             if single_pts:
                 # 单个定点设置：让 eh/em 紧接 +1 分钟（span=1分钟），排期表精准只出这一个时间点！
@@ -6123,7 +6397,11 @@ def try_handle_ai_config_command(user_text, cfg):
                     new_cfg["night_enabled"] = True
                     end2 = (h_last * 60 + m_last + 1) % 1440
                     new_cfg["night"] = {"sh": h_last, "sm": m_last, "eh": end2 // 60, "em": end2 % 60, "ih": 1, "im": 0}
-                    changes.append(f"定点触发设为 {h0:02d}:{m0:02d} 与 {h_last:02d}:{m_last:02d}")
+                    if len(single_pts) > 2:
+                        mid_strs = [f"{hm[0]:02d}:{hm[1]:02d}" for hm in single_pts[1:-1]]
+                        new_cfg["extra_points"] = sorted(set(mid_strs))[:48]
+                    pts_lbl = "、".join(f"{hm[0]:02d}:{hm[1]:02d}" for hm in single_pts)
+                    changes.append(f"定点触发设为 {pts_lbl}")
                 else:
                     changes.append(f"每日定点执行设为 {h0:02d}:{m0:02d}")
 
@@ -6342,15 +6620,19 @@ def summarize_report_with_ai(cfg, style_id="brief", user_prompt="", chat_history
 
     hist = [it for it in (chat_history or []) if isinstance(it, dict) and str(it.get("text") or "").strip()]
     if hist:
-        first_msg = hist[0]
-        first_parts.append({"text": str(first_msg.get("text"))})
-        contents.append({"role": "user" if first_msg.get("role") != "model" else "model", "parts": first_parts})
-        for turn in hist[1:]:
-            contents.append({
-                "role": "model" if turn.get("role") == "model" else "user",
-                "parts": [{"text": str(turn.get("text"))}],
-            })
-        contents.append({"role": "user", "parts": [{"text": effective_prompt}]})
+        first_parts.append({"text": "以下是此前历史对话脉络，图片与实时数据以上文【user】提供为准。"})
+        contents.append({"role": "user", "parts": first_parts})
+        for turn in hist:
+            t_role = "model" if turn.get("role") == "model" else "user"
+            t_txt = str(turn.get("text"))
+            if contents and contents[-1]["role"] == t_role:
+                contents[-1]["parts"].append({"text": t_txt})
+            else:
+                contents.append({"role": t_role, "parts": [{"text": t_txt}]})
+        if contents and contents[-1]["role"] == "user":
+            contents[-1]["parts"].append({"text": effective_prompt})
+        else:
+            contents.append({"role": "user", "parts": [{"text": effective_prompt}]})
     else:
         first_parts.append({"text": effective_prompt})
         contents.append({"role": "user", "parts": first_parts})
@@ -6774,8 +7056,7 @@ def ai_auto_debug_and_heal(cfg, stage, exc=None, extra=None, page=None, force=Fa
             if call_res.get("ok"):
                 raw_txt = str(call_res.get("reply") or "").strip()
                 raw_txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_txt, flags=re.IGNORECASE | re.DOTALL).strip()
-                m_obj = re.search(r"\{.*\}", raw_txt, flags=re.DOTALL)
-                parsed = json.loads(m_obj.group(0) if m_obj else raw_txt)
+                parsed = _parse_first_json_dict(raw_txt)
                 if isinstance(parsed, dict) and "observation" in parsed:
                     valid_acts = [a for a in (parsed.get("actions") or []) if a in _AI_HEAL_ALLOWED_ACTIONS]
                     plan = {
@@ -7150,23 +7431,26 @@ def wait_for_recovery(title, detail, hint="", actions=None, timeout_sec=900, err
             "actions": act_list,
             "error_detail": det,
         }
-    set_step(f"暂停待处理：{title}")
-    log(f"⚠️ {title} — {str(detail or '').replace(chr(10), ' ')}")
     try:
-        record_run_journal(load_config(), status="paused_err", mode="waiting_fix", round_label="待排障", error_detail=det)
-    except Exception:
-        pass
-    _notify_runtime_state()
-    deadline = time.monotonic() + max(10.0, float(timeout_sec))
-    try:
+        try:
+            set_step(f"暂停待处理：{title}")
+        except Exception:
+            pass
+        log(f"⚠️ {title} — {str(detail or '').replace(chr(10), ' ')}")
+        try:
+            record_run_journal(load_config(), status="paused_err", mode="waiting_fix", round_label="待排障", error_detail=det)
+        except Exception:
+            pass
+        _notify_runtime_state()
+        deadline = time.monotonic() + max(10.0, float(timeout_sec))
         with _runtime_cond:
             while time.monotonic() < deadline:
                 if _stop_requested:
-                    raise RuntimeError("用户手动停止了任务")
+                    raise TaskStoppedError("用户手动停止了任务")
                 choice = _recovery_choice
                 if choice is not None:
                     if choice == "cancel":
-                        raise RuntimeError("用户手动停止了任务")
+                        raise TaskStoppedError("用户手动停止了任务")
                     log(f"▶ 正在执行恢复操作：{choice}")
                     return choice
                 _runtime_cond.wait(timeout=0.25)
@@ -7175,7 +7459,8 @@ def wait_for_recovery(title, detail, hint="", actions=None, timeout_sec=900, err
         with _runtime_cond:
             _waiting_recovery = False
             _recovery_choice = None
-            _runtime_prompt = _default_running_prompt()
+            if not _stop_requested and _runtime_prompt.get("mode") != "stopped":
+                _runtime_prompt = _apply_hands_off_to_prompt(_default_running_prompt())
             _runtime_cond.notify_all()
         _notify_runtime_state()
 
@@ -7411,13 +7696,14 @@ def set_clipboard_windows(text):
 
     # 极端被占锁时的保底兜底：务必加 UTF-16LE BOM 防止 IsTextUnicode 误判
     try:
-        subprocess.run(
+        cp = subprocess.run(
             ["clip"],
             input=b"\xff\xfe" + s.encode("utf-16-le"),
             check=False,
             timeout=5,
             creationflags=_no_window_flags(),
         )
+        return cp.returncode == 0
     except Exception:
         pass
     return False
@@ -7514,6 +7800,7 @@ def clipboard_has_image():
 
 def get_clipboard_image_size():
     """读取剪贴板位图尺寸 (width, height)，无法读取返回 None。"""
+    obj = None
     try:
         from PIL import ImageGrab
         obj = ImageGrab.grabclipboard()
@@ -7521,6 +7808,12 @@ def get_clipboard_image_size():
             return obj.size
     except Exception:
         pass
+    finally:
+        if obj is not None and hasattr(obj, "close"):
+            try:
+                obj.close()
+            except Exception:
+                pass
     return None
 
 
@@ -7999,6 +8292,7 @@ DEFAULT_CONFIG = {
     "dt_clear_before_send": True,  # 粘贴前先清空聊天输入框原有残留内容
     "dt_paste_delay_sec": 1,     # 打开/切入会话后等待几秒再粘贴图片（1秒极速就绪）
     "dt_send_wait_sec": 5,       # 截图与文案全部写入输入框后，等待几秒再直接按 Enter 发送（默认5秒）
+    "wps_post_copy_wait_sec": 5, # WPS「复制为图片」成功进入剪贴板后，稳态等待几秒再切换去粘贴（默认5秒）
     "dt_silent_send": True,      # 发送前自动勾选「设为静音」（静音发送）
     "dt_minimize_after_send": True,  # 自动发送完成后最小化钉钉窗口
     "dt_search": "文件小助手",    # 钉钉搜索的主会话名（兼容单目标及回退）
@@ -8181,6 +8475,13 @@ def normalize_config(cfg):
     except Exception:
         s_wait = 5
     out["dt_send_wait_sec"] = max(0, min(30, s_wait))
+    try:
+        w_wait = out.get("wps_post_copy_wait_sec", 5)
+        w_wait = 5.0 if isinstance(w_wait, bool) or w_wait in (None, "") else float(w_wait)
+    except Exception:
+        w_wait = 5.0
+    w_wait = max(0.0, min(15.0, round(w_wait, 2)))
+    out["wps_post_copy_wait_sec"] = int(w_wait) if abs(w_wait - round(w_wait)) < 1e-6 else w_wait
 
     if out.get("dt_time_mode") not in ("datetime", "date_only", "none"):
         out["dt_time_mode"] = "datetime"
@@ -8196,7 +8497,9 @@ def normalize_config(cfg):
     if ai_prov not in ("gemini", "openai_compat", "local_only"):
         ai_prov = "gemini"
     ai_base = str(ai_cfg.get("api_base") or "").strip().rstrip("/")
-    ai_key = str(ai_cfg.get("api_key") or "").strip() or DEFAULT_GEMINI_API_KEY
+    ai_key = str(ai_cfg.get("api_key") or "").strip()
+    if not ai_key and ai_prov == "gemini" and _is_official_gemini_base(ai_base):
+        ai_key = str(DEFAULT_GEMINI_API_KEY or "").strip()
     ai_model = str(ai_cfg.get("model") or GEMINI_MODEL_CANDIDATES[0]).replace("models/", "").strip() or GEMINI_MODEL_CANDIDATES[0]
     attach_st = str(ai_cfg.get("attach_style") or "brief").strip().lower()
     if attach_st not in AI_SUMMARY_STYLES:
@@ -8630,8 +8933,9 @@ def resolve_preset_day_offset(item, cfg=None, lt=None, hm_override=None):
     cur_min = h * 60 + m
 
     ov = ((cfg or {}).get("point_overrides") or {}).get(hm)
-    if isinstance(ov, dict) and ov.get("sheet_day_offset") is not None:
-        return _clamp_day_offset(ov.get("sheet_day_offset"), 0), f"单点({hm})"
+    ov_sh_off = _clamp_day_offset(ov.get("sheet_day_offset"), None) if isinstance(ov, dict) else None
+    if ov_sh_off is not None:
+        return ov_sh_off, f"单点({hm})"
 
     if isinstance(item, dict) and item.get("cutoff_enabled"):
         cut_hm = _norm_hm_str(item.get("cutoff_hm"), "09:00")
@@ -8665,8 +8969,9 @@ def resolve_dingtalk_time_policy(cfg, lt=None, hm_override=None):
     if d_fmt not in ("YYYY-MM-DD", "YYYY年M月D日", "M月D日"):
         d_fmt = "YYYY-MM-DD"
 
-    if ov_dict.get("msg_day_offset") is not None:
-        d_off = _clamp_day_offset(ov_dict.get("msg_day_offset"), 0)
+    ov_msg_off = _clamp_day_offset(ov_dict.get("msg_day_offset"), None)
+    if ov_msg_off is not None:
+        d_off = ov_msg_off
         src = f"单点({hm})"
     elif cfg.get("dt_cutoff_enabled"):
         cut_hm = _norm_hm_str(cfg.get("dt_cutoff_hm"), "09:00")
@@ -8690,13 +8995,14 @@ def build_dingtalk_message_text(cfg, lt=None, hm_override=None, is_preview=False
     hm = _norm_hm_str(hm_override, f"{lt.tm_hour:02d}:{lt.tm_min:02d}") if hm_override else f"{lt.tm_hour:02d}:{lt.tm_min:02d}"
     suffix, suffix_src = resolve_suffix_for_time(cfg, lt=lt, hm_override=hm)
     t_mode, d_fmt, d_off, time_src = resolve_dingtalk_time_policy(cfg, lt=lt, hm_override=hm)
-    shifted_lt = _shift_lt(lt, d_off)
-    date_part = format_preset_date(lt=shifted_lt, date_fmt=d_fmt, day_offset=0)
     use_actual_clock = bool((cfg or {}).get("dt_use_actual_clock", False)) and (not is_preview)
+    act_lt = time.localtime() if use_actual_clock else None
+    base_date_lt = act_lt if (use_actual_clock and t_mode == "datetime") else lt
+    shifted_lt = _shift_lt(base_date_lt, d_off)
+    date_part = format_preset_date(lt=shifted_lt, date_fmt=d_fmt, day_offset=0)
 
     if t_mode == "datetime":
         if use_actual_clock:
-            act_lt = time.localtime()
             clock_hm = f"{act_lt.tm_hour:02d}:{act_lt.tm_min:02d}"
         else:
             clock_hm = hm
@@ -8758,28 +9064,69 @@ _keep_awake_lock = threading.Lock()
 _keep_awake_reasons = set()
 
 
+_keep_awake_counts = {}
+_keep_awake_worker_q = None
+_keep_awake_worker_started = False
+
+
+def _ensure_keep_awake_worker():
+    global _keep_awake_worker_q, _keep_awake_worker_started
+    if _keep_awake_worker_started:
+        return _keep_awake_worker_q
+    import queue as _ka_q
+    q = _ka_q.SimpleQueue()
+    _keep_awake_worker_q = q
+    _keep_awake_worker_started = True
+
+    def _ka_loop():
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.SetThreadExecutionState.argtypes = [wintypes.DWORD]
+        k32.SetThreadExecutionState.restype = wintypes.DWORD
+        while True:
+            item = q.get()
+            flags, done_ev, box = item
+            try:
+                prev = k32.SetThreadExecutionState(flags)
+                box[0] = (prev != 0)
+            except Exception:
+                box[0] = False
+            finally:
+                done_ev.set()
+
+    threading.Thread(target=_ka_loop, daemon=True, name="SheetMateKeepAwake").start()
+    return q
+
+
 def set_keep_awake(enable=True, reason="manual"):
-    """调用 Win32 SetThreadExecutionState 在自动值守或执行期间阻止电脑自动休眠与息屏。"""
+    """由专用常驻线程调用 Win32 SetThreadExecutionState 并按引用计数防休眠，避免跨线程释放失效。"""
     if os.name != "nt":
         return False
     ES_CONTINUOUS = 0x80000000
     ES_SYSTEM_REQUIRED = 0x00000001
     ES_DISPLAY_REQUIRED = 0x00000002
+    r_key = str(reason or "manual")
     with _keep_awake_lock:
         if enable:
-            _keep_awake_reasons.add(reason)
+            _keep_awake_reasons.add(r_key)
+            _keep_awake_counts[r_key] = _keep_awake_counts.get(r_key, 0) + 1
             flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
         else:
-            _keep_awake_reasons.discard(reason)
-            if _keep_awake_reasons:
+            cur_c = _keep_awake_counts.get(r_key, 0)
+            if cur_c > 1:
+                _keep_awake_counts[r_key] = cur_c - 1
+            else:
+                _keep_awake_counts.pop(r_key, None)
+                _keep_awake_reasons.discard(r_key)
+            if _keep_awake_counts:
                 return True
             flags = ES_CONTINUOUS
+        q = _ensure_keep_awake_worker()
     try:
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.SetThreadExecutionState.argtypes = [wintypes.DWORD]
-        k32.SetThreadExecutionState.restype = wintypes.DWORD
-        prev = k32.SetThreadExecutionState(flags)
-        return prev != 0
+        ev = threading.Event()
+        box = [False]
+        q.put((flags, ev, box))
+        ev.wait(timeout=2.0)
+        return bool(box[0])
     except Exception:
         return False
 
@@ -8933,7 +9280,7 @@ def build_daily_timetable(cfg):
         elif start_m > end_m:
             span = (1440 - start_m) + end_m
         else:
-            span = 1440
+            span = 1
         offset = 0
         guard = 0
         while offset < span and guard < 1442:
@@ -9051,24 +9398,20 @@ def compute_raw_sync_due(cfg, now_ts=None, last_paste_ts=0.0, next_send_ts=0.0, 
         return {"enabled": True, "due": False, "next_ts": 0.0, "interval_min": iv, "skipped_reason": "今日不在运行周期"}
 
     if not rs.get("all_day", True):
-        st_h, st_m = parse_hm(_norm_hm_str(rs.get("start"), "00:00"))
-        ed_h, ed_m = parse_hm(_norm_hm_str(rs.get("end"), "23:59"))
-        sm = st_h * 60 + st_m
-        em = ed_h * 60 + ed_m
         cur_m = now_lt.tm_hour * 60 + now_lt.tm_min
-        in_win = True if sm == em else ((sm <= cur_m < em) if sm < em else (cur_m >= sm or cur_m < em))
+        in_win = in_time_window(cur_m, rs.get("start") or "00:00", rs.get("end") or "23:59", inclusive_end=True)
         if not in_win:
             return {"enabled": True, "due": False, "next_ts": 0.0, "interval_min": iv, "skipped_reason": "当前不在刷底表时段"}
 
     base_ts = float(last_paste_ts or 0.0)
     if base_ts <= 0.0:
-        base_ts = float(schedule_started_ts or now_ts)
-    due_ts = base_ts + iv * 60.0
-    if now_ts < due_ts:
+        base_ts = float(schedule_started_ts or 0.0)
+    due_ts = (base_ts + iv * 60.0) if base_ts > 0.0 else 0.0
+    if due_ts > 0.0 and now_ts < due_ts:
         return {"enabled": True, "due": False, "next_ts": due_ts, "interval_min": iv, "skipped_reason": ""}
 
     next_send = float(next_send_ts or 0.0)
-    if skip_min > 0 and next_send > now_ts and (next_send - now_ts) <= skip_min * 60.0:
+    if skip_min > 0 and next_send > 0.0 and -60.0 <= (next_send - now_ts) <= skip_min * 60.0:
         rem_min = max(1, int((next_send - now_ts + 59) // 60))
         return {
             "enabled": True,
@@ -9179,21 +9522,44 @@ def download_xlsx(page, name, url, save_dir):
             dl = dl_info.value
             save_path = save_dir / f"{name}.xlsx"
             dl.save_as(str(save_path))
+            with open(save_path, "rb") as _rf_hdr:
+                hdr = _rf_hdr.read(4)
+            if not hdr.startswith(b"PK"):
+                try:
+                    save_path.unlink()
+                except Exception:
+                    pass
+                log(f"  ⚠️ 【{name}】下载文件内容不是有效 .xlsx（可能格式未切换成功），准备重试")
+                continue
             log(f"✅ 【{name}】下载完成")
             return save_path
-        except Exception:
+        except Exception as e_dl:
+            if _is_stop_exception(e_dl):
+                raise
             log(f"  【{name}】本次下载未成功")
     log(f"  【{name}】两次下载均未成功")
     return None
 
 
+def _sanitize_tsv_cell(cell_val):
+    if cell_val is None:
+        return ""
+    s = str(cell_val)
+    return s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+
+
 def xlsx_to_tsv(xlsx_path, tsv_path):
     wb = openpyxl.load_workbook(xlsx_path, read_only=True)
-    ws = wb.active
-    with open(tsv_path, "w", encoding="utf-8", newline="") as f:
-        for row in ws.iter_rows(values_only=True):
-            f.write("\t".join(str(c) if c is not None else "" for c in row) + "\n")
-    wb.close()
+    try:
+        ws = wb.active
+        with open(tsv_path, "w", encoding="utf-8", newline="") as f:
+            for row in ws.iter_rows(values_only=True):
+                f.write("\t".join(_sanitize_tsv_cell(c) for c in row) + "\n")
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
     log(f"✅ 【{tsv_path.stem}】格式转换完成")
 
 
@@ -9231,16 +9597,23 @@ def paste_to_wps(page, sheet_name, tsv_path):
         if not switch_wps_sheet(page, sheet_name):
             raise RuntimeError(f"没找到【{sheet_name}】这个工作表")
 
+        with open(tsv_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        if not set_clipboard_windows(content):
+            raise RuntimeError(f"无法将【{sheet_name}】数据写入系统剪贴板，已中止以避免误清空底表")
+        if content.strip():
+            clip_chk = get_clipboard_text_windows()
+            if not clip_chk or clip_chk[:40] != content[:40]:
+                if not set_clipboard_windows(content):
+                    raise RuntimeError(f"剪贴板回读校验失败，已中止清空【{sheet_name}】")
+
         sleep_check(3)
         page.keyboard.press("Control+A")
         sleep_check(0.5)
         page.keyboard.press("Delete")
         sleep_check(1)
 
-        with open(tsv_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        set_clipboard_windows(content)
-        sleep_check(0.5)
+        sleep_check(0.2)
         page.keyboard.press("Control+V")
         sleep_check(3)
         log(f"✅ 【{sheet_name}】写入完成")
@@ -9363,6 +9736,8 @@ def _main_canvas_box(page):
     """表格主体是面积最大的 canvas，返回其 bounding box。"""
     boxes = [c.bounding_box() for c in page.query_selector_all("canvas")]
     boxes = [b for b in boxes if b]
+    if not boxes:
+        return None
     return max(boxes, key=lambda b: b["width"] * b["height"])
 
 
@@ -9426,9 +9801,19 @@ def _preset_readback_matches(action, expected_val, actual_val, lt=None, day_offs
         return False
     exp_norm = _normalize_preset_text(expected_val)
     if action == "today":
+        if act_norm == exp_norm:
+            return True
         target_lt = _shift_lt(lt or time.localtime(), day_offset=day_offset)
-        nums = re.findall(r"\d+", act_norm)
-        return (str(target_lt.tm_mon) in nums and str(target_lt.tm_mday) in nums) or (act_norm == exp_norm)
+        try:
+            nums = [int(x) for x in re.findall(r"\d+", act_norm)]
+        except Exception:
+            nums = []
+        ty, tm, td = target_lt.tm_year, target_lt.tm_mon, target_lt.tm_mday
+        if len(nums) >= 3:
+            return any(nums[i] == ty and nums[i + 1] == tm and nums[i + 2] == td for i in range(len(nums) - 2))
+        if len(nums) >= 2:
+            return any(nums[i] == tm and nums[i + 1] == td for i in range(len(nums) - 1))
+        return False
     return act_norm == exp_norm
 
 
@@ -9521,7 +9906,12 @@ def apply_wps_summary_presets(page, cfg, lt=None, hm_override=None, after_data_p
                 if switch_wps_sheet(page, target_sheet):
                     current_sheet = target_sheet
                     sleep_check(0.8)
+                else:
+                    log(f"  ⚠️ 切换工作表「{target_sheet}」失败，跳过对应格位")
+                    continue
             except Exception as e_sw:
+                if _is_stop_exception(e_sw):
+                    raise
                 log(f"  ⚠️ 切换工作表「{target_sheet}」失败，跳过对应格位：{e_sw}")
                 continue
 
@@ -9616,8 +10006,9 @@ def apply_wps_summary_presets(page, cfg, lt=None, hm_override=None, after_data_p
         try:
             switch_wps_sheet(page, "数据汇总")
             sleep_check(0.6)
-        except Exception:
-            pass
+        except Exception as e_ret:
+            if _is_stop_exception(e_ret):
+                raise
     try:
         page.keyboard.press("Escape")
     except Exception:
@@ -9740,13 +10131,25 @@ def _detect_last_row(page, start_cell="Q8"):
     return None
 
 
+_C6_BANNER_RGB = (54, 76, 116)  # #364C74：数据汇总第 6 行深蓝标题栏（11月24日…个人数据明细）
+
+
+def _mouse_move_smooth(page, x, y, steps=12):
+    """兼容真实 Playwright 与单元测试 Mock 的平滑鼠标移动辅助函数。"""
+    try:
+        page.mouse.move(float(x), float(y), steps=int(steps))
+    except TypeError:
+        page.mouse.move(float(x), float(y))
+
+
 def _set_wps_zoom(page, percent):
-    """通过右下角真实缩放控件设置比例，并回读确认。"""
+    """通过右下角真实缩放控件设置比例，放慢等待画布重排稳态并回读确认。"""
     wanted = f"{percent}%"
+    is_hi = int(percent) >= 150
     for _attempt in range(2):
         try:
             page.click("div.zoom-value", timeout=4000)
-            time.sleep(0.25)
+            sleep_check(0.35)
             zin = None
             for el in page.query_selector_all("input"):
                 try:
@@ -9760,12 +10163,15 @@ def _set_wps_zoom(page, percent):
                 page.keyboard.press("Enter")
             else:
                 page.click(f".panel-item.only-text:text-is('{wanted}')", timeout=2500)
-            time.sleep(0.6)
+            sleep_check(1.15 if is_hi else 0.75)
             actual = (page.locator("div.zoom-value").inner_text() or "").strip()
             if actual == wanted:
                 log(f"  缩放比例已确认为 {wanted}")
+                sleep_check(0.45 if is_hi else 0.25)
                 return
-        except Exception:
+        except Exception as e_zm:
+            if "手动停止" in str(e_zm):
+                raise
             try:
                 page.keyboard.press("Escape")
             except Exception:
@@ -9806,9 +10212,118 @@ def _find_wps_green_pixels(im, dr=24, dg=30, db=30):
         return xs, ys
 
 
-def _active_cell_rect(page, cell):
-    """名称框定位单元格后，从 canvas 选中框读取其真实像素位置。"""
-    _goto_cell(page, cell)
+def _find_c6_header_banner_bbox(im, min_width_ratio=0.18, min_height_px=12):
+    """基于 #364C74 (RGB 54,76,116) 精确识别汇总表第 6 行（C6 区域）深蓝标题横条像素边界。"""
+    w, h = im.size
+    if w < 60 or h < 40:
+        return None
+    top_guard = min(max(12, int(h * 0.045)), max(0, h // 3))
+    left_guard = min(max(12, int(w * 0.035)), max(0, w // 4))
+    min_row_px = max(36, int(w * float(min_width_ratio)))
+    mask = None
+    try:
+        import numpy as np  # type: ignore[import-not-found]
+        arr = np.asarray(im)
+        sub = arr[top_guard:, left_guard:]
+        r = sub[:, :, 0].astype(np.int16)
+        g = sub[:, :, 1].astype(np.int16)
+        b = sub[:, :, 2].astype(np.int16)
+        mask = (
+            (np.abs(r - _C6_BANNER_RGB[0]) <= 26)
+            & (np.abs(g - _C6_BANNER_RGB[1]) <= 30)
+            & (np.abs(b - _C6_BANNER_RGB[2]) <= 28)
+            & (b >= g + 8)
+            & (g >= r + 4)
+            & (b >= 84)
+        )
+        row_cnts = mask.sum(axis=1)
+        hit_rel = np.flatnonzero(row_cnts >= min_row_px).tolist()
+    except Exception:
+        pix = im.load()
+        hit_rel = []
+        for y in range(top_guard, h):
+            cnt = 0
+            for x in range(left_guard, w):
+                rv, gv, bv = pix[x, y]
+                if (
+                    abs(rv - _C6_BANNER_RGB[0]) <= 26
+                    and abs(gv - _C6_BANNER_RGB[1]) <= 30
+                    and abs(bv - _C6_BANNER_RGB[2]) <= 28
+                    and bv >= gv + 8
+                    and gv >= rv + 4
+                    and bv >= 84
+                ):
+                    cnt += 1
+            if cnt >= min_row_px:
+                hit_rel.append(y - top_guard)
+    if not hit_rel:
+        return None
+
+    bands = []
+    bs = hit_rel[0]
+    be = hit_rel[0]
+    for ry in hit_rel[1:]:
+        if ry <= be + 3:
+            be = ry
+        else:
+            bands.append((bs, be))
+            bs = be = ry
+    bands.append((bs, be))
+
+    best = None
+    best_score = -1
+    for bs, be in bands:
+        bh = be - bs + 1
+        if bh < int(min_height_px):
+            continue
+        if mask is not None:
+            import numpy as np  # type: ignore[import-not-found]
+            band_m = mask[bs : be + 1, :]
+            px_cnt = int(band_m.sum())
+            col_cnts = band_m.sum(axis=0)
+            col_thresh = max(2, bh // 3) if bh >= 6 else 1
+            xs_rel = np.flatnonzero(col_cnts >= col_thresh)
+            if len(xs_rel) == 0:
+                xs_rel = np.flatnonzero(band_m.any(axis=0))
+            if len(xs_rel) == 0:
+                continue
+            px0 = int(xs_rel[0]) + left_guard
+            px1 = int(xs_rel[-1]) + left_guard
+        else:
+            pix = im.load()
+            xs_all = []
+            px_cnt = 0
+            for y in range(bs + top_guard, be + top_guard + 1):
+                for x in range(left_guard, w):
+                    rv, gv, bv = pix[x, y]
+                    if (
+                        abs(rv - _C6_BANNER_RGB[0]) <= 26
+                        and abs(gv - _C6_BANNER_RGB[1]) <= 30
+                        and abs(bv - _C6_BANNER_RGB[2]) <= 28
+                        and bv >= gv + 8
+                        and gv >= rv + 4
+                        and bv >= 84
+                    ):
+                        px_cnt += 1
+                        xs_all.append(x)
+            if not xs_all:
+                continue
+            px0 = min(xs_all)
+            px1 = max(xs_all)
+        bw = px1 - px0 + 1
+        if bw < min_row_px:
+            continue
+        cov = float(px_cnt) / float(max(1, bw * bh))
+        if cov < 0.28:
+            continue
+        if px_cnt > best_score:
+            best_score = px_cnt
+            best = (px0, bs + top_guard, px1, be + top_guard, px_cnt, cov)
+    return best
+
+
+def _capture_main_canvas_rgb(page):
+    """截取主表格 canvas 的 RGB 图像与 DPR 换算比例，返回 (box, im_rgb, scale_x, scale_y)。"""
     box = _main_canvas_box(page)
     if box is None:
         raise RuntimeError("没有找到表格画布")
@@ -9822,21 +10337,135 @@ def _active_cell_rect(page, cell):
             pass
     if not canvases:
         raise RuntimeError("表格画布尚未准备好")
-    target, _ = max(canvases, key=lambda it: it[1]["width"] * it[1]["height"])
+    target, t_box = max(canvases, key=lambda it: it[1]["width"] * it[1]["height"])
+    use_box = t_box or box
     shot_buf = io.BytesIO(target.screenshot())
-    im = None
-    im_crop = None
     try:
         with Image.open(shot_buf) as raw_im:
-            im = raw_im.convert("RGB")
+            im_rgb = raw_im.convert("RGB")
+        scale_x = max(1.0, float(im_rgb.width) / max(1.0, float(use_box["width"])))
+        scale_y = max(1.0, float(im_rgb.height) / max(1.0, float(use_box["height"])))
+        return use_box, im_rgb, scale_x, scale_y
+    finally:
+        try:
+            shot_buf.close()
+        except Exception:
+            pass
+
+
+def _largest_pixel_component_rect(pts, min_len=6):
+    """从像素点集中提取最大 8-连通分量外接框 (min_x, min_y, max_x, max_y)。"""
+    if len(pts) < int(min_len):
+        return None
+    remaining = set(pts)
+    comps = []
+    while remaining:
+        seed = remaining.pop()
+        stack = [seed]
+        comp_i = [seed]
+        while stack:
+            x, y = stack.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    q = (x + dx, y + dy)
+                    if q in remaining:
+                        remaining.remove(q)
+                        stack.append(q)
+                        comp_i.append(q)
+        comps.append(comp_i)
+    comp = max(comps, key=len)
+    if len(comp) < int(min_len):
+        return None
+    return (
+        min(x for x, _ in comp),
+        min(y for _, y in comp),
+        max(x for x, _ in comp),
+        max(y for _, y in comp),
+    )
+
+
+def _diff_active_cell_rect(im_ref, im_cur, scale_x, scale_y, min_x_css=0.0, min_y_css=0.0):
+    """通过 A1 参考帧与目标帧的像素差分精确提取新激活单元格绿框，彻底排除第1行图标与远端静态绿块干扰。"""
+    if im_ref is None or im_cur is None or im_ref.size != im_cur.size:
+        return None
+    w, h = im_cur.size
+    left_px = max(int(14 * scale_x), int(float(min_x_css) * scale_x))
+    top_px = max(int(12 * scale_y), int(float(min_y_css) * scale_y))
+    if left_px >= w - 4 or top_px >= h - 4:
+        left_px = 0
+        top_px = 0
+    try:
+        import numpy as np  # type: ignore[import-not-found]
+        a = np.asarray(im_ref)
+        b = np.asarray(im_cur)
+        # 检查背景是否发生大面积滚动（抽样中位像素差应近似为 0）
+        bg_diff = np.abs(a[::16, ::16].astype(np.int16) - b[::16, ::16].astype(np.int16))
+        if float(np.median(bg_diff)) > 4.0:
+            return None
+        diff_sub = np.max(np.abs(a[top_px:, left_px:].astype(np.int16) - b[top_px:, left_px:].astype(np.int16)), axis=2)
+        sub_b = b[top_px:, left_px:]
+        r_ch, g_ch, b_ch = sub_b[:, :, 0], sub_b[:, :, 1], sub_b[:, :, 2]
+        green_cur = (r_ch <= 45) & (g_ch >= 118) & (g_ch <= 190) & (b_ch >= 68) & (b_ch <= 140)
+        ys, xs = np.nonzero((diff_sub >= 18) & green_cur)
+        pts = [(int(x) + left_px, int(y) + top_px) for x, y in zip(xs.tolist(), ys.tolist())]
+        box_px = _largest_pixel_component_rect(pts, min_len=6)
+        if box_px is None:
+            ys2, xs2 = np.nonzero(diff_sub >= 28)
+            if 6 <= len(ys2) <= int(w * h * 0.15):
+                pts2 = [(int(x) + left_px, int(y) + top_px) for x, y in zip(xs2.tolist(), ys2.tolist())]
+                box_px = _largest_pixel_component_rect(pts2, min_len=6)
+    except Exception:
+        pix_a = im_ref.load()
+        pix_b = im_cur.load()
+        pts = []
+        for y in range(top_px, h):
+            for x in range(left_px, w):
+                ra, ga, ba = pix_a[x, y]
+                rb, gb, bb = pix_b[x, y]
+                if max(abs(ra - rb), abs(ga - gb), abs(ba - bb)) >= 18 and abs(rb - 16) < 28 and abs(gb - 153) < 34 and abs(bb - 104) < 34:
+                    pts.append((x, y))
+        box_px = _largest_pixel_component_rect(pts, min_len=6)
+
+    if box_px is None:
+        return None
+    px0, py0, px1, py1 = box_px
+    return (px0 / scale_x, py0 / scale_y, px1 / scale_x, py1 / scale_y)
+
+
+def _active_cell_rect(page, cell, ref_im=None, min_x_css=0.0, min_y_css=0.0):
+    """名称框定位单元格后，优先使用帧差分 + C6 #364C74 横带读取并按 DPR 换算回 CSS 像素位置。"""
+    _goto_cell(page, cell)
+    sleep_check(0.20)
+    use_box, im, scale_x, scale_y = _capture_main_canvas_rgb(page)
+    im_crop = None
+    try:
+        if ref_im is not None:
+            diff_rect = _diff_active_cell_rect(
+                ref_im,
+                im,
+                scale_x,
+                scale_y,
+                min_x_css=min_x_css,
+                min_y_css=min_y_css,
+            )
+            if diff_rect is not None:
+                return use_box, diff_rect
+
+        if str(cell or "").strip().upper() == "C6":
+            c6_box = _find_c6_header_banner_bbox(im, min_width_ratio=0.10, min_height_px=4)
+            if c6_box is not None:
+                px0, py0, px1, py1, _, _ = c6_box
+                return use_box, (px0 / scale_x, py0 / scale_y, px1 / scale_x, py1 / scale_y)
+
         scan_im = im
-        if im.height > 700:
-            im_crop = im.crop((0, 0, im.width, 700))
+        max_scan_h = int(700 * scale_y)
+        if im.height > max_scan_h:
+            im_crop = im.crop((0, 0, im.width, max_scan_h))
             scan_im = im_crop
         xs, ys = _find_wps_green_pixels(scan_im, dr=24, dg=30, db=30)
         pts = list(zip(xs, ys))
     finally:
-        for obj in (im_crop, im, shot_buf):
+        for obj in (im_crop, im):
             if obj is not None:
                 try:
                     obj.close()
@@ -9844,90 +10473,421 @@ def _active_cell_rect(page, cell):
                     pass
     if not pts:
         raise RuntimeError(f"没有识别到 {cell} 的选中框")
-    if cell == "C6":
-        comp = pts
+
+    # 非 A1 目标过滤掉超出指定区域或第 1 行静态图标的像素（若过滤后仍有有效框）
+    if str(cell or "").strip().upper() != "A1":
+        lim_x = max(0.0, float(min_x_css) * scale_x)
+        lim_y = max(14.0 * scale_y if float(min_y_css) > 0 else 0.0, float(min_y_css) * scale_y)
+        filtered = [(x, y) for x, y in pts if x >= lim_x and y >= lim_y]
+        if len(filtered) >= 6:
+            pts = filtered
+
+    if str(cell or "").strip().upper() == "C6":
+        comp_pts = pts
+        rect = (
+            min(x for x, _ in comp_pts) / scale_x,
+            min(y for _, y in comp_pts) / scale_y,
+            max(x for x, _ in comp_pts) / scale_x,
+            max(y for _, y in comp_pts) / scale_y,
+        )
     else:
-        remaining = set(pts)
-        comps = []
-        while remaining:
-            seed = remaining.pop()
-            stack = [seed]
-            comp_i = [seed]
-            while stack:
-                x, y = stack.pop()
-                for dy in (-1, 0, 1):
-                    for dx in (-1, 0, 1):
-                        q = (x + dx, y + dy)
-                        if q in remaining:
-                            remaining.remove(q)
-                            stack.append(q)
-                            comp_i.append(q)
-            comps.append(comp_i)
-        comp = max(comps, key=len)
-    rect = (min(x for x, y in comp), min(y for x, y in comp),
-            max(x for x, y in comp), max(y for x, y in comp))
-    return box, rect
+        comp_box = _largest_pixel_component_rect(pts, min_len=1)
+        if comp_box is None:
+            raise RuntimeError(f"没有识别到 {cell} 的选中框")
+        rect = (
+            comp_box[0] / scale_x,
+            comp_box[1] / scale_y,
+            comp_box[2] / scale_x,
+            comp_box[3] / scale_y,
+        )
+    return use_box, rect
+
+
+def _verify_selection_by_tsv(page, last_row, min_cols=18):
+    """通过 Ctrl+C 采样剪贴板 TSV 核验选区是否真包含多行多列数据（绕开名称框仅显示起点 C6）。"""
+    global _last_captured_summary_tsv
+    try:
+        clear_clipboard_windows()
+        page.keyboard.press("Control+C")
+        dl = time.monotonic() + 0.70
+        txt = ""
+        while time.monotonic() < dl:
+            time.sleep(0.10)
+            txt = get_clipboard_text_windows()
+            if txt and len(txt.strip()) >= 12:
+                break
+        if not txt:
+            return False, 0, 0
+        lines = [ln for ln in txt.rstrip("\r\n").splitlines() if ln.strip()]
+        row_cnt = len(lines)
+        col_cnt = max((ln.count("\t") + 1 for ln in lines), default=0)
+        exp_rows = max(2, int(last_row) - 5)
+        need_rows = max(2, min(exp_rows - 1, int(exp_rows * 0.45))) if exp_rows > 2 else 2
+        ok = (row_cnt >= need_rows and col_cnt >= int(min_cols))
+        if ok and len(txt.strip()) >= 20:
+            _last_captured_summary_tsv = txt
+        return ok, row_cnt, col_cnt
+    except Exception:
+        return False, 0, 0
 
 
 def _select_wps_range(page, last_row, end_col="AK", use_mouse=True):
-    """选中 C6:AK{last_row}（允许 AJ~AK 列）：20% 缩放框选，失败改用 Shift+终点点击，彻底绕开合并单元格跳列。"""
+    """四层稳态选中 C6:AK{last_row}：名称框直选 -> 20%缩放差分框选 -> Shift+终点+TSV核验 -> 键盘C6下扩兜底。"""
+    expected_cols = max(1, _col_letter_to_idx(end_col) - _col_letter_to_idx("C") + 1)
+
     def _verify_range(selection):
-        m = re.search(r"(\d+)R\s*x\s*(\d+)C", selection or "")
+        m = re.search(r"(\d+)\s*R\s*[x×]\s*(\d+)\s*C", selection or "")
         rows = int(m.group(1)) if m else 0
         cols = int(m.group(2)) if m else 0
-        if rows != last_row - 5 or not (34 <= cols <= 35):
+        if rows != last_row - 5 or not (max(1, expected_cols - 1) <= cols <= expected_cols + 1):
             raise RuntimeError(f"框选回读为 {selection or '未知'}")
 
+    # 通道 0：尝试名称框直输区间（若当前版本 WPS 支持则直接零误差选中）
+    try:
+        _goto_cell(page, f"C6:{end_col}{last_row}")
+        sleep_check(0.40)
+        nb_c0 = _read_wps_name_box(page)
+        if nb_c0:
+            try:
+                _verify_range(nb_c0)
+                log(f"  已通过名称框直接选中 C6:{end_col}{last_row}（{nb_c0}）")
+                return True
+            except Exception:
+                pass
+            if f":{end_col}{last_row}".upper() in nb_c0.upper():
+                ok_tsv0, rc0, cc0 = _verify_selection_by_tsv(page, last_row)
+                if ok_tsv0:
+                    log(f"  已通过名称框直选并核验选区 C6:{end_col}{last_row}（{rc0}行×{cc0}列）")
+                    return True
+    except Exception as e_c0:
+        if "手动停止" in str(e_c0):
+            raise
+
+    # 通道 1：20% 缩放 + A1 差分定位起点/终点 + 平滑缓慢拖拽框选
     if use_mouse:
+        im_ref = None
         try:
             _set_wps_zoom(page, 20)
-            box, sr = _active_cell_rect(page, "C6")
-            _, er = _active_cell_rect(page, f"{end_col}{last_row}")
-            box, sr = _active_cell_rect(page, "C6")
-            sx = box["x"] + sr[0] + 5
-            sy = box["y"] + sr[1] + max(2, (sr[3] - sr[1]) // 2)
-            ex = box["x"] + (er[0] + er[2]) // 2
-            ey = box["y"] + (er[1] + er[3]) // 2
-            page.mouse.move(sx, sy)
+            try:
+                _goto_cell(page, "A1")
+                sleep_check(0.25)
+                _, im_ref, _, _ = _capture_main_canvas_rgb(page)
+            except Exception as e_ref:
+                if _is_stop_exception(e_ref):
+                    raise
+                im_ref = None
+            box, sr = _active_cell_rect(page, "C6", ref_im=im_ref)
+            _, er = _active_cell_rect(
+                page,
+                f"{end_col}{last_row}",
+                ref_im=im_ref,
+                min_x_css=max(0.0, sr[0] - 8.0),
+                min_y_css=max(0.0, sr[3] - 2.0),
+            )
+            if er[1] < sr[1] + 2.0:
+                raise RuntimeError(f"终点纵坐标异常（{er[1]:.1f} < {sr[1]:.1f}），防止误拖向第1行")
+            sx = box["x"] + sr[0] + max(4.0, min(14.0, (sr[2] - sr[0]) * 0.08))
+            sy = box["y"] + sr[1] + max(2.0, (sr[3] - sr[1]) / 2.0)
+            ex = box["x"] + (er[0] + er[2]) / 2.0
+            ey = box["y"] + (er[1] + er[3]) / 2.0
+            _mouse_move_smooth(page, sx, sy, steps=8)
+            sleep_check(0.18)
             page.mouse.down()
-            page.mouse.move(ex, ey, steps=35)
-            time.sleep(0.25)
-            selection = page.eval_on_selector("input.edit-box", "e=>e.value")
+            _mouse_move_smooth(page, ex, ey, steps=40)
+            sleep_check(0.35)
+            selection = _read_wps_name_box(page)
             page.mouse.up()
-            _verify_range(selection)
-            log(f"  已用鼠标框选 C6:{end_col}{last_row}（{selection}）")
-            return True
+            sleep_check(0.25)
+            try:
+                _verify_range(selection)
+                log(f"  已用鼠标框选 C6:{end_col}{last_row}（{selection}）")
+                return True
+            except Exception:
+                ok_tsv1, rc1, cc1 = _verify_selection_by_tsv(page, last_row)
+                if ok_tsv1:
+                    log(f"  已用鼠标框选 C6:{end_col}{last_row}（TSV 实测 {rc1}行×{cc1}列）")
+                    return True
+                raise RuntimeError(f"框选回读为 {selection or '未知'}")
         except Exception as e:
+            if "手动停止" in str(e):
+                raise
             try:
                 page.mouse.up()
             except Exception:
                 pass
             log(f"  鼠标框选未命中，改为 Shift+终点精确框选：{human_error(e)}")
+        finally:
+            if im_ref is not None:
+                try:
+                    im_ref.close()
+                except Exception:
+                    pass
 
-    _set_wps_zoom(page, 20)
-    box, er = _active_cell_rect(page, f"{end_col}{last_row}")
-    ex = box["x"] + (er[0] + er[2]) // 2
-    ey = box["y"] + (er[1] + er[3]) // 2
-    _goto_cell(page, "C6")
-    time.sleep(0.25)
-    page.keyboard.down("Shift")
+    # 通道 2：20% 缩放 + 差分终点 + Shift+点击 + TSV 真实选区核验
+    im_ref2 = None
     try:
-        page.mouse.click(ex, ey)
-    finally:
-        page.keyboard.up("Shift")
-    time.sleep(0.35)
-    try:
-        selection = page.eval_on_selector("input.edit-box", "e=>e.value")
-        _verify_range(selection)
-        log(f"  已精准框选 C6:{end_col}{last_row}（{selection}）")
-        return True
+        _set_wps_zoom(page, 20)
+        try:
+            _goto_cell(page, "A1")
+            sleep_check(0.25)
+            _, im_ref2, _, _ = _capture_main_canvas_rgb(page)
+        except Exception as e_ref2:
+            if _is_stop_exception(e_ref2):
+                raise
+            im_ref2 = None
+        box, sr2 = _active_cell_rect(page, "C6", ref_im=im_ref2)
+        _, er2 = _active_cell_rect(
+            page,
+            f"{end_col}{last_row}",
+            ref_im=im_ref2,
+            min_x_css=max(0.0, sr2[0] - 8.0),
+            min_y_css=max(0.0, sr2[3] - 2.0),
+        )
+        if er2[1] < sr2[1] + 2.0:
+            raise RuntimeError(f"Shift终点纵坐标异常（{er2[1]:.1f} < {sr2[1]:.1f}），防止误选第1行")
+        ex = box["x"] + (er2[0] + er2[2]) / 2.0
+        ey = box["y"] + (er2[1] + er2[3]) / 2.0
+        _goto_cell(page, "C6")
+        sleep_check(0.35)
+        page.keyboard.down("Shift")
+        try:
+            _mouse_move_smooth(page, ex, ey, steps=12)
+            sleep_check(0.15)
+            page.mouse.click(ex, ey)
+            sleep_check(0.25)
+        finally:
+            page.keyboard.up("Shift")
+        sleep_check(0.40)
+        selection2 = _read_wps_name_box(page)
+        try:
+            _verify_range(selection2)
+            log(f"  已精准框选 C6:{end_col}{last_row}（{selection2}）")
+            return True
+        except Exception:
+            ok_tsv2, rc2, cc2 = _verify_selection_by_tsv(page, last_row)
+            if ok_tsv2:
+                log(f"  已通过 Shift+终点核验选中 C6:{end_col}{last_row}（TSV 实测 {rc2}行×{cc2}列）")
+                return True
     except Exception as e2:
-        log(f"  Shift+点击回读异常，按当前选区继续并依赖白边兜底：{human_error(e2)}")
+        if "手动停止" in str(e2):
+            raise
+        log(f"  Shift+点击回读异常，尝试键盘 C6 合并行下扩兜底：{human_error(e2)}")
+    finally:
+        if im_ref2 is not None:
+            try:
+                im_ref2.close()
+            except Exception:
+                pass
+
+    # 通道 3：纯键盘 C6（已横跨 C6:AK6）+ Shift+ArrowDown 逐行稳态下扩（完全不依赖鼠标）
+    try:
+        _goto_cell(page, "C6")
+        sleep_check(0.35)
+        steps_down = max(1, min(260, int(last_row) - 6))
+        for idx_dn in range(steps_down):
+            if idx_dn % 10 == 0:
+                check_stop()
+            page.keyboard.press("Shift+ArrowDown")
+            if idx_dn % 8 == 7:
+                time.sleep(0.04)
+        sleep_check(0.35)
+        ok_tsv3, rc3, cc3 = _verify_selection_by_tsv(page, last_row)
+        if ok_tsv3:
+            log(f"  已通过键盘下扩稳选 C6:{end_col}{last_row}（TSV 实测 {rc3}行×{cc3}列）")
+            return True
+        log(f"  键盘下扩后采样 {rc3}行×{cc3}列，继续依赖白边与标题栏定位…")
+        return False
+    except Exception as e3:
+        if "手动停止" in str(e3):
+            raise
+        log(f"  键盘下扩回读异常，继续依赖标题栏定位：{human_error(e3)}")
         return False
 
 
+def _col_letters_to_index(col_str):
+    """将 Excel/WPS 列标（如 C、AK）转为 1-based 列号。"""
+    n = 0
+    for ch in str(col_str or "").strip().upper():
+        if not ("A" <= ch <= "Z"):
+            return 0
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n
+
+
+def _read_wps_name_box(page):
+    """极速回读 WPS 左上角名称框（input.edit-box）当前选中区域/单元格，失败返回空串。"""
+    try:
+        loc = page.locator("input.edit-box")
+        if hasattr(loc, "count") and loc.count() <= 0:
+            return ""
+        val = loc.first.input_value() if hasattr(loc.first, "input_value") else page.eval_on_selector("input.edit-box", "e=>e.value")
+        return str(val or "").strip()
+    except Exception:
+        try:
+            return str(page.eval_on_selector("input.edit-box", "e=>e.value") or "").strip()
+        except Exception:
+            return ""
+
+
+def _is_wps_selection_valid_for_capture(name_box_val, last_row=0):
+    """校验当前名称框选区是否仍停留在汇总数据区（C6 及之后），严厉拦截 A1 或 1~5 行误点。"""
+    s = str(name_box_val or "").strip().upper()
+    if not s:
+        return False
+    m_rc = re.search(r"(\d+)\s*R\s*[X×]\s*(\d+)\s*C", s)
+    if m_rc:
+        rows_n = int(m_rc.group(1))
+        cols_n = int(m_rc.group(2))
+        return rows_n >= 2 and cols_n >= 10
+    head_part = s.split(":", 1)[0].strip()
+    m_cell = re.fullmatch(r"([A-Z]{1,3})(\d+)", head_part)
+    if not m_cell:
+        return False
+    col_idx = _col_letters_to_index(m_cell.group(1))
+    row_idx = int(m_cell.group(2))
+    # 目标汇总表左上角为 C6，禁止 A/B 列或第 1~5 行（尤其 A1 漂移）
+    return col_idx >= 3 and row_idx >= 6
+
+
+def _longest_true_run_span(vec):
+    """返回一维布尔序列中连续 True 段列表 [(start_idx, end_idx), ...]。"""
+    spans = []
+    n = len(vec)
+    i = 0
+    while i < n:
+        if vec[i]:
+            j = i
+            while j + 1 < n and vec[j + 1]:
+                j += 1
+            spans.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    return spans
+
+
+def _find_wps_selection_border_bbox(im, min_h_run=40, min_v_run=24):
+    """通过连续水平/垂直绿线边界检测 WPS 选区外框，彻底忽略第 1 行绿色图标与零星绿格干扰。"""
+    w, h = im.size
+    if w < 60 or h < 60:
+        return None
+    top_guard = min(max(40, int(h * 0.18)), max(0, h // 3))
+    left_guard = min(36, int(w * 0.03))
+    try:
+        import numpy as np  # type: ignore[import-not-found]
+        arr = np.asarray(im)
+        r_ch, g_ch, b_ch = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+        mask = (
+            (r_ch >= 0) & (r_ch <= 43)
+            & (g_ch >= 120) & (g_ch <= 186)
+            & (b_ch >= 71) & (b_ch <= 137)
+        )
+        h_lines = []
+        row_sums = mask[top_guard:, left_guard:].sum(axis=1)
+        for ry in np.flatnonzero(row_sums >= min_h_run):
+            y = int(ry) + top_guard
+            row_m = mask[y, left_guard:]
+            for sx, ex in _longest_true_run_span(row_m.tolist()):
+                if (ex - sx + 1) >= min_h_run:
+                    h_lines.append((y, sx + left_guard, ex + left_guard))
+        v_lines = []
+        col_sums = mask[top_guard:, left_guard:].sum(axis=0)
+        for cx in np.flatnonzero(col_sums >= min_v_run):
+            x = int(cx) + left_guard
+            col_m = mask[top_guard:, x]
+            for sy, ey in _longest_true_run_span(col_m.tolist()):
+                if (ey - sy + 1) >= min_v_run:
+                    v_lines.append((x, sy + top_guard, ey + top_guard))
+    except Exception:
+        pix = im.load()
+        h_lines = []
+        for y in range(top_guard, h):
+            run_s = -1
+            for x in range(left_guard, w):
+                r, g, b = pix[x, y]
+                is_g = abs(r - 16) < 28 and abs(g - 153) < 34 and abs(b - 104) < 34
+                if is_g and run_s < 0:
+                    run_s = x
+                elif not is_g and run_s >= 0:
+                    if (x - run_s) >= min_h_run:
+                        h_lines.append((y, run_s, x - 1))
+                    run_s = -1
+            if run_s >= 0 and (w - run_s) >= min_h_run:
+                h_lines.append((y, run_s, w - 1))
+        v_lines = []
+        for x in range(left_guard, w):
+            run_s = -1
+            for y in range(top_guard, h):
+                r, g, b = pix[x, y]
+                is_g = abs(r - 16) < 28 and abs(g - 153) < 34 and abs(b - 104) < 34
+                if is_g and run_s < 0:
+                    run_s = y
+                elif not is_g and run_s >= 0:
+                    if (y - run_s) >= min_v_run:
+                        v_lines.append((x, run_s, y - 1))
+                    run_s = -1
+            if run_s >= 0 and (h - run_s) >= min_v_run:
+                v_lines.append((x, run_s, h - 1))
+
+    if not h_lines and not v_lines:
+        return None
+    bx0 = min(v[0] for v in v_lines) if v_lines else min(hl[1] for hl in h_lines)
+    by0 = min(hl[0] for hl in h_lines) if h_lines else min(v[1] for v in v_lines)
+    max_vx = max((v[0] for v in v_lines), default=-1)
+    max_hy = max((hl[0] for hl in h_lines), default=-1)
+    bx1 = max_vx if (v_lines and max_vx > bx0 + min_h_run) else (max((hl[2] for hl in h_lines), default=w - 12))
+    by1 = max_hy if (h_lines and max_hy > by0 + min_v_run) else (max((v[2] for v in v_lines), default=h - 12))
+    if (bx1 - bx0) < 40 or (by1 - by0) < 16:
+        return None
+    return bx0, by0, bx1, by1
+
+
+def _find_c6_header_banner_point(page):
+    """在当前 WPS 画布中识别第 6 行 #364C74 深蓝标题栏（C6 区域），返回安全右键 CSS 坐标详情。"""
+    try:
+        box, im, scale_x, scale_y = _capture_main_canvas_rgb(page)
+    except Exception:
+        return {"found": False, "box": None}
+    try:
+        binfo = _find_c6_header_banner_bbox(im, min_width_ratio=0.18, min_height_px=max(8, int(10 * scale_y)))
+        if binfo is None:
+            return {"found": False, "box": box}
+        px0, py0, px1, py1, px_cnt, cov = binfo
+        cx0, cy0 = px0 / scale_x, py0 / scale_y
+        cx1, cy1 = px1 / scale_x, py1 / scale_y
+        bw = cx1 - cx0
+        bh = cy1 - cy0
+        if bw < 40 or bh < 6:
+            return {"found": False, "box": box}
+        # 优先取深蓝横条偏左中段内部（严格远离 A/B 列与右侧屏幕边缘）
+        rx = box["x"] + min(cx1 - max(28.0, bw * 0.12), cx0 + max(48.0, bw * 0.28))
+        ry = box["y"] + (cy0 + cy1) * 0.50
+        return {
+            "found": True,
+            "rx": round(float(rx), 1),
+            "ry": round(float(ry), 1),
+            "bbox_css": (round(cx0, 1), round(cy0, 1), round(cx1, 1), round(cy1, 1)),
+            "bw": round(bw, 1),
+            "bh": round(bh, 1),
+            "navy_px": int(px_cnt),
+            "coverage": round(float(cov), 3),
+            "scale_x": round(float(scale_x), 3),
+            "scale_y": round(float(scale_y), 3),
+            "box": box,
+        }
+    finally:
+        try:
+            im.close()
+        except Exception:
+            pass
+
+
 def _find_selection_right_click_point(page):
-    """按 1px 步长沿横纵探测线识别绿色选区边框，绝不漏检 1px 细边框。"""
+    """优先锁定第 6 行 #364C74 C6 标题栏，其次连续绿框直线 + HiDPI 换算，彻底防误点第 1 行图标或 A1。"""
+    c6_hit = _find_c6_header_banner_point(page)
+    if c6_hit.get("found"):
+        return float(c6_hit["rx"]), float(c6_hit["ry"]), True
+
     canvases = []
     for c in page.query_selector_all("canvas"):
         try:
@@ -9942,11 +10902,17 @@ def _find_selection_right_click_point(page):
     try:
         shot_buf = io.BytesIO(target.screenshot())
         im = None
+        scale_x = 1.0
+        scale_y = 1.0
+        bbox_px = None
         try:
             with Image.open(shot_buf) as raw_im:
                 im = raw_im.convert("RGB")
-            im_h = im.height
-            xs, ys = _find_wps_green_pixels(im, dr=28, dg=34, db=34)
+            scale_x = max(1.0, float(im.width) / max(1.0, float(box["width"])))
+            scale_y = max(1.0, float(im.height) / max(1.0, float(box["height"])))
+            min_h_px = max(40, int(44 * scale_x))
+            min_v_px = max(20, int(24 * scale_y))
+            bbox_px = _find_wps_selection_border_bbox(im, min_h_run=min_h_px, min_v_run=min_v_px)
         finally:
             for obj in (im, shot_buf):
                 if obj is not None:
@@ -9954,54 +10920,384 @@ def _find_selection_right_click_point(page):
                         obj.close()
                     except Exception:
                         pass
-        if xs and ys:
-            min_x, max_x = min(xs), max(xs)
-            min_y, max_y = min(ys), max(ys)
-            if max_x - min_x >= 40:
-                rx = box["x"] + min(max_x - 16, min_x + max(30, (max_x - min_x) // 4))
-                if max_y - min_y >= 14:
-                    ry = box["y"] + min(max_y - 10, min_y + max(14, min(32, (max_y - min_y) // 2)))
+        if bbox_px is not None:
+            px0, py0, px1, py1 = bbox_px
+            cx0, cy0 = px0 / scale_x, py0 / scale_y
+            cx1, cy1 = px1 / scale_x, py1 / scale_y
+            bw = cx1 - cx0
+            bh = cy1 - cy0
+            if bw >= 40 and bh >= 16:
+                inset_x = min(160.0, max(36.0, bw * 0.30))
+                inset_x = min(inset_x, max(20.0, bw - 20.0))
+                rx = box["x"] + min(cx1 - 16.0, cx0 + inset_x)
+                if bh >= 52:
+                    inset_y = min(110.0, max(36.0, bh * 0.35), max(22.0, bh - 16.0))
                 else:
-                    ry = box["y"] + min(im_h - 16, min_y + 24)
+                    inset_y = max(14.0, bh * 0.5)
+                ry = box["y"] + min(cy1 - 10.0, cy0 + inset_y)
                 return rx, ry, True
     except Exception:
         pass
-    rx = box["x"] + min(260, max(140, int(box["width"] * 0.22)))
-    ry = box["y"] + min(190, max(110, int(box["height"] * 0.22)))
+    # 200% 缩放无框检出兜底：落到数据表中下安全区（绝不落到 A1 或第 1~5 行标题区）
+    rx = box["x"] + min(max(box["width"] * 0.36, 180.0), max(120.0, box["width"] - 80.0))
+    ry = box["y"] + min(max(box["height"] * 0.58, 220.0), max(160.0, box["height"] - 40.0))
     return rx, ry, False
 
 
+def _is_copy_as_image_menu_visible(page):
+    """快速探测当前画面是否已弹出「复制为图片」菜单（区分复制为表格图，并支持文本节点精确定位）。"""
+    try:
+        if hasattr(page, "evaluate"):
+            hit = page.evaluate("""() => {
+                const els = document.querySelectorAll('.ks-contextmenu *, [class*="contextmenu"] *, [role="menu"] *, [role="menuitem"]');
+                for (const el of els) {
+                    const st = window.getComputedStyle(el);
+                    if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+                    const txt = (el.textContent || '').trim();
+                    if (txt === '复制为图片') {
+                        const r = el.getBoundingClientRect();
+                        if (r && r.width >= 24 && r.height >= 12 && r.left >= 35 && r.top >= 50) {
+                            return { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height };
+                        }
+                    }
+                    for (const ch of (el.childNodes || [])) {
+                        if (ch.nodeType === 3 && (ch.textContent || '').trim() === '复制为图片') {
+                            try {
+                                const rg = document.createRange();
+                                rg.selectNodeContents(ch);
+                                const r2 = rg.getBoundingClientRect();
+                                if (r2 && r2.width >= 24 && r2.height >= 12 && r2.left >= 35 && r2.top >= 50) {
+                                    return { x: r2.left + r2.width / 2, y: r2.top + r2.height / 2, w: r2.width, h: r2.height };
+                                }
+                            } catch (_e) {}
+                        }
+                    }
+                }
+                return null;
+            }""")
+            if isinstance(hit, dict) and hit.get("x") and hit.get("y"):
+                return hit
+    except Exception:
+        pass
+    for sel in (
+        ".ks-contextmenu :text-is('复制为图片')",
+        "[class*='contextmenu'] :text-is('复制为图片')",
+        "[role='menu'] :text-is('复制为图片')",
+    ):
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                bb = loc.first.bounding_box() if hasattr(loc.first, "bounding_box") else None
+                if isinstance(bb, dict):
+                    if bb.get("width", 0) >= 24 and bb.get("height", 0) >= 12 and (bb.get("x", 0) >= 35 or bb.get("y", 0) >= 50):
+                        return {"x": bb["x"] + bb["width"] / 2, "y": bb["y"] + bb["height"] / 2, "w": bb["width"], "h": bb["height"]}
+                else:
+                    return True
+        except Exception:
+            pass
+    return None
+
+
 def _click_copy_as_image_menu(page):
-    """兼容多个 WPS 右键菜单选择器并点击「复制为图片」。"""
+    """精确点击可视右键菜单中的「复制为图片」（严拒复制为表格图及 (0,0)/A1 幽灵坐标）。"""
+    vis = _is_copy_as_image_menu_visible(page)
+    if isinstance(vis, dict) and vis.get("x") and vis.get("y"):
+        _mouse_move_smooth(page, float(vis["x"]), float(vis["y"]), steps=8)
+        sleep_check(0.18)
+        page.mouse.click(float(vis["x"]), float(vis["y"]))
+        return True
     selectors = [
-        ".ks-contextmenu :text('复制为图片')",
-        "[class*='contextmenu'] :text('复制为图片')",
+        ".ks-contextmenu :text-is('复制为图片')",
+        "[class*='contextmenu'] :text-is('复制为图片')",
+        "[role='menu'] :text-is('复制为图片')",
         "text='复制为图片'",
     ]
     for sel in selectors:
         try:
             loc = page.locator(sel)
             if loc.count() > 0 and loc.first.is_visible():
-                loc.first.click(timeout=3000)
+                bb = loc.first.bounding_box() if hasattr(loc.first, "bounding_box") else None
+                if isinstance(bb, dict) and (bb.get("width", 0) < 20 or bb.get("height", 0) < 10 or (bb.get("x", 0) < 35 and bb.get("y", 0) < 55)):
+                    continue
+                loc.first.click(timeout=2500)
                 return True
         except Exception:
             pass
-    # 最后一次再等最多 3 秒
-    page.click(", ".join(selectors), timeout=3000)
-    return True
+    if hasattr(page, "get_by_text"):
+        try:
+            loc_ex = page.get_by_text("复制为图片", exact=True)
+            if loc_ex.count() > 0 and loc_ex.first.is_visible():
+                bb = loc_ex.first.bounding_box() if hasattr(loc_ex.first, "bounding_box") else None
+                if not isinstance(bb, dict) or (bb.get("width", 0) >= 20 and bb.get("height", 0) >= 10 and (bb.get("x", 0) >= 35 or bb.get("y", 0) >= 55)):
+                    loc_ex.first.click(timeout=2500)
+                    return True
+        except Exception:
+            pass
+    raise RuntimeError("未找到可见且位置有效的「复制为图片」菜单项")
 
 
-def _verify_clipboard_image_size():
-    """确认剪贴板图片宽高达标，避免误复制单格或空白区域。"""
+def _get_page_viewport_wh(page):
+    """安全获取当前浏览器视口宽高 (vw, vh)，失败回退 (1280, 720)。"""
+    vw, vh = 1280, 720
+    try:
+        vp = getattr(page, "viewport_size", None)
+        if isinstance(vp, dict) and vp.get("width") and vp.get("height"):
+            return int(vp["width"]), int(vp["height"])
+        mb = _main_canvas_box(page)
+        if isinstance(mb, dict) and mb.get("width"):
+            return int(mb.get("x", 0) + mb["width"]), int(mb.get("y", 0) + mb["height"])
+    except Exception:
+        pass
+    return vw, vh
+
+
+def _ai_vision_locate_wps_capture_target(page, stage="selection_interior", cfg=None, cand_xy=None):
+    """按需调用视觉 AI 在 200% 缩放表格中定位或用红圈准星反复确认 C6（#364C74）标题栏 /「复制为图片」菜单。"""
+    norm_c = normalize_config(cfg if isinstance(cfg, dict) else load_config())
+    ai_cfg = norm_c.get("ai_assistant") or {}
+    if not ai_cfg.get("enabled", True) or str(ai_cfg.get("provider") or "gemini") == "local_only":
+        return {"ok": False, "reason": "ai_disabled"}
+    try:
+        raw_png = page.screenshot()
+    except Exception as exc_s:
+        return {"ok": False, "reason": f"screenshot_fail:{exc_s}"}
+    if not raw_png:
+        return {"ok": False, "reason": "empty_screenshot"}
+
+    vw, vh = _get_page_viewport_wh(page)
+    cand_xp = 0.0
+    cand_yp = 0.0
+    if cand_xy is not None and len(cand_xy) >= 2:
+        try:
+            cand_xp = max(0.0, min(1.0, float(cand_xy[0]) / float(max(1, vw))))
+            cand_yp = max(0.0, min(1.0, float(cand_xy[1]) / float(max(1, vh))))
+        except Exception:
+            cand_xp = cand_yp = 0.0
+
+    im_buf = io.BytesIO(raw_png)
+    out_buf = io.BytesIO()
+    b64_img = ""
+    rgb_im = None
+    try:
+        with Image.open(im_buf) as raw_im:
+            rgb_im = raw_im.convert("RGB")
+            iw, ih = rgb_im.size
+            if iw > 960:
+                nh = max(120, int(ih * (960.0 / float(iw))))
+                resized_im = rgb_im.resize((960, nh), Image.Resampling.LANCZOS)
+                rgb_im.close()
+                rgb_im = resized_im
+                iw, ih = rgb_im.size
+            if cand_xy is not None and len(cand_xy) >= 2:
+                try:
+                    from PIL import ImageDraw
+                    drw = ImageDraw.Draw(rgb_im)
+                    px = max(6, min(iw - 6, int(round(iw * cand_xp))))
+                    py = max(6, min(ih - 6, int(round(ih * cand_yp))))
+                    rr = max(12, min(24, int(min(iw, ih) * 0.035)))
+                    drw.ellipse((px - rr, py - rr, px + rr, py + rr), outline=(255, 40, 40), width=3)
+                    drw.line((px - rr - 6, py, px + rr + 6, py), fill=(255, 40, 40), width=2)
+                    drw.line((px, py - rr - 6, px, py + rr + 6), fill=(255, 40, 40), width=2)
+                except Exception:
+                    pass
+            rgb_im.save(out_buf, format="JPEG", quality=82, optimize=True)
+        b64_img = base64.b64encode(out_buf.getvalue()).decode("ascii")
+    except Exception:
+        b64_img = ""
+    finally:
+        for obj in (rgb_im, out_buf, im_buf):
+            try:
+                obj.close()
+            except Exception:
+                pass
+    if not b64_img:
+        return {"ok": False, "reason": "encode_fail"}
+
+    is_confirm_stage = stage in ("confirm_c6_banner", "confirm_copy_menu")
+    if stage == "copy_as_image_menu":
+        sys_p = (
+            "你是浏览器 WPS 在线表格视觉助手。当前屏幕已弹出黑色或白色右键菜单。\n"
+            "请找出菜单中写着「复制为图片」（注意不要点到旁边的「复制为表格图」或其他项）的精确中心位置比例 x_pct、y_pct（0.0~1.0）。\n"
+            "只输出一段严格 JSON：\n"
+            '{"found":false,"x_pct":0.0,"y_pct":0.0,"reason":""}'
+        )
+        u_txt = "请识别右键菜单中「复制为图片」选项的精确点击坐标。"
+    elif stage == "confirm_copy_menu":
+        sys_p = (
+            "你是浏览器 WPS 在线表格视觉复核专家。图中已用红色圆圈与十字标出候选左键点击坐标。\n"
+            "请反复核对：该红圈十字是否精准落在右键菜单中的「复制为图片」上（绝不能偏到「复制为表格图」、桌面其他处或 A1）？\n"
+            "若确认无误返回 confirmed:true；若偏差请给出正确的「复制为图片」中心比例 x_pct、y_pct（0.0~1.0）。\n"
+            "只输出一段严格 JSON：\n"
+            '{"confirmed":false,"found":false,"x_pct":0.0,"y_pct":0.0,"reason":""}'
+        )
+        u_txt = f"请复核红圈({cand_xp:.3f},{cand_yp:.3f})是否正中「复制为图片」菜单项。"
+    elif stage == "confirm_c6_banner":
+        sys_p = (
+            "你是浏览器 WPS 在线表格视觉复核专家。当前页面已放大 200%，图中已用红色圆圈与十字标出候选右键点击位置。\n"
+            "目标区域是第 6 行深蓝色（色调 #364C74）合并标题横条（C6 区域，内含白色文字「个人数据明细 / 日报未更 / 暗号数据表」）。\n"
+            "请反复确认：红圈十字是否正落在第 6 行 #364C74 深蓝标题栏内部，且完全没有偏到左上角 A1/C1、列标或第 1~5 行？\n"
+            "只输出一段严格 JSON：\n"
+            '{"confirmed":false,"found":false,"x_pct":0.0,"y_pct":0.0,"reason":""}'
+        )
+        u_txt = f"请反复确认红圈({cand_xp:.3f},{cand_yp:.3f})是否准确落在第6行 #364C74 深蓝标题栏（C6 区域）内部。"
+    elif stage == "c6_banner_locate":
+        sys_p = (
+            "你是浏览器 WPS 在线表格视觉助手。当前表格已放大至 200%，请专门寻找第 6 行深蓝色背景（十六进制颜色 #364C74）的合并标题横条（C6 区域，写着「个人数据明细」等白色大字）。\n"
+            "请给出该 #364C74 深蓝标题横条内部一个安全右键点坐标比例 x_pct、y_pct（0.0~1.0）。\n"
+            "严禁返回左上角 A1/B1/C1、列标行、行号栏或第 1~5 行浅色筛选区！\n"
+            "只输出一段严格 JSON：\n"
+            '{"found":false,"x_pct":0.0,"y_pct":0.0,"reason":""}'
+        )
+        u_txt = "请按颜色 #364C74 寻找第 6 行 C6 标题栏（个人数据明细）内部的安全右键坐标。"
+    else:
+        sys_p = (
+            "你是浏览器 WPS 在线表格视觉助手。当前表格已放大至 200% 并选中了第 6 行及以下（C6 开始）的数据区域（C6 标题栏为深蓝色 #364C74）。\n"
+            "请给出第 6 行 #364C74 深蓝标题栏或绿框数据区内部一个安全的中心点比例 x_pct、y_pct（0.0~1.0），用于弹出右键菜单：\n"
+            "严禁返回左上角 A1/B1/C1、列标 A/B/C、行号或顶部 1~5 行筛选区位置！\n"
+            "只输出一段严格 JSON：\n"
+            '{"found":false,"x_pct":0.0,"y_pct":0.0,"reason":""}'
+        )
+        u_txt = "请识别 200% 缩放 C6（#364C74）标题栏或选中数据区内部适合右键点击的安全坐标。"
+
+    parts = [
+        {"text": u_txt},
+        {"inlineData": {"mimeType": "image/jpeg", "data": b64_img}},
+    ]
+    try:
+        g_res = _call_gemini_generate(
+            norm_c,
+            sys_p,
+            [{"role": "user", "parts": parts}],
+            temperature=0.05,
+            max_tokens=220,
+            timeout_sec=7,
+            max_models=1,
+            total_budget_sec=9,
+        )
+    except Exception as exc_ai:
+        return {"ok": False, "reason": f"ai_err:{exc_ai}"}
+    if not isinstance(g_res, dict) or not g_res.get("ok"):
+        return {"ok": False, "reason": "ai_not_ok"}
+    obj = _parse_first_json_dict(g_res.get("reply"))
+    if not isinstance(obj, dict):
+        return {"ok": False, "reason": "ai_bad_json"}
+
+    confirmed_flag = bool(obj.get("confirmed", False))
+    found_flag = bool(obj.get("found", False))
+    if is_confirm_stage:
+        if not confirmed_flag and not found_flag:
+            return {"ok": False, "confirmed": False, "reason": str(obj.get("reason") or "ai_unconfirmed")}
+    else:
+        if not found_flag:
+            return {"ok": False, "reason": "ai_not_found"}
+
+    try:
+        raw_xp = obj.get("x_pct")
+        raw_yp = obj.get("y_pct")
+        if is_confirm_stage and confirmed_flag and (raw_xp in (None, "", 0, 0.0) or raw_yp in (None, "", 0, 0.0)) and cand_xy is not None:
+            xp, yp = cand_xp, cand_yp
+        else:
+            xp = float(raw_xp)
+            yp = float(raw_yp)
+    except Exception:
+        return {"ok": False, "reason": "ai_bad_coords"}
+
+    if stage in ("copy_as_image_menu", "confirm_copy_menu"):
+        if not (0.04 <= xp <= 0.96 and 0.08 <= yp <= 0.96) or (xp < 0.08 and yp < 0.25):
+            return {"ok": False, "reason": f"ai_menu_a1_guard({xp},{yp})"}
+    elif stage in ("confirm_c6_banner", "c6_banner_locate"):
+        if not (0.08 <= xp <= 0.92 and 0.16 <= yp <= 0.90) or (xp < 0.14 and yp < 0.25):
+            return {"ok": False, "reason": f"ai_c6_a1_guard({xp},{yp})"}
+    else:
+        if not (0.08 <= xp <= 0.90 and 0.30 <= yp <= 0.88):
+            return {"ok": False, "reason": f"ai_selection_a1_guard({xp},{yp})"}
+
+    return {
+        "ok": True,
+        "confirmed": confirmed_flag if is_confirm_stage else True,
+        "x": round(vw * xp, 1),
+        "y": round(vh * yp, 1),
+        "x_pct": round(xp, 4),
+        "y_pct": round(yp, 4),
+        "vw": vw,
+        "vh": vh,
+        "reason": str(obj.get("reason") or "ai_vision_hit"),
+    }
+
+
+def _confirm_wps_c6_right_click_target(page, cand_rx, cand_ry, banner_info=None, cfg=None):
+    """每次右键 C6（#364C74）前进行「本地两帧稳定复核 + 云端红圈准星反复确认」，严防偏到 A1/C1。"""
+    rx = float(cand_rx)
+    ry = float(cand_ry)
+    vw, vh = _get_page_viewport_wh(page)
+    binfo = dict(banner_info or {})
+
+    # 确认层 1：停顿等待后复查第二帧（若画布仍在微动则追帧至第三帧），确保 #364C74 横条静止且几何远离 A1/C1
+    if binfo.get("found"):
+        sleep_check(0.45)
+        b2 = _find_c6_header_banner_point(page)
+        if b2.get("found"):
+            rx2, ry2 = float(b2["rx"]), float(b2["ry"])
+            if abs(rx2 - rx) > 12.0 or abs(ry2 - ry) > 8.0:
+                rx, ry = rx2, ry2
+                binfo = b2
+                sleep_check(0.35)
+                b3 = _find_c6_header_banner_point(page)
+                if b3.get("found"):
+                    rx, ry = float(b3["rx"]), float(b3["ry"])
+                    binfo = b3
+            else:
+                rx, ry = rx2, ry2
+                binfo = b2
+            log(
+                f"  🤖 [AI 反复确认 1/2] 已锁定 C6 深蓝标题栏（#364C74，高 {binfo.get('bh', 0):.0f}px/"
+                f"覆盖 {float(binfo.get('coverage', 0.0)) * 100:.0f}%），多帧坐标稳定 ({rx:.0f}, {ry:.0f})，避开 A1/C1"
+            )
+
+    # 几何硬护栏：绝不允许落入左上角 A1/C1/第1~5行风险区
+    xp = rx / float(max(1, vw))
+    yp = ry / float(max(1, vh))
+    if xp < 0.08 or yp < 0.14 or (xp < 0.14 and yp < 0.25):
+        raise RuntimeError(f"候选右键点 ({rx:.0f}, {ry:.0f}) 过于靠近左上角 A1/C1 危险区，已主动拦截")
+
+    # 确认层 2：调用视觉 AI 用红圈十字二次/三次确认（未配密钥或离线时由层 1 双帧色标确认无缝放行）
+    cfm_tag = "c6_double_local"
+    for _pass in range(2):
+        ai_c = _ai_vision_locate_wps_capture_target(
+            page,
+            stage="confirm_c6_banner",
+            cfg=cfg,
+            cand_xy=(rx, ry),
+        )
+        if ai_c.get("ok"):
+            if ai_c.get("confirmed"):
+                rx, ry = float(ai_c["x"]), float(ai_c["y"])
+                cfm_tag = "c6_ai_confirmed"
+                log(f"  🤖 [AI 反复确认 2/2] 云端视觉 AI 红圈复核通过，正中 C6（#364C74）标题栏 ({rx:.0f}, {ry:.0f})")
+                break
+            # 云端视觉指出了更准确的 C6 落点：纠偏后再进入下一轮确认
+            rx, ry = float(ai_c["x"]), float(ai_c["y"])
+            cfm_tag = "c6_ai_adjusted"
+            log(f"  🤖 [AI 反复确认] 视觉纠偏微调落点至 ({rx:.0f}, {ry:.0f})（{ai_c.get('reason') or '标题栏中心'}），再次复核…")
+        else:
+            if _pass == 0:
+                log("  🤖 [AI 反复确认 2/2] 本地视觉色标（#364C74）与几何防 A1 双检已确认（离线/未配云端密钥兜底）")
+            break
+
+    return rx, ry, cfm_tag
+
+
+def _verify_clipboard_image_size(min_w=180, min_h=50):
+    """确认剪贴板图片宽高达标，避免误复制单格 A1 或空白区域。"""
     sz = get_clipboard_image_size()
     if sz is not None:
-        return sz[0] >= 180 and sz[1] >= 50, sz
+        return sz[0] >= min_w and sz[1] >= min_h, sz
     tmp_check = app_dir() / "_sheetmate_check_tmp.png"
     try:
         if save_clipboard_image_if_exists(tmp_check) == "saved" and tmp_check.exists():
             with Image.open(tmp_check) as im:
                 sz = im.size
-            return sz[0] >= 180 and sz[1] >= 50, sz
+            return sz[0] >= min_w and sz[1] >= min_h, sz
     except Exception:
         pass
     finally:
@@ -10010,44 +11306,67 @@ def _verify_clipboard_image_size():
                 tmp_check.unlink()
         except Exception:
             pass
-    return True, None
+    return False, None
 
 
 def _trim_image_right_blank(im):
     """裁除图片右侧纯白多余列并保留 4px 自然边距，返回 (img_out, orig_w, new_w)。"""
     rgb = im.convert("RGB")
-    w, h = rgb.size
-    mask = rgb.point(lambda v: 255 if v < 246 else 0)
-    bbox = mask.getbbox()
-    if bbox is None:
+    mask = None
+    try:
+        w, h = rgb.size
+        mask = rgb.point(lambda v: 255 if v < 246 else 0)
+        bbox = mask.getbbox()
+        if bbox is None:
+            return im, w, w
+        right_x = bbox[2] - 1
+        if right_x < int(w * 0.25):
+            return im, w, w
+        if w - 1 - right_x > 12:
+            new_w = min(w, right_x + 5)
+            return rgb.crop((0, 0, new_w, h)), w, new_w
         return im, w, w
-    right_x = bbox[2] - 1
-    if right_x < int(w * 0.25):
-        return im, w, w
-    if w - 1 - right_x > 12:
-        new_w = min(w, right_x + 5)
-        return rgb.crop((0, 0, new_w, h)), w, new_w
-    return im, w, w
+    finally:
+        for _tmp_im in (mask, rgb):
+            if _tmp_im is not None:
+                try:
+                    _tmp_im.close()
+                except Exception:
+                    pass
 
 
 def _trim_clipboard_image_right_blank():
     """检查剪贴板图片右侧是否存在多余纯白列，如有则无损裁切并写回剪贴板。"""
     tmp_trim = app_dir() / "_sheetmate_trim_tmp.png"
+    tmp_trim_out = app_dir() / "_sheetmate_trim_out_tmp.png"
+    trimmed = None
     try:
         if save_clipboard_image_if_exists(tmp_trim) != "saved" or not tmp_trim.exists():
             return False
         with Image.open(tmp_trim) as im:
             trimmed, orig_w, new_w = _trim_image_right_blank(im)
             if new_w >= orig_w:
+                if trimmed is not im and trimmed is not None:
+                    trimmed.close()
+                    trimmed = None
                 return False
-            trimmed.save(tmp_trim, "PNG", optimize=True)
+            trimmed.save(tmp_trim_out, "PNG", optimize=True)
+            if trimmed is not im and trimmed is not None:
+                trimmed.close()
+                trimmed = None
+        os.replace(str(tmp_trim_out), str(tmp_trim))
         if set_clipboard_image_from_file(tmp_trim):
             log(f"  已自动裁除右侧多余白边：宽度 {orig_w} -> {new_w}px")
             return True
     except Exception as e:
         log(f"  白边裁切跳过（保留原图）：{human_error(e)}")
     finally:
-        for p_del in (tmp_trim, tmp_trim.with_name(tmp_trim.stem + "_send.png")):
+        if trimmed is not None:
+            try:
+                trimmed.close()
+            except Exception:
+                pass
+        for p_del in (tmp_trim, tmp_trim_out, tmp_trim.with_name(tmp_trim.stem + "_send.png")):
             try:
                 if p_del.exists():
                     p_del.unlink()
@@ -10074,15 +11393,17 @@ def _try_capture_selection_tsv(page):
     return ""
 
 
-def capture_wps_region(page):
+def capture_wps_region(page, cfg=None):
     """按 Q 列（失败则 D 列兜底）确定末行，框选 C6:AK 并高清复制为图片（期间保护键鼠提示）。"""
     with hands_off_guard("WPS 汇总表中框选区域并复制截图"):
-        return _capture_wps_region_inner(page)
+        return _capture_wps_region_inner(page, cfg=cfg)
 
 
-def _capture_wps_region_inner(page):
-    """按 Q 列（失败则 D 列兜底）确定末行，框选 C6:AK 并高清复制为图片。"""
+def _capture_wps_region_inner(page, cfg=None):
+    """按 Q 列确定末行，选区并放大 200% 后稳态锁定 C6 深蓝标题栏（#364C74），AI 反复确认右键复制为图片并等 5 秒。"""
+    global _last_captured_summary_tsv
     check_stop()
+    _last_captured_summary_tsv = ""
     log("  准备按 Q 列末行框选表格…")
     last_row = 8
     for _attempt in range(4):
@@ -10105,14 +11426,35 @@ def _capture_wps_region_inner(page):
     log(f"  Q 列最后有文字的是第 {last_row} 行，目标 C6:AK{last_row}")
 
     selected_ok = _select_wps_range(page, last_row, end_col="AK", use_mouse=True)
-    _try_capture_selection_tsv(page)
+    if not str(_last_captured_summary_tsv or "").strip():
+        _try_capture_selection_tsv(page)
+
+    sleep_check(0.50)
     try:
         _set_wps_zoom(page, 200)
-    except Exception:
+    except Exception as e_z1:
+        if _is_stop_exception(e_z1):
+            raise
         try:
             _set_wps_zoom(page, 150)
         except Exception as e_zoom:
+            if _is_stop_exception(e_zoom):
+                raise
             log(f"  高清缩放未生效，按当前比例继续：{human_error(e_zoom)}")
+    sleep_check(0.75)
+
+    # 200% 缩放后即时核验选区是否仍稳停在 C6:AK，防缩放过程焦点误滑回 A1
+    nb_zoom = _read_wps_name_box(page)
+    if nb_zoom and not _is_wps_selection_valid_for_capture(nb_zoom, last_row=last_row):
+        log(f"  ⚠️ 缩放后检测到选区漂移至「{nb_zoom}」，立即重选 C6:AK{last_row}…")
+        record_run_trace_event("wps_rclick_a1_guard", f"zoom_drift:{nb_zoom}")
+        _select_wps_range(page, last_row, end_col="AK", use_mouse=False)
+        try:
+            _set_wps_zoom(page, 200)
+        except Exception as e_z2:
+            if _is_stop_exception(e_z2):
+                raise
+        sleep_check(0.75)
 
     clear_clipboard_windows()
     for copy_attempt in range(3):
@@ -10121,43 +11463,245 @@ def _capture_wps_region_inner(page):
             log(f"  本次复制未拿到有效图片，自动重试第 {copy_attempt + 1} 次…")
             try:
                 page.keyboard.press("Escape")
-                time.sleep(0.25)
-            except Exception:
-                pass
+                sleep_check(0.40)
+            except Exception as e_esc1:
+                if _is_stop_exception(e_esc1):
+                    raise
             _select_wps_range(page, last_row, end_col="AK", use_mouse=False)
             try:
                 _set_wps_zoom(page, 200)
-            except Exception:
-                pass
+            except Exception as e_z3:
+                if _is_stop_exception(e_z3):
+                    raise
+            sleep_check(0.75)
 
-        rx, ry, hit_green = _find_selection_right_click_point(page)
-        if not hit_green and copy_attempt == 0 and not selected_ok:
-            _select_wps_range(page, last_row, end_col="AK", use_mouse=False)
+        used_method = "border_rclick"
+        learned_xy = None
+        menu_opened = False
+
+        # 先检测当前画布是否可见第 6 行 C6 深蓝标题栏（#364C74）
+        banner_info = _find_c6_header_banner_point(page)
+        if banner_info.get("found"):
+            log(
+                f"  🔍 已识别 C6 深蓝标题栏（#364C74），候选落点 ({banner_info['rx']:.0f}, {banner_info['ry']:.0f})，"
+                "正在由 AI 反复确认后慢速右键…"
+            )
+            rx, ry, _cfm = _confirm_wps_c6_right_click_target(
+                page,
+                banner_info["rx"],
+                banner_info["ry"],
+                banner_info=banner_info,
+                cfg=cfg,
+            )
+            used_method = "c6_banner_rclick"
+        else:
+            # 无 #364C74 色带场景（如特殊主题或快捷直通）先尝试系统快捷键 Shift+F10 / ContextMenu
+            if copy_attempt == 0:
+                for sc_key, m_tag in (("Shift+F10", "shift_f10"), ("ContextMenu", "contextmenu_key")):
+                    try:
+                        page.keyboard.press(sc_key)
+                    except Exception:
+                        continue
+                    for _w in range(4):
+                        sleep_check(0.18)
+                        if _is_copy_as_image_menu_visible(page):
+                            menu_opened = True
+                            used_method = m_tag
+                            log(f"  已通过系统按键 {sc_key} 零误触打开右键菜单")
+                            break
+                    if menu_opened:
+                        break
+                if not menu_opened:
+                    try:
+                        page.keyboard.press("Escape")
+                        sleep_check(0.15)
+                    except Exception as e_esc2:
+                        if _is_stop_exception(e_esc2):
+                            raise
+
+            if not menu_opened:
+                rx, ry, hit_green = _find_selection_right_click_point(page)
+                if hit_green:
+                    used_method = "border_rclick"
+                else:
+                    ai_c6 = _ai_vision_locate_wps_capture_target(page, stage="c6_banner_locate", cfg=cfg)
+                    if ai_c6.get("ok"):
+                        rx, ry = float(ai_c6["x"]), float(ai_c6["y"])
+                        used_method = "c6_ai_locate"
+                    else:
+                        pb_cur = load_ai_run_playbook()
+                        anc = pb_cur.get("wps_capture_anchor") if isinstance(pb_cur, dict) else None
+                        if isinstance(anc, dict) and anc.get("x_pct") and anc.get("y_pct"):
+                            try:
+                                vw_a, vh_a = _get_page_viewport_wh(page)
+                                rx = float(vw_a) * float(anc["x_pct"])
+                                ry = float(vh_a) * float(anc["y_pct"])
+                                used_method = "learned_anchor"
+                            except Exception:
+                                pass
+                        if not selected_ok and copy_attempt == 0 and used_method not in ("learned_anchor", "c6_ai_locate"):
+                            _select_wps_range(page, last_row, end_col="AK", use_mouse=False)
+                            try:
+                                _set_wps_zoom(page, 200)
+                            except Exception as e_z4:
+                                if _is_stop_exception(e_z4):
+                                    raise
+                            sleep_check(0.75)
+                            rx, ry, hit_green = _find_selection_right_click_point(page)
+                            if hit_green:
+                                used_method = "border_rclick"
+                try:
+                    rx, ry, _cfm2 = _confirm_wps_c6_right_click_target(page, rx, ry, banner_info=None, cfg=cfg)
+                except Exception as e_cfm2:
+                    if _is_stop_exception(e_cfm2):
+                        raise
+                    log(f"  ⚠️ 候选右键落点被防误触护栏拦截（{human_error(e_cfm2)}），重新选区定位…")
+                    continue
+
+        if not menu_opened:
+            _mouse_move_smooth(page, rx, ry, steps=12)
+            sleep_check(0.35)
+            page.mouse.click(rx, ry, button="right")
+            sleep_check(0.85)
             try:
-                _set_wps_zoom(page, 200)
+                vw_l, vh_l = _get_page_viewport_wh(page)
+                learned_xy = (rx / float(max(1, vw_l)), ry / float(max(1, vh_l)), int(vw_l), int(vh_l))
             except Exception:
-                pass
-            rx, ry, _ = _find_selection_right_click_point(page)
+                learned_xy = None
 
-        page.mouse.click(rx, ry, button="right")
-        time.sleep(0.65)
-        try:
-            _click_copy_as_image_menu(page)
-        except Exception:
-            continue
-        log("  已点「复制为图片」，正在读取图片…")
-        for _ in range(40):
+            # 防 A1 误点核心守卫：右键后立刻复查名称框，若意外点成 A1/C1/前5行则当场撤回重选并重定 C6 #364C74
+            nb_after = _read_wps_name_box(page)
+            if nb_after and not _is_wps_selection_valid_for_capture(nb_after, last_row=last_row):
+                log(f"  ⚠️ 检测到右键误点到「{nb_after}」（偏离数据区），立即放弃并重选 + AI 协同定位…")
+                record_run_trace_event("wps_rclick_a1_guard", f"rclick->{nb_after}")
+                _record_wps_capture_learned_anchor(used_method, ok=False)
+                try:
+                    page.keyboard.press("Escape")
+                    sleep_check(0.30)
+                except Exception as e_esc3:
+                    if _is_stop_exception(e_esc3):
+                        raise
+                _select_wps_range(page, last_row, end_col="AK", use_mouse=False)
+                try:
+                    _set_wps_zoom(page, 200)
+                except Exception as e_z5:
+                    if _is_stop_exception(e_z5):
+                        raise
+                sleep_check(0.75)
+
+                b_retry = _find_c6_header_banner_point(page)
+                if b_retry.get("found"):
+                    rx, ry, _ = _confirm_wps_c6_right_click_target(
+                        page,
+                        b_retry["rx"],
+                        b_retry["ry"],
+                        banner_info=b_retry,
+                        cfg=cfg,
+                    )
+                    used_method = "c6_banner_rclick"
+                    vw_r, vh_r = _get_page_viewport_wh(page)
+                    learned_xy = (rx / float(max(1, vw_r)), ry / float(max(1, vh_r)), vw_r, vh_r)
+                else:
+                    ai_sel = _ai_vision_locate_wps_capture_target(page, stage="selection_interior", cfg=cfg)
+                    if ai_sel.get("ok"):
+                        rx, ry = float(ai_sel["x"]), float(ai_sel["y"])
+                        used_method = "ai_vision"
+                        learned_xy = (ai_sel["x_pct"], ai_sel["y_pct"], ai_sel["vw"], ai_sel["vh"])
+                    else:
+                        log(f"  右键防 A1 已触发撤回（{ai_sel.get('reason') or '无视觉通道'}），进入下轮重选")
+                        continue
+                _mouse_move_smooth(page, rx, ry, steps=12)
+                sleep_check(0.35)
+                page.mouse.click(rx, ry, button="right")
+                sleep_check(0.85)
+                nb_ai = _read_wps_name_box(page)
+                if nb_ai and not _is_wps_selection_valid_for_capture(nb_ai, last_row=last_row):
+                    log(f"  ⚠️ 二次落点仍偏移至「{nb_ai}」，进入下轮重选")
+                    continue
+
+        # 顺位 3：轮询菜单出现 -> 二次停顿复核「复制为图片」位置（防偏移/防误点复制为表格图）再点击
+        clicked_pic = False
+        vis1 = None
+        for _mw in range(6):
+            vis1 = _is_copy_as_image_menu_visible(page)
+            if vis1:
+                break
+            sleep_check(0.25)
+
+        if isinstance(vis1, dict) and vis1.get("x") and vis1.get("y"):
+            sleep_check(0.25)
+            vis2 = _is_copy_as_image_menu_visible(page)
+            v_use = vis2 if (isinstance(vis2, dict) and vis2.get("x") and vis2.get("y")) else vis1
+            mx, my = float(v_use["x"]), float(v_use["y"])
+            if used_method not in ("shift_f10", "contextmenu_key"):
+                ai_chk_m = _ai_vision_locate_wps_capture_target(
+                    page,
+                    stage="confirm_copy_menu",
+                    cfg=cfg,
+                    cand_xy=(mx, my),
+                )
+                if ai_chk_m.get("ok") and not ai_chk_m.get("confirmed"):
+                    mx, my = float(ai_chk_m["x"]), float(ai_chk_m["y"])
+                    log(f"  🤖 [AI 反复确认·菜单] 视觉微调「复制为图片」坐标至 ({mx:.0f}, {my:.0f})")
+                else:
+                    log(f"  🤖 [AI 反复确认·菜单] 已双检确认「复制为图片」稳态位于 ({mx:.0f}, {my:.0f})，准备点击")
+            _mouse_move_smooth(page, mx, my, steps=10)
+            sleep_check(0.28)
+            page.mouse.click(mx, my)
+            clicked_pic = True
+        else:
+            try:
+                clicked_pic = _click_copy_as_image_menu(page)
+            except Exception as e_cpic:
+                if _is_stop_exception(e_cpic):
+                    raise
+                clicked_pic = False
+
+        if not clicked_pic:
+            ai_menu = _ai_vision_locate_wps_capture_target(page, stage="copy_as_image_menu", cfg=cfg)
+            if ai_menu.get("ok"):
+                mx_a, my_a = float(ai_menu["x"]), float(ai_menu["y"])
+                log(f"  🤖 AI 视觉已锁定右键菜单「复制为图片」({mx_a:.0f}, {my_a:.0f})，慢速移入点击…")
+                _mouse_move_smooth(page, mx_a, my_a, steps=10)
+                sleep_check(0.28)
+                page.mouse.click(mx_a, my_a)
+                clicked_pic = True
+                used_method = "ai_vision"
+            else:
+                record_run_trace_event("wps_capture_fail", used_method, {"reason": "menu_not_found"})
+                _record_wps_capture_learned_anchor(used_method, ok=False)
+                continue
+
+        log("  已点「复制为图片」，正在等待图片写入剪贴板…")
+        for _ in range(44):
             check_stop()
             if clipboard_has_image():
-                ok_size, sz = _verify_clipboard_image_size()
+                ok_size, sz = _verify_clipboard_image_size(min_w=280, min_h=100)
                 if ok_size:
                     _trim_clipboard_image_right_blank()
-                    log("  图片已复制到剪贴板")
+                    record_run_trace_event("wps_capture_ok", used_method)
+                    if learned_xy is not None:
+                        _record_wps_capture_learned_anchor(used_method, *learned_xy, ok=True)
+                    else:
+                        _record_wps_capture_learned_anchor(used_method, ok=True)
+                    log(f"  图片已复制到剪贴板（策略：{used_method}，尺寸：{sz}）")
+                    post_copy_wait = 5.0
+                    norm_cfg_wait = normalize_config(cfg if isinstance(cfg, dict) else {})
+                    if "wps_post_copy_wait_sec" in norm_cfg_wait:
+                        try:
+                            post_copy_wait = max(0.0, min(15.0, float(norm_cfg_wait.get("wps_post_copy_wait_sec", 5))))
+                        except Exception:
+                            post_copy_wait = 5.0
+                    if post_copy_wait > 0:
+                        log(f"  ⏳ 已复制为图片，按要求稳定等待 {post_copy_wait:g} 秒后再去粘贴…")
+                        sleep_check(post_copy_wait)
                     return
-                log(f"  检测到图片尺寸异常（{sz}），准备重新框选复制…")
+                log(f"  ⚠️ 检测到剪贴板图片过小（{sz}，疑似误点单格），立即清理并重选复制…")
+                record_run_trace_event("wps_capture_fail", used_method, {"reason": f"small_img:{sz}"})
+                _record_wps_capture_learned_anchor(used_method, ok=False)
                 clear_clipboard_windows()
                 break
-            time.sleep(0.25)
+            sleep_check(0.25)
     raise RuntimeError("复制为图片后仍未检测到有效图片，请确认选区及浏览器剪贴板权限后重试")
 
 
@@ -11247,8 +12791,8 @@ def _uia_find_and_click_silent_menu(uia_win, pids, enable_silent=True):
             except Exception:
                 pass
 
-    # 2) Qt 弹出菜单（如 im_chat::QuiMenu）无暴露文字时，立即按第 2 项规则命中；若 Desktop 未枚举到则补查 TopLevel QuiMenu
-    if enable_silent and not pop_windows:
+    # 2) Qt 弹出菜单（如 im_chat::QuiMenu）无暴露文字时，支持开启或取消静音点击第 2 项
+    if not pop_windows:
         try:
             for qh, _qc, _qt in _enum_top_windows(target_classes=("im_chat::QuiMenu",), target_titles=None):
                 try:
@@ -11261,11 +12805,12 @@ def _uia_find_and_click_silent_menu(uia_win, pids, enable_silent=True):
         except Exception:
             pass
 
-    if enable_silent and pop_windows:
+    if pop_windows:
         qui_hit = _find_dt_qui_menu_silent_item(pop_windows)
         if qui_hit is not None:
             q_ctrl, q_info = qui_hit
-            log(f"  [静音模式: pywinauto-UIA] 命中 Qt 弹出菜单第2项「设为静音」: type={q_info.control_type!r} cls={q_info.class_name!r}")
+            act_lbl_q = "设为静音" if enable_silent else "取消静音"
+            log(f"  [静音模式: pywinauto-UIA] 命中 Qt 弹出菜单第2项「{act_lbl_q}」: type={q_info.control_type!r} cls={q_info.class_name!r}")
             _uia_click_ctrl(q_ctrl)
             return True
 
@@ -11309,8 +12854,9 @@ def _try_click_open_silent_menu_uia():
         _app, win, pids = _connect_dingtalk_pywinauto(timeout=2.5)
         if win is not None and _uia_find_and_click_silent_menu(win, pids):
             return True
-    except Exception:
-        pass
+    except Exception as e_u:
+        if _is_stop_exception(e_u):
+            raise
     return False
 
 
@@ -11842,6 +13388,7 @@ def _enable_dingtalk_silent_send(silent_order="uia_first"):
 
 def _disable_dingtalk_silent_send():
     """当某时间点设置为常规提醒时，检查并清除钉钉输入框可能残留的「静音发送」状态。"""
+    opened_menu = False
     try:
         _app, win, pids = _connect_dingtalk_pywinauto(timeout=4.0)
         win.set_focus()
@@ -11849,13 +13396,21 @@ def _disable_dingtalk_silent_send():
             arrow = _uia_find_arrow_ctrl(win)
             if arrow is not None:
                 _uia_click_ctrl(_unwrap_uia(arrow))
+                opened_menu = True
                 sleep_check(0.45)
                 if _uia_find_and_click_silent_menu(win, pids, enable_silent=False):
                     sleep_check(0.3)
                     log("  [静音模式: pywinauto-UIA] 已关闭残留静音状态，改为常规提醒发送")
                     return True
-    except Exception:
-        pass
+    except Exception as e_ds1:
+        if _is_stop_exception(e_ds1):
+            raise
+    finally:
+        if opened_menu:
+            try:
+                _win32_send_single_vk(0x1B)
+            except Exception:
+                pass
 
     try:
         import pyautogui  # type: ignore[import-not-found]
@@ -11868,11 +13423,34 @@ def _disable_dingtalk_silent_send():
             pyautogui.click(cx, cy)
             sleep_check(0.3)
             return True
-    except Exception:
-        pass
+    except Exception as e_ds2:
+        if _is_stop_exception(e_ds2):
+            raise
 
     log("  [静音模式] 本次配置为常规提醒（未开启静音发送）")
     return True
+
+
+_dt_silent_was_enabled = False
+
+
+def _reset_residual_dt_silent_if_needed():
+    """仅当之前轮次启用过静音或当前窗口可见静音徽标时，清理残留静音态（常规提醒零额外点击）。"""
+    global _dt_silent_was_enabled
+    try:
+        if _dt_silent_was_enabled:
+            _disable_dingtalk_silent_send()
+            _dt_silent_was_enabled = False
+            return True
+        _app, win, _pids = _connect_dingtalk_pywinauto(timeout=1.2)
+        if win is not None and _uia_find_silent_badge(win):
+            _disable_dingtalk_silent_send()
+            _dt_silent_was_enabled = False
+            return True
+    except Exception as e_res:
+        if _is_stop_exception(e_res):
+            raise
+    return False
 
 
 def _restore_and_activate_hwnd(hwnd, maximize=True, wake_exe_candidates=None):
@@ -11989,17 +13567,26 @@ def _commit_dingtalk_send(cur_hwnd, send_enter_fn=None, timeout=1.5, input_rect=
                 hwnd_val = 0
 
     before_send_patch = _capture_dt_input_patch(None, input_rect=input_rect) if input_rect is not None else None
-    if callable(send_enter_fn):
-        send_enter_fn()
-    else:
-        if not _win32_send_single_vk(0x0D):
-            _pwa_kbd.send_keys("{ENTER}")
-    sleep_check(0.50)
+    after_send_patch = None
+    try:
+        if callable(send_enter_fn):
+            send_enter_fn()
+        else:
+            if not _win32_send_single_vk(0x0D):
+                _pwa_kbd.send_keys("{ENTER}")
+        sleep_check(0.50)
 
-    if before_send_patch is not None and input_rect is not None:
-        after_send_patch = _capture_dt_input_patch(None, input_rect=input_rect)
-        if _did_dt_input_change(before_send_patch, after_send_patch):
-            return False
+        if before_send_patch is not None and input_rect is not None:
+            after_send_patch = _capture_dt_input_patch(None, input_rect=input_rect)
+            if _did_dt_input_change(before_send_patch, after_send_patch):
+                return False
+    finally:
+        for _p_img in (before_send_patch, after_send_patch):
+            if _p_img is not None and hasattr(_p_img, "close"):
+                try:
+                    _p_img.close()
+                except Exception:
+                    pass
 
     if not hwnd_val:
         return False
@@ -12054,8 +13641,9 @@ def _commit_dingtalk_send(cur_hwnd, send_enter_fn=None, timeout=1.5, input_rect=
                     if not _win32_send_ctrl_key(0x0D):
                         _pwa_kbd.send_keys("^{ENTER}")
                     sleep_check(0.25)
-            except Exception:
-                pass
+            except Exception as e_ce:
+                if _is_stop_exception(e_ce):
+                    raise
             return True
     except Exception as e_btn:
         if "手动停止" in str(e_btn):
@@ -12431,14 +14019,20 @@ def _parse_first_json_dict(raw_txt):
     s = str(raw_txt or "").strip()
     if not s:
         return None
-    m = re.search(r"\{[\s\S]*\}", s)
-    if not m:
-        return None
-    try:
-        obj = json.loads(m.group(0))
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
+    dec = json.JSONDecoder()
+    idx = 0
+    while idx < len(s):
+        pos = s.find("{", idx)
+        if pos < 0:
+            break
+        try:
+            obj, _end = dec.raw_decode(s, pos)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        idx = pos + 1
+    return None
 
 
 def _ai_vision_match_dingtalk_search(target_name, search_kw, shot_info, uia_rows=None, cfg=None):
@@ -13226,11 +14820,13 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                         return True
                     _win32_send_single_vk(0x1B)
                     sleep_check(0.12)
-                except Exception:
+                except Exception as e_cm_p:
                     try:
                         _win32_send_single_vk(0x1B)
                     except Exception:
                         pass
+                    if _is_stop_exception(e_cm_p):
+                        raise
             if m == "uia_ctrl_v":
                 try:
                     ua.SendKeys("{Ctrl}v", waitTime=0.32)
@@ -13672,10 +15268,10 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
             fb_rect = cands_fb[0][3] if cands_fb else None
             return seen_strats[0] if seen_strats else "ratio_bottom_85", fb_rect, last_reason
 
-        def _prepare_chat_compose_box(force_strategy=None):
-            """严格执行：定位点击待发送框 -> 清空旧内容 -> 按一次 Enter 激活输入态 -> 确认光标在待发送框内。"""
+        def _prepare_chat_compose_box(force_strategy=None, clear_box=True):
+            """严格执行：定位点击待发送框 -> 按需清空旧内容 -> 激活输入态 -> 确认光标在待发送框内。"""
             used_strat, c_rect, focus_desc = _verify_and_focus_chat_input(retries=2, force_strategy=force_strategy)
-            if cfg.get("dt_clear_before_send", True):
+            if clear_box and cfg.get("dt_clear_before_send", True):
                 if not _win32_send_ctrl_key(ord("A")):
                     ua.SendKeys("{Ctrl}a", waitTime=0.10)
                 sleep_check(0.06)
@@ -13746,6 +15342,13 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                     if not _is_search_popup_open():
                         return True
             return False
+
+        _current_actual_target = {"name": ""}
+
+        def _send_one_target_with_actual(idx, total, target_name):
+            _current_actual_target["name"] = target_name
+            st_r = _send_one_target(idx, total, target_name)
+            return st_r, (_current_actual_target.get("name") or target_name)
 
         def _send_one_target(idx, total, search_name):
             if total > 1:
@@ -13819,13 +15422,15 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                 )
 
             def _apply_new_target_switch(new_tgt_raw):
-                nonlocal search_name, direct_candidates, skip_search, vision_hdr_rejects, target_switch_hops
+                nonlocal search_name, search_tokens, direct_candidates, skip_search, vision_hdr_rejects, target_switch_hops
                 new_t = str(new_tgt_raw or "").strip()[:80]
                 if not new_t:
                     return False
                 target_switch_hops += 1
                 search_name = new_t
+                _current_actual_target["name"] = search_name
                 sc_new, _st_new = _extract_search_keywords(search_name)
+                search_tokens = _st_new
                 try:
                     sm_new = resolve_smart_dingtalk_target(search_name, cfg=cfg, use_ai=True)
                     ex_new = list(sm_new.get("candidates") or [])
@@ -14320,8 +15925,9 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             try:
                                 ua.SendKeys("{Esc}", waitTime=0.2)
                                 sleep_check(0.22)
-                            except Exception:
-                                pass
+                            except Exception as e_esc_dt:
+                                if _is_stop_exception(e_esc_dt):
+                                    raise
 
                         # 按用户设定及训练优化结果等待 N 秒让钉钉聊天框加载完成再粘贴（纯文字直发极速免等）
                         try:
@@ -14356,53 +15962,68 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             for paste_try in range(max_tries):
                                 fs_try, pm_try = combos[paste_try]
                                 if paste_try > 0:
-                                    active_focus_strat, active_compose_rect = _prepare_chat_compose_box(force_strategy=fs_try)
+                                    preserve_txt = (compose_order == "text_silent_image" and text_pasted_ok)
+                                    active_focus_strat, active_compose_rect = _prepare_chat_compose_box(
+                                        force_strategy=fs_try,
+                                        clear_box=not preserve_txt,
+                                    )
                                 ding_cur, _, hwnd_cur = _raise_if_interrupted(expected_pid=ding_pid, fg_locked=True)
                                 r_img = ding_cur.BoundingRectangle
                                 if compose_order == "text_silent_image":
                                     if not _win32_send_single_vk(0x23):
                                         ua.SendKeys("{End}", waitTime=0.10)
                                 _ensure_not_in_search_box(r_img)
-                                before_patch = (
-                                    _capture_dt_input_patch(r_img, input_rect=active_compose_rect)
-                                    if (hwnd_cur and int(user32.GetForegroundWindow() or 0) == hwnd_cur)
-                                    else None
-                                )
-                                if not set_clipboard_image_from_file(
-                                    tmp_img,
-                                    cached_scaled_path=scaled_send_path,
-                                    cached_png_bytes=scaled_png_bytes,
-                                ):
-                                    raise RuntimeError("图片恢复失败，已停止粘贴")
-                                sleep_check(0.14)
+                                before_patch = None
+                                after_patch = None
+                                try:
+                                    before_patch = (
+                                        _capture_dt_input_patch(r_img, input_rect=active_compose_rect)
+                                        if (hwnd_cur and int(user32.GetForegroundWindow() or 0) == hwnd_cur)
+                                        else None
+                                    )
+                                    if not set_clipboard_image_from_file(
+                                        tmp_img,
+                                        cached_scaled_path=scaled_send_path,
+                                        cached_png_bytes=scaled_png_bytes,
+                                    ):
+                                        raise RuntimeError("图片恢复失败，已停止粘贴")
+                                    sleep_check(0.14)
 
-                                _send_paste_shortcut(method=pm_try, compose_rect=active_compose_rect)
-                                sleep_check(0.85)
+                                    _send_paste_shortcut(method=pm_try, compose_rect=active_compose_rect)
+                                    sleep_check(0.85)
 
-                                converted = False
-                                for _ in range(5):
-                                    sleep_check(0.18)
-                                    _raise_if_interrupted(expected_pid=ding_pid, fg_locked=False)
-                                    tops = _enum_top_windows(
-                                        target_classes=("ddesign::ComplexModal",), target_titles=None)
-                                    if tops:
-                                        modal = _safe_control_from_handle(ua, tops[0][0])
-                                        if modal is not None:
-                                            for btn_lbl in ("转为图片", "确定", "是", "Yes", "YES", "OK", "发送", "继续", "好", "确认"):
-                                                btn = modal.ButtonControl(searchDepth=12, Name=btn_lbl)
-                                                if btn.Exists(0.30):
-                                                    btn.Click()
-                                                    converted = True
-                                                    sleep_check(0.45)
-                                                    break
-                                        break
-                                sleep_check(0.30)
-                                after_patch = (
-                                    _capture_dt_input_patch(r_img, input_rect=active_compose_rect)
-                                    if before_patch is not None
-                                    else None
-                                )
-                                if converted or _did_dt_input_change(before_patch, after_patch):
+                                    converted = False
+                                    for _ in range(5):
+                                        sleep_check(0.18)
+                                        _raise_if_interrupted(expected_pid=ding_pid, fg_locked=False)
+                                        tops = _enum_top_windows(
+                                            target_classes=("ddesign::ComplexModal",), target_titles=None)
+                                        if tops:
+                                            modal = _safe_control_from_handle(ua, tops[0][0])
+                                            if modal is not None:
+                                                for btn_lbl in ("转为图片", "确定", "是", "Yes", "YES", "OK", "发送", "继续", "好", "确认"):
+                                                    btn = modal.ButtonControl(searchDepth=12, Name=btn_lbl)
+                                                    if btn.Exists(0.30):
+                                                        btn.Click()
+                                                        converted = True
+                                                        sleep_check(0.45)
+                                                        break
+                                            break
+                                    sleep_check(0.30)
+                                    after_patch = (
+                                        _capture_dt_input_patch(r_img, input_rect=active_compose_rect)
+                                        if before_patch is not None
+                                        else None
+                                    )
+                                    changed_img = converted or _did_dt_input_change(before_patch, after_patch)
+                                finally:
+                                    for _pi in (before_patch, after_patch):
+                                        if _pi is not None and hasattr(_pi, "close"):
+                                            try:
+                                                _pi.close()
+                                            except Exception:
+                                                pass
+                                if changed_img:
                                     active_paste_method = pm_try
                                     record_run_trace_event("paste_ok", pm_try, {"focus": active_focus_strat, "attempt": paste_try + 1})
                                     if converted:
@@ -14432,26 +16053,37 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             if not _win32_send_single_vk(0x23):
                                 try:
                                     ua.SendKeys("{End}", waitTime=0.12)
-                                except Exception:
-                                    pass
+                                except Exception as e_end_t:
+                                    if _is_stop_exception(e_end_t):
+                                        raise
                             _ensure_not_in_search_box(r_txt)
-                            before_txt_patch = (
-                                _capture_dt_input_patch(r_txt, input_rect=active_compose_rect)
-                                if (hwnd_txt and int(user32.GetForegroundWindow() or 0) == hwnd_txt)
-                                else None
-                            )
-                            paste_method_txt = "win32_sendinput_ctrl_v" if active_paste_method == "context_menu_paste" else active_paste_method
-                            ok_clip = _paste_text(text_msg, verify=True, method=paste_method_txt)
-                            after_txt_patch = (
-                                _capture_dt_input_patch(r_txt, input_rect=active_compose_rect)
-                                if before_txt_patch is not None
-                                else None
-                            )
-                            need_unicode_fb = (not ok_clip) or (
-                                before_txt_patch is not None
-                                and after_txt_patch is not None
-                                and not _did_dt_input_change(before_txt_patch, after_txt_patch)
-                            )
+                            before_txt_patch = None
+                            after_txt_patch = None
+                            try:
+                                before_txt_patch = (
+                                    _capture_dt_input_patch(r_txt, input_rect=active_compose_rect)
+                                    if (hwnd_txt and int(user32.GetForegroundWindow() or 0) == hwnd_txt)
+                                    else None
+                                )
+                                paste_method_txt = "win32_sendinput_ctrl_v" if active_paste_method == "context_menu_paste" else active_paste_method
+                                ok_clip = _paste_text(text_msg, verify=True, method=paste_method_txt)
+                                after_txt_patch = (
+                                    _capture_dt_input_patch(r_txt, input_rect=active_compose_rect)
+                                    if before_txt_patch is not None
+                                    else None
+                                )
+                                need_unicode_fb = (not ok_clip) or (
+                                    before_txt_patch is not None
+                                    and after_txt_patch is not None
+                                    and not _did_dt_input_change(before_txt_patch, after_txt_patch)
+                                )
+                            finally:
+                                for _pt in (before_txt_patch, after_txt_patch):
+                                    if _pt is not None and hasattr(_pt, "close"):
+                                        try:
+                                            _pt.close()
+                                        except Exception:
+                                            pass
                             if need_unicode_fb:
                                 log("  ⚠️ 文字粘贴未检测到输入变化或剪贴板繁忙，改用 Unicode 直打注入后缀文案…")
                                 _focus_chat_input(ding_txt, r_txt, strategy_hint=active_focus_strat)
@@ -14466,11 +16098,15 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                             _sleep_watch_ding(0.22, expected_pid=ding_pid, fg_locked=True)
 
                         def _do_toggle_silent_step():
+                            global _dt_silent_was_enabled
                             if do_silent:
                                 ok_sil = _enable_dingtalk_silent_send(silent_order=silent_order)
+                                if ok_sil:
+                                    _dt_silent_was_enabled = True
                                 record_run_trace_event("silent_ok" if ok_sil else "silent_fail", "image" if silent_order == "arrow_img_then_uia" else "uia")
                             else:
-                                log("  未开启静音发送，跳过点击静音按钮")
+                                if not _reset_residual_dt_silent_if_needed():
+                                    log("  未开启静音发送，跳过点击静音按钮")
 
                         if str(text_only_message or "").strip():
                             image_pasted_ok = True
@@ -14557,9 +16193,11 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                                     _focus_chat_input(ding_h, ding_h.BoundingRectangle)
                                     sleep_check(0.2)
                                     if do_silent:
-                                        _enable_dingtalk_silent_send()
+                                        if _enable_dingtalk_silent_send():
+                                            globals()["_dt_silent_was_enabled"] = True
                                     else:
-                                        log("  未开启静音发送，跳过点击静音按钮")
+                                        if not _reset_residual_dt_silent_if_needed():
+                                            log("  未开启静音发送，跳过点击静音按钮")
                                     try:
                                         sw2 = max(0, min(30, int(round(float(cfg.get("dt_send_wait_sec", 5))))))
                                     except Exception:
@@ -14582,7 +16220,7 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
                                     if "手动停止" in str(e_heal_fail):
                                         raise
                                     log(f"  ℹ️ [AI 自动调试] 补发尝试未一次完成（{human_error(e_heal_fail)}），转入常规重贴流程…")
-                            skip_search = ("retry_paste" in acts_p) or (image_pasted_ok is False)
+                            skip_search = (("retry_paste" in acts_p) or (image_pasted_ok is False)) and ("reopen_search" not in acts_p)
                             continue
                     if not recover_interactive:
                         raise
@@ -14613,15 +16251,15 @@ def send_dingtalk_image(cfg, trigger_lt=None, trigger_hm=None, recover_interacti
         cancelled_targets = []
         total_targets = len(targets)
         for idx, tgt in enumerate(targets, 1):
-            res = _send_one_target(idx, total_targets, tgt)
+            res, actual_tgt = _send_one_target_with_actual(idx, total_targets, tgt)
             if res == "cancelled":
-                cancelled_targets.append(tgt)
-                log(f"  🛑 已自动取消发送到「{tgt}」（AI 桌面核对对象不一致，未粘贴发送）")
+                cancelled_targets.append(actual_tgt)
+                log(f"  🛑 已自动取消发送到「{actual_tgt}」（AI 桌面核对对象不一致，未粘贴发送）")
             elif res == "skipped":
-                skipped_targets.append(tgt)
-                log(f"  ⚠️ 已跳过会话「{tgt}」，继续下一个目标")
+                skipped_targets.append(actual_tgt)
+                log(f"  ⚠️ 已跳过会话「{actual_tgt}」，继续下一个目标")
             else:
-                sent_targets.append(tgt)
+                sent_targets.append(actual_tgt)
             if idx < total_targets:
                 sleep_check(0.8)
 
@@ -14680,6 +16318,9 @@ def send_dingtalk_text_message(cfg, target_names, message_text, silent=True, rec
     c["dt_silent_send"] = bool(silent)
     c["dt_targets"] = [{"name": t, "enabled": True} for t in tgts]
     c["dt_search"] = tgts[0]
+    c["point_overrides"] = {}
+    c["suffix_rules"] = []
+    c["dt_use_actual_clock"] = False
     return send_dingtalk_image(
         c,
         recover_interactive=recover_interactive,
@@ -14759,7 +16400,7 @@ def _capture_summary_with_recovery(page, temp_dir=None, enable_capture=True, rec
             if enable_capture:
                 check_stop()
                 set_step("正在复制表格图片…")
-                capture_wps_region(page)
+                capture_wps_region(page, cfg=use_cfg)
             return False
         except Exception as e_cap:
             if "手动停止" in str(e_cap):
@@ -14772,8 +16413,9 @@ def _capture_summary_with_recovery(page, temp_dir=None, enable_capture=True, rec
                     try:
                         page.keyboard.press("Escape")
                         sleep_check(1.0)
-                    except Exception:
-                        pass
+                    except Exception as e_cap_esc:
+                        if _is_stop_exception(e_cap_esc):
+                            raise
                     continue
             if not recover_interactive:
                 if failures is not None:
@@ -14845,6 +16487,8 @@ def run_raw_sync_only(round_num="刷底表", cfg=None, recover_interactive=True)
 
 
 def _run_once_impl(round_num, cfg=None, trigger_lt=None, trigger_hm=None, recover_interactive=True, raw_sync_only=False):
+    global _last_captured_summary_tsv
+    _last_captured_summary_tsv = ""
     start_time = time.time()
     trigger_lt = trigger_lt or time.localtime(start_time)
     start_str = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -15029,16 +16673,32 @@ def _run_once_impl_body(round_num, cfg, trigger_lt, trigger_hm, recover_interact
                         issue = diagnose_issue("luya_download", e_dl, extra={"name": name})
                         wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
 
-            # Stage 3: 整理格式
+            # Stage 3: 整理格式（失败时支持重新下载该表或提示排障）
             check_stop()
             set_step("正在整理数据格式…")
             log("3/5 整理数据格式...")
             tsv_files = []
             for name, xlsx_path in xlsx_files:
-                check_stop()
-                tsv_path = temp_dir / f"{name}.tsv"
-                xlsx_to_tsv(xlsx_path, tsv_path)
-                tsv_files.append((name, tsv_path))
+                while True:
+                    check_stop()
+                    tsv_path = temp_dir / f"{name}.tsv"
+                    try:
+                        xlsx_to_tsv(xlsx_path, tsv_path)
+                        tsv_files.append((name, tsv_path))
+                        break
+                    except Exception as e_tsv:
+                        if _is_stop_exception(e_tsv) or not recover_interactive:
+                            raise
+                        issue = diagnose_issue("luya_download", e_tsv, extra={"name": name})
+                        choice_t = wait_for_recovery(issue["title"], issue["detail"], issue["hint"], issue["actions"])
+                        if choice_t == "skip":
+                            log(f"  ⚠️ 用户选择跳过【{name}】格式转换")
+                            break
+                        src_url = next((u for n, u in DATA_URLS if n == name), None)
+                        if src_url:
+                            dl_retry = download_xlsx(page, name, src_url, temp_dir)
+                            if dl_retry:
+                                xlsx_path = dl_retry
 
             # Stage 4: 打开 WPS 登录并逐表写入
             check_stop()
@@ -15113,8 +16773,8 @@ def _run_once_impl_body(round_num, cfg, trigger_lt, trigger_hm, recover_interact
             except Exception:
                 pass
 
-    # Stage 6: 发钉钉（raw_sync_only 模式或截图失败/跳过时不发）
-    if (not raw_sync_only) and cfg.get("enable_dingtalk") and not capture_failed:
+    # Stage 6: 发钉钉（未开启截图或处于 raw_sync_only 或截图失败/跳过时不发）
+    if (not raw_sync_only) and cfg.get("enable_capture") and cfg.get("enable_dingtalk") and not capture_failed:
         try:
             check_stop()
             set_step("正在发送到钉钉…")
@@ -15199,6 +16859,8 @@ def run_capture_only(round_num="截图", cfg=None, recover_interactive=True):
 
 
 def _run_capture_only_impl(round_num="截图", cfg=None, recover_interactive=True):
+    global _last_captured_summary_tsv
+    _last_captured_summary_tsv = ""
     start_time = time.time()
     trigger_lt = time.localtime(start_time)
     if cfg is None:

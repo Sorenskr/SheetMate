@@ -8,7 +8,6 @@
 """
 
 import base64
-from collections import deque
 import functools
 import hashlib
 import hmac
@@ -92,11 +91,13 @@ def _mqtt_read_packet(sock):
     hdr = _mqtt_recv_exact(sock, 1)[0]
     mult = 1
     rem = 0
-    for _ in range(4):
+    for idx in range(4):
         b = _mqtt_recv_exact(sock, 1)[0]
         rem += (b & 0x7F) * mult
         if (b & 0x80) == 0:
             break
+        if idx == 3:
+            raise ValueError("Malformed MQTT remaining length")
         mult *= 128
     if rem > MAX_HTTP_BODY_BYTES:
         raise ValueError("MQTT packet exceeds size limit")
@@ -243,9 +244,15 @@ class CloudRelayCrypto:
         exp_mac = hmac.new(master_key, nonce + ct, hashlib.sha256).digest()[:16]
         if not hmac.compare_digest(mac, exp_mac):
             return None
+        cur_chk_t = int(time.time() if now_ts is None else now_ts)
         n_hex = nonce.hex()
-        if seen_nonces is not None and n_hex in seen_nonces:
-            return None
+        if seen_nonces is not None:
+            if isinstance(seen_nonces, dict):
+                exp_existing = seen_nonces.get(n_hex)
+                if exp_existing is not None and exp_existing > cur_chk_t:
+                    return None
+            elif n_hex in seen_nonces:
+                return None
         ks = cls._keystream(master_key, nonce, len(ct))
         pt = bytes(c ^ k for c, k in zip(ct, ks))
         try:
@@ -259,7 +266,19 @@ class CloudRelayCrypto:
         if abs(cur_t - pkt_ts) > RELAY_REPLAY_WINDOW_SEC:
             return None
         if seen_nonces is not None:
-            seen_nonces.append(n_hex)
+            if isinstance(seen_nonces, dict):
+                expired_k = [k for k, exp_v in seen_nonces.items() if exp_v <= cur_t]
+                for k in expired_k:
+                    seen_nonces.pop(k, None)
+                if len(seen_nonces) > 4096:
+                    oldest = sorted(seen_nonces.items(), key=lambda it: it[1])[: len(seen_nonces) - 2048]
+                    for k, _ in oldest:
+                        seen_nonces.pop(k, None)
+                seen_nonces[n_hex] = cur_t + RELAY_REPLAY_WINDOW_SEC
+            elif hasattr(seen_nonces, "append"):
+                seen_nonces.append(n_hex)
+            elif hasattr(seen_nonces, "add"):
+                seen_nonces.add(n_hex)
         return obj
 
 
@@ -1250,7 +1269,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="m-dl-card" id="mDownloadCard">
       <div class="m-dl-head">
         <div class="m-dl-title">电脑还没装软件？免费下载客户端</div>
-        <span class="m-dl-badge">v2.9.6 纯净单文件版</span>
+        <span class="m-dl-badge">v2.9.7 纯净单文件版</span>
       </div>
       <div class="m-dl-desc">
         下载这单个 SheetMate.exe 双击直接运行（绝不生成杂乱文件夹、无需安装环境、关闭窗口直接结束退出），支持自动抓数写 WPS 表、钉钉静音发群与云端异地遥控。
@@ -1483,7 +1502,8 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       const mac = hmacSha256(masterKey, concat([nonce, ct])).slice(0, 16);
       return "SM28:" + toB64(concat([nonce, mac, ct]));
     }
-    function decryptPacket(masterKey, rawStr) {
+    const defaultSeenNonces = new Map();
+    function decryptPacket(masterKey, rawStr, seenMap = defaultSeenNonces) {
       let s = String(rawStr || "").trim();
       if (s.startsWith("SM28:")) s = s.slice(5);
       if (!s) return null;
@@ -1497,14 +1517,29 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       let diff = 0;
       for (let i = 0; i < 16; i++) diff |= (mac[i] ^ expMac[i]);
       if (diff !== 0) return null;
+      const now = Math.floor(Date.now() / 1000);
+      const nHex = toHex(nonce);
+      if (seenMap instanceof Map) {
+        for (const [k, exp] of seenMap.entries()) {
+          if (exp <= now) seenMap.delete(k);
+        }
+        const ex = seenMap.get(nHex);
+        if (ex && ex > now) return null;
+      }
       const ks = keystream(masterKey, nonce, ct.length);
       const pt = new Uint8Array(ct.length);
       for (let i = 0; i < ct.length; i++) pt[i] = ct[i] ^ ks[i];
       try {
         const obj = JSON.parse(td.decode(pt));
         if (!obj || typeof obj !== "object") return null;
-        const now = Math.floor(Date.now() / 1000);
         if (Math.abs(now - (Number(obj.ts) || 0)) > 180) return null;
+        if (seenMap instanceof Map) {
+          seenMap.set(nHex, now + 180);
+          while (seenMap.size > 2048) {
+            const firstKey = seenMap.keys().next().value;
+            seenMap.delete(firstKey);
+          }
+        }
         return obj;
       } catch (_e) {
         return null;
@@ -1599,6 +1634,10 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         if (ptype === 0x20) {
           if (body.length >= 2 && body[1] === 0 && activeDownTopic) {
             try { entry.ws.send(buildSubscribe(1, activeDownTopic)); } catch (_e) {}
+          } else {
+            entry.ready = false;
+            try { entry.ws.close(); } catch (_e2) {}
+            return;
           }
         } else if (ptype === 0x90) {
           entry.ready = true;
@@ -1699,6 +1738,9 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     function hasReady() {
       return conns.some((e) => e.ready && e.ws && e.ws.readyState === 1);
     }
+    function hasConnectingOrReady() {
+      return conns.some((e) => e.ws && (e.ws.readyState === 0 || (e.ready && e.ws.readyState === 1)));
+    }
     async function connectAndSub(downTopic, cb, timeoutMs = 5500) {
       if (cb) onMessageCb = cb;
       if (!manualClosed && activeDownTopic === downTopic && hasReady()) return true;
@@ -1731,7 +1773,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
       return sent;
     }
-    return { connectAndSub, publish, closeAll, hasReady, WS_BROKERS };
+    return { connectAndSub, publish, closeAll, hasReady, hasConnectingOrReady, WS_BROKERS };
   })();
   if (typeof globalThis !== "undefined") globalThis.SMRelay = SMRelay;
   if (typeof window === "undefined" || typeof document === "undefined") return;
@@ -1743,11 +1785,20 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   const LS_AUTO_KEY = "sm_auto_login";
   const LS_CACHE_STATE_KEY = "sm_cached_state_v2";
 
+  function safeStorageGet(k, defVal = "") {
+    try { const v = localStorage.getItem(k); return v === null ? defVal : v; } catch (_e) { return defVal; }
+  }
+  function safeStorageSet(k, v) {
+    try { localStorage.setItem(k, String(v)); } catch (_e) {}
+  }
+  function safeStorageRemove(k) {
+    try { localStorage.removeItem(k); } catch (_e) {}
+  }
   function safeJsonParse(raw, fallback) {
     try { return raw ? JSON.parse(raw) : fallback; } catch (_e) { return fallback; }
   }
   function loadSavedAccounts() {
-    const arr = safeJsonParse(localStorage.getItem(LS_ACCTS_KEY), []);
+    const arr = safeJsonParse(safeStorageGet(LS_ACCTS_KEY, ""), []);
     return Array.isArray(arr) ? arr.filter((x) => x && x.nick && x.pin) : [];
   }
   function saveAccountRecord(rec) {
@@ -1762,34 +1813,60 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       updatedAt: Date.now(),
     });
     if (list.length > 8) list.length = 8;
-    localStorage.setItem(LS_ACCTS_KEY, JSON.stringify(list));
-    localStorage.setItem(LS_CREDS_KEY, JSON.stringify(list[0]));
+    safeStorageSet(LS_ACCTS_KEY, JSON.stringify(list));
+    safeStorageSet(LS_CREDS_KEY, JSON.stringify(list[0]));
   }
   function removeAccountRecord(nick) {
     const key = SMCrypto.normalizeNickKey(nick);
     const list = loadSavedAccounts().filter((x) => SMCrypto.normalizeNickKey(x.nick) !== key);
-    localStorage.setItem(LS_ACCTS_KEY, JSON.stringify(list));
-    const cur = safeJsonParse(localStorage.getItem(LS_CREDS_KEY), null);
+    safeStorageSet(LS_ACCTS_KEY, JSON.stringify(list));
+    const cur = safeJsonParse(safeStorageGet(LS_CREDS_KEY, ""), null);
     if (cur && SMCrypto.normalizeNickKey(cur.nick) === key) {
-      if (list.length) localStorage.setItem(LS_CREDS_KEY, JSON.stringify(list[0]));
-      else localStorage.removeItem(LS_CREDS_KEY);
+      if (list.length) safeStorageSet(LS_CREDS_KEY, JSON.stringify(list[0]));
+      else safeStorageRemove(LS_CREDS_KEY);
     }
   }
 
-  let savedCred = safeJsonParse(localStorage.getItem(LS_CREDS_KEY), null);
-  let mobileToken = localStorage.getItem("sm_mobile_token") || "";
-  let myNick = (savedCred && savedCred.nick) || localStorage.getItem("sm_mobile_nick") || qs.get("name") || "";
+  let savedCred = safeJsonParse(safeStorageGet(LS_CREDS_KEY, ""), null);
+  let mobileToken = safeStorageGet("sm_mobile_token", "") || "";
+  let myNick = (savedCred && savedCred.nick) || safeStorageGet("sm_mobile_nick", "") || qs.get("name") || "";
   let myPin = (savedCred && savedCred.pin) || "";
-  let serverBase = (savedCred && savedCred.serverBase) || localStorage.getItem("sm_mobile_base") || qs.get("hub") || "";
-  let connMode = (savedCred && savedCred.connMode) || localStorage.getItem("sm_conn_mode") || "";
+  let serverBase = (savedCred && savedCred.serverBase) || safeStorageGet("sm_mobile_base", "") || qs.get("hub") || "";
+  let connMode = (savedCred && savedCred.connMode) || safeStorageGet("sm_conn_mode", "") || "";
   let relayCred = null; // { nick, pin, upTopic, downTopic, masterKey }
   const pendingReqs = new Map();
   let lastChatSeq = -1;
   let lastPaused = false;
   let pollTimer = null;
+  let delayedPollTm = null;
   let pollInFlight = false;
+  let loginGen = 0;
   let cachedChatHistory = [];
   let pendingUserMsgs = [];
+  function scheduleDelayedPoll(ms = 220) {
+    if (delayedPollTm) clearTimeout(delayedPollTm);
+    delayedPollTm = setTimeout(() => {
+      delayedPollTm = null;
+      doPoll();
+    }, ms);
+  }
+  function clearPollTimers() {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    if (delayedPollTm) {
+      clearTimeout(delayedPollTm);
+      delayedPollTm = null;
+    }
+  }
+  function restartPollTimer() {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    if (connMode === "cloud" && relayCred) {
+      pollTimer = setInterval(doPoll, 5000);
+    } else if (mobileToken) {
+      pollTimer = setInterval(doPoll, 1200);
+    }
+  }
 
   if ($("mLoginNameInput") && myNick) $("mLoginNameInput").value = myNick;
   if ($("mLoginPinInput") && myPin) $("mLoginPinInput").value = myPin;
@@ -1920,7 +1997,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
           lastChatSeq = typeof r.chat_seq === "number" ? r.chat_seq : lastChatSeq + 1;
           renderChats(r.history);
         }
-        setTimeout(doPoll, 200);
+        scheduleDelayedPoll(200);
       }
     } catch (_e) {
       if (typeof onFailUnlock === "function") onFailUnlock();
@@ -2106,11 +2183,14 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       } else {
         for (const it of items) frag.appendChild(buildBubbleNode(it));
         for (const pMsg of pendingUserMsgs) {
-          frag.appendChild(buildBubbleNode({ role: "user", text: pMsg, time: "刚刚", via: "mobile", shot_info: "已发出" }));
+          const pTxt = typeof pMsg === "string" ? pMsg : (pMsg && pMsg.text) || "";
+          if (pTxt) frag.appendChild(buildBubbleNode({ role: "user", text: pTxt, time: "刚刚", via: "mobile", shot_info: "已发出" }));
         }
         if (pendingUserMsgs.length || mAiThinking.active) {
           const elapsed = mAiThinking.startTs ? Math.max(0, Math.floor((Date.now() - mAiThinking.startTs) / 1000)) : 0;
-          frag.appendChild(buildMobileThinkingNode(mAiThinking.prompt || pendingUserMsgs[0] || "", elapsed));
+          const pFirst = pendingUserMsgs[0];
+          const pFirstTxt = typeof pFirst === "string" ? pFirst : (pFirst && pFirst.text) || "";
+          frag.appendChild(buildMobileThinkingNode(mAiThinking.prompt || pFirstTxt || "", elapsed));
         }
       }
       feed.innerHTML = "";
@@ -2133,7 +2213,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
           })
         : [];
       const liteSt = Object.assign({}, st, { ai_history: liteHist, pending_target_confirm: null });
-      localStorage.setItem(LS_CACHE_STATE_KEY, JSON.stringify({ st: liteSt, ts: Date.now() }));
+      safeStorageSet(LS_CACHE_STATE_KEY, JSON.stringify({ st: liteSt, ts: Date.now() }));
     } catch (_e) {}
     const dot = $("mStatusDot");
     dot.className = "m-st-dot" + (st.busy ? " busy" : (st.status_level === "err" ? " err" : ""));
@@ -2169,8 +2249,14 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     if (typeof st.chat_seq === "number" && st.chat_seq !== lastChatSeq) {
       lastChatSeq = st.chat_seq;
       const incoming = Array.isArray(st.ai_history) ? st.ai_history : [];
-      if (pendingUserMsgs.length && incoming.some((m) => m.role === "user" && m.text === pendingUserMsgs[0])) {
-        pendingUserMsgs.shift();
+      if (pendingUserMsgs.length) {
+        const p0 = pendingUserMsgs[0];
+        const pTxt = typeof p0 === "string" ? p0 : (p0 && p0.text) || "";
+        const bLen = (p0 && typeof p0.baseLen === "number") ? p0.baseLen : 0;
+        const startIdx = incoming.length >= bLen ? bLen : 0;
+        if (incoming.slice(startIdx).some((m) => m.role === "user" && m.text === pTxt)) {
+          pendingUserMsgs.shift();
+        }
       }
       renderChats(incoming);
     }
@@ -2259,10 +2345,12 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   async function sendRelayCommand(cmd, params = {}, timeoutMs = 12000) {
     if (!relayCred) throw new Error("未配置云桥连接");
-    const okSub = await startRelaySubscribe();
+    const credSnap = relayCred;
+    const upTopicSnap = credSnap.upTopic;
+    const okSub = await SMRelay.connectAndSub(credSnap.downTopic, handleRelayIncomingText, 5500);
     if (!okSub) throw new Error("broker_unreachable");
     const reqId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-    const pkt = SMCrypto.encryptPacket(relayCred.masterKey, { req_id: reqId, cmd, params });
+    const pkt = SMCrypto.encryptPacket(credSnap.masterKey, { req_id: reqId, cmd, params });
     return await new Promise((resolve, reject) => {
       const tm = setTimeout(() => {
         if (pendingReqs.has(reqId)) {
@@ -2272,12 +2360,12 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
       }, timeoutMs);
       const retryTm = setTimeout(() => {
-        if (pendingReqs.has(reqId)) {
-          SMRelay.publish(relayCred.upTopic, pkt);
+        if (pendingReqs.has(reqId) && relayCred === credSnap) {
+          SMRelay.publish(upTopicSnap, pkt);
         }
       }, 1800);
       pendingReqs.set(reqId, { resolve, reject, tm, retryTm });
-      const sent = SMRelay.publish(relayCred.upTopic, pkt);
+      const sent = SMRelay.publish(upTopicSnap, pkt);
       if (!sent) {
         pendingReqs.delete(reqId);
         clearTimeout(tm);
@@ -2292,7 +2380,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     pollInFlight = true;
     try {
       if (connMode === "cloud" && relayCred) {
-        if (!SMRelay.hasReady()) await startRelaySubscribe();
+        if (!SMRelay.hasConnectingOrReady()) await startRelaySubscribe();
         return;
       }
       if (!mobileToken) return;
@@ -2300,8 +2388,8 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         const st = await mApi("/api/mobile/state");
         if (st && st.auth_required) {
           mobileToken = "";
-          localStorage.removeItem("sm_mobile_token");
-          clearInterval(pollTimer);
+          safeStorageRemove("sm_mobile_token");
+          clearPollTimers();
           showLoginView("登录已失效，请重新输入唯一名字和远程密码");
           return;
         }
@@ -2317,16 +2405,17 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     const msg = String(text !== undefined ? text : inp.value).trim();
     if (!msg) return;
     if (text === undefined || inp.value.trim() === msg) inp.value = "";
-    pendingUserMsgs.push(msg);
+    const pendItem = { text: msg, baseLen: cachedChatHistory.length };
+    pendingUserMsgs.push(pendItem);
     startMobileThinking(msg);
     renderChats(cachedChatHistory);
     try {
       if (connMode === "cloud" && relayCred) {
         const res = await sendRelayCommand("chat", { prompt: msg, style_id: "custom" }, 58000);
-        const idx = pendingUserMsgs.indexOf(msg);
+        const idx = pendingUserMsgs.indexOf(pendItem);
         if (idx >= 0) pendingUserMsgs.splice(idx, 1);
         stopMobileThinking();
-        if (res && res.state) applyState(res.state);
+        if (res && res.state) applyPcState(res.state);
         if (res && res.result) {
           const r = res.result;
           if (Array.isArray(r.history)) {
@@ -2340,7 +2429,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
       } else {
         const res = await mApi("/api/mobile/chat", "POST", { prompt: msg }, null, 65000);
-        const idx = pendingUserMsgs.indexOf(msg);
+        const idx = pendingUserMsgs.indexOf(pendItem);
         if (idx >= 0) pendingUserMsgs.splice(idx, 1);
         stopMobileThinking();
         if (res && Array.isArray(res.history)) {
@@ -2356,7 +2445,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
       }
     } catch (_e) {
-      const idx = pendingUserMsgs.indexOf(msg);
+      const idx = pendingUserMsgs.indexOf(pendItem);
       if (idx >= 0) pendingUserMsgs.splice(idx, 1);
       stopMobileThinking();
       renderChats(cachedChatHistory);
@@ -2365,6 +2454,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   async function performLogin(nick, pin, b, { remember = true, silentBoot = false } = {}) {
+    const myGen = ++loginGen;
     const cleanNick = String(nick || "").trim();
     const cleanPin = String(pin || "").trim();
     const cleanBase = String(b || "").trim().replace(/\/+$/, "");
@@ -2378,10 +2468,10 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
     if (cleanBase) {
       serverBase = cleanBase;
-      localStorage.setItem("sm_mobile_base", cleanBase);
+      safeStorageSet("sm_mobile_base", cleanBase);
     } else if (!isLocalServed()) {
       serverBase = "";
-      localStorage.removeItem("sm_mobile_base");
+      safeStorageRemove("sm_mobile_base");
     }
 
     const persistSuccess = (mode, tok, resolvedNick) => {
@@ -2390,15 +2480,15 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       myPin = cleanPin;
       if (tok) {
         mobileToken = tok;
-        localStorage.setItem("sm_mobile_token", tok);
+        safeStorageSet("sm_mobile_token", tok);
       }
-      localStorage.setItem("sm_conn_mode", mode);
-      localStorage.setItem("sm_mobile_nick", myNick);
+      safeStorageSet("sm_conn_mode", mode);
+      safeStorageSet("sm_mobile_nick", myNick);
       if (remember) {
-        localStorage.setItem(LS_AUTO_KEY, "1");
+        safeStorageSet(LS_AUTO_KEY, "1");
         saveAccountRecord({ nick: myNick, pin: cleanPin, serverBase: serverBase, connMode: mode });
       } else {
-        localStorage.setItem(LS_AUTO_KEY, "0");
+        safeStorageSet(LS_AUTO_KEY, "0");
       }
       if ($("mLoginNameInput")) $("mLoginNameInput").value = myNick;
       if ($("mLoginPinInput")) $("mLoginPinInput").value = cleanPin;
@@ -2408,13 +2498,14 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     if (isLocalServed()) {
       try {
         const r = await mApi("/api/mobile/auth", "POST", { nickname: cleanNick, pin: cleanPin }, cleanBase || baseUrl());
+        if (myGen !== loginGen) return false;
         if (r && r.ok && r.mobile_token) {
           const rNick = (r.profile && (r.profile.nickname || r.profile.display_name)) || cleanNick;
           persistSuccess("local", r.mobile_token, rNick);
           showMainView();
           await doPoll();
-          clearInterval(pollTimer);
-          pollTimer = setInterval(doPoll, 1200);
+          if (myGen !== loginGen) return false;
+          restartPollTimer();
           localWorked = true;
           return true;
         } else if (r && r.message && !cleanBase) {
@@ -2426,34 +2517,41 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       try {
         const localHostBase = "http://127.0.0.1:18792";
         const r = await mApi("/api/mobile/auth", "POST", { nickname: cleanNick, pin: cleanPin }, localHostBase, 750);
+        if (myGen !== loginGen) return false;
         if (r && r.ok && r.mobile_token) {
           serverBase = localHostBase;
-          localStorage.setItem("sm_mobile_base", localHostBase);
+          safeStorageSet("sm_mobile_base", localHostBase);
           const rNick = (r.profile && (r.profile.nickname || r.profile.display_name)) || cleanNick;
           persistSuccess("local", r.mobile_token, rNick);
           showMainView();
           await doPoll();
-          clearInterval(pollTimer);
-          pollTimer = setInterval(doPoll, 1200);
+          if (myGen !== loginGen) return false;
+          restartPollTimer();
           localWorked = true;
           return true;
         }
       } catch (_loopErr) {}
     }
+    if (myGen !== loginGen) return false;
     if (!localWorked) {
       const derived = SMCrypto.deriveRoomAndKey(cleanNick, cleanPin);
       relayCred = Object.assign({ nick: cleanNick, pin: cleanPin }, derived);
       try {
         const ack = await sendRelayCommand("auth_state", {}, silentBoot ? 7500 : 9000);
+        if (myGen !== loginGen) return false;
         if (ack && ack.ok) {
           persistSuccess("cloud", "", ack.nickname || cleanNick);
           showMainView();
           if (ack.state) applyPcState(ack.state);
-          clearInterval(pollTimer);
-          pollTimer = setInterval(doPoll, 5000);
+          restartPollTimer();
           return true;
         }
+        closeRelayStream();
+        relayCred = null;
+        showLoginView((ack && ack.message) || "登录被电脑端拒绝，请核对昵称与密码");
+        return false;
       } catch (_relayErr) {
+        if (myGen !== loginGen) return false;
         closeRelayStream();
         relayCred = null;
         const isNetErr = _relayErr && _relayErr.message === "broker_unreachable";
@@ -2468,31 +2566,44 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     return false;
   }
 
-  function logoutCurrentSession() {
-    mobileToken = "";
-    connMode = "";
-    relayCred = null;
+  function resetAccountViewCache() {
+    cachedChatHistory = [];
     pendingUserMsgs = [];
     stopMobileThinking();
     lastChatSeq = -1;
+    safeStorageRemove(LS_CACHE_STATE_KEY);
+    renderChats([]);
+  }
+
+  function logoutCurrentSession() {
+    loginGen += 1;
+    mobileToken = "";
+    connMode = "";
+    relayCred = null;
+    resetAccountViewCache();
     closeRelayStream();
-    localStorage.setItem(LS_AUTO_KEY, "0");
-    localStorage.removeItem("sm_mobile_token");
-    localStorage.removeItem("sm_conn_mode");
-    clearInterval(pollTimer);
+    safeStorageSet(LS_AUTO_KEY, "0");
+    safeStorageRemove("sm_mobile_token");
+    safeStorageRemove("sm_conn_mode");
+    clearPollTimers();
     showLoginView("");
     showToast("已退出当前连接");
   }
 
   async function quickSwitchToAccount(acc) {
     if (!acc || !acc.nick || !acc.pin) return;
+    loginGen += 1;
     if ($("mSwitchModalMask")) $("mSwitchModalMask").classList.remove("show");
     if ($("mLoginNameInput")) $("mLoginNameInput").value = acc.nick;
     if ($("mLoginPinInput")) $("mLoginPinInput").value = acc.pin;
     if ($("mServerBaseInput")) $("mServerBaseInput").value = acc.serverBase || "";
     serverBase = acc.serverBase || "";
+    mobileToken = "";
+    connMode = "";
+    relayCred = null;
+    resetAccountViewCache();
     closeRelayStream();
-    clearInterval(pollTimer);
+    clearPollTimers();
     showToast(`正在切换到「${acc.nick}」…`);
     await performLogin(acc.nick, acc.pin, acc.serverBase || "", { remember: true });
   }
@@ -2568,11 +2679,11 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   if ($("mClearSavedBtn")) {
     $("mClearSavedBtn").onclick = () => {
-      localStorage.removeItem(LS_ACCTS_KEY);
-      localStorage.removeItem(LS_CREDS_KEY);
-      localStorage.removeItem(LS_AUTO_KEY);
-      localStorage.removeItem("sm_mobile_nick");
-      localStorage.removeItem("sm_mobile_base");
+      safeStorageRemove(LS_ACCTS_KEY);
+      safeStorageRemove(LS_CREDS_KEY);
+      safeStorageRemove(LS_AUTO_KEY);
+      safeStorageRemove("sm_mobile_nick");
+      safeStorageRemove("sm_mobile_base");
       if ($("mLoginNameInput")) $("mLoginNameInput").value = "";
       if ($("mLoginPinInput")) $("mLoginPinInput").value = "";
       if ($("mServerBaseInput")) $("mServerBaseInput").value = "";
@@ -2604,11 +2715,9 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     const syncCardCompact = (compact) => {
       $("mStatusCard").classList.toggle("m-status-compact", !!compact);
       $("mToggleCardBtn").textContent = compact ? "展开详情" : "收起";
-      try { localStorage.setItem("sm_m_card_compact", compact ? "1" : "0"); } catch (_e) {}
+      safeStorageSet("sm_m_card_compact", compact ? "1" : "0");
     };
-    try {
-      if (localStorage.getItem("sm_m_card_compact") === "1") syncCardCompact(true);
-    } catch (_e) {}
+    if (safeStorageGet("sm_m_card_compact", "") === "1") syncCardCompact(true);
     $("mToggleCardBtn").onclick = () => {
       syncCardCompact(!$("mStatusCard").classList.contains("m-status-compact"));
     };
@@ -2623,10 +2732,20 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (feed) feed.scrollTop = feed.scrollHeight;
     };
   }
+  function resumePollIfLoggedIn() {
+    if ($("mMainApp") && $("mMainApp").style.display !== "none" && ((connMode === "cloud" && relayCred) || mobileToken)) {
+      restartPollTimer();
+      doPoll();
+    }
+  }
   window.addEventListener("pagehide", () => {
     pollInFlight = false;
-    clearInterval(pollTimer);
+    clearPollTimers();
     stopMobileThinking();
+  });
+  window.addEventListener("pageshow", resumePollIfLoggedIn);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") resumePollIfLoggedIn();
   });
 
   $("mSendBtn").onclick = () => sendChat();
@@ -2659,7 +2778,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
           const r = await mApi("/api/mobile/action", "POST", { action: act });
           showToast((r && r.message) || "指令已下发给电脑");
         }
-        setTimeout(doPoll, 250);
+        scheduleDelayedPoll(250);
       } catch (_e) {
         showToast("操作指令暂未送达，请重试");
       }
@@ -2668,14 +2787,13 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   (async function bootMobile() {
     renderSavedAccountUI();
-    const allowAuto = localStorage.getItem(LS_AUTO_KEY) !== "0";
+    const allowAuto = safeStorageGet(LS_AUTO_KEY, "") !== "0";
     if (connMode === "local" && mobileToken && isLocalServed() && allowAuto) {
       showMainView();
-      const cached = safeJsonParse(localStorage.getItem(LS_CACHE_STATE_KEY), null);
+      const cached = safeJsonParse(safeStorageGet(LS_CACHE_STATE_KEY, ""), null);
       if (cached && cached.st) applyPcState(cached.st);
       await doPoll();
-      clearInterval(pollTimer);
-      pollTimer = setInterval(doPoll, 1200);
+      restartPollTimer();
       return;
     }
     const useCred = savedCred || (myNick && myPin ? { nick: myNick, pin: myPin, serverBase: serverBase } : null);
@@ -2684,7 +2802,7 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       if ($("mLoginPinInput")) $("mLoginPinInput").value = useCred.pin;
       if ($("mServerBaseInput") && useCred.serverBase) $("mServerBaseInput").value = useCred.serverBase;
       showMainView();
-      const cached = safeJsonParse(localStorage.getItem(LS_CACHE_STATE_KEY), null);
+      const cached = safeJsonParse(safeStorageGet(LS_CACHE_STATE_KEY, ""), null);
       if (cached && cached.st) applyPcState(cached.st);
       $("mHeaderSub").textContent = `自动登录中… · ${useCred.nick}`;
       await performLogin(useCred.nick, useCred.pin, useCred.serverBase || "", { remember: true, silentBoot: true });
@@ -2697,7 +2815,13 @@ MOBILE_HTML_TEMPLATE = r"""<!DOCTYPE html>
 """
 
 
-def _detect_lan_ipv4_list():
+_LAN_IP_CACHE = {"ts": 0.0, "ips": ["127.0.0.1"]}
+
+
+def _detect_lan_ipv4_list(use_cache=True):
+    now_m = time.monotonic()
+    if use_cache and _LAN_IP_CACHE["ts"] and (now_m - _LAN_IP_CACHE["ts"]) < 30.0:
+        return list(_LAN_IP_CACHE["ips"])
     ips = []
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -2714,7 +2838,10 @@ def _detect_lan_ipv4_list():
                 ips.append(ip)
     except Exception:
         pass
-    return ips or ["127.0.0.1"]
+    res_list = ips or ["127.0.0.1"]
+    _LAN_IP_CACHE["ts"] = now_m
+    _LAN_IP_CACHE["ips"] = list(res_list)
+    return list(res_list)
 
 
 class MobileBridgeManager:
@@ -2742,7 +2869,7 @@ class MobileBridgeManager:
         self._mqtt_conns = {}
         self._mqtt_send_lock = threading.Lock()
         self._nonce_lock = threading.Lock()
-        self._relay_seen_nonces = deque(maxlen=250)
+        self._relay_seen_nonces = {}
         self._relay_last_active_ts = 0.0
         self._relay_last_pushed_seq = -1
         self._relay_connected = False
@@ -2791,17 +2918,23 @@ class MobileBridgeManager:
 
     def _save_remote_cfg(self):
         p = self._remote_cfg_path()
+        tmp = p.with_name(f".{p.name}.tmp.{os.getpid()}.{threading.get_ident()}")
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".tmp")
-            tmp.write_text(json.dumps({
-                "schema_v": 2,
-                "remote_password": self.mobile_pin,
-                "cloud_relay_enabled": bool(self.cloud_relay_enabled),
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(p)
+            with open(tmp, "w", encoding="utf-8", newline="") as fp:
+                fp.write(json.dumps({
+                    "schema_v": 2,
+                    "remote_password": self.mobile_pin,
+                    "cloud_relay_enabled": bool(self.cloud_relay_enabled),
+                }, ensure_ascii=False, indent=2))
+                fp.flush()
+            os.replace(str(tmp), str(p))
         except Exception:
-            pass
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
     def _get_local_nick(self):
         hub = getattr(self.ctrl, "hub", None)
@@ -2839,6 +2972,9 @@ class MobileBridgeManager:
             if rec.get("until", 0.0) > now:
                 wait_s = max(1, int(rec["until"] - now))
                 return {"ok": False, "locked": True, "message": f"密码连续输错过多，请 {wait_s} 秒后再试"}
+            if rec.get("until", 0.0) > 0.0 and rec["until"] <= now:
+                rec = {"cnt": 0, "until": 0.0}
+                self._auth_fail_tracker.pop(client_id, None)
             want_pin = str(self.mobile_pin or DEFAULT_REMOTE_PASSWORD)
             got_pin = str(pin or "").strip()
             if not got_pin or not hmac.compare_digest(got_pin, want_pin):
@@ -2940,121 +3076,140 @@ class MobileBridgeManager:
                     return None
 
                 def do_GET(self):
-                    parsed = urlparse(self.path)
-                    if parsed.path in ("/", "/m", "/index.html"):
-                        body = MOBILE_HTML_TEMPLATE.encode("utf-8")
-                        self.send_response(HTTPStatus.OK)
-                        self._cors()
-                        self._send_security_headers()
-                        self.send_header("Content-Type", "text/html; charset=utf-8")
-                        self.send_header("Cache-Control", "no-store")
-                        self.send_header("Content-Length", str(len(body)))
-                        self.end_headers()
-                        self.wfile.write(body)
-                        return
+                    try:
+                        parsed = urlparse(self.path)
+                        if parsed.path in ("/", "/m", "/index.html"):
+                            body = MOBILE_HTML_TEMPLATE.encode("utf-8")
+                            self.send_response(HTTPStatus.OK)
+                            self._cors()
+                            self._send_security_headers()
+                            self.send_header("Content-Type", "text/html; charset=utf-8")
+                            self.send_header("Cache-Control", "no-store")
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+                            return
 
-                    if parsed.path == "/api/mobile/ping":
-                        self._send_json({
-                            "ok": True,
-                            "version": getattr(mgr.ctrl.app, "APP_VERSION", "2.8.0"),
-                            "need_pin": True,
-                        })
-                        return
+                        if parsed.path == "/api/mobile/ping":
+                            self._send_json({
+                                "ok": True,
+                                "version": getattr(mgr.ctrl.app, "APP_VERSION", "2.8.0"),
+                                "need_pin": True,
+                            })
+                            return
 
-                    if parsed.path == "/api/mobile/state":
+                        if parsed.path == "/api/mobile/state":
+                            u = self._authed_user()
+                            if u is None:
+                                self._send_json({"ok": False, "auth_required": True, "message": "请先输入唯一名字与访问密码连接"}, HTTPStatus.FORBIDDEN)
+                                return
+                            qs = parse_qs(parsed.query)
+                            since_log = _safe_int((qs.get("since_log") or ["0"])[0], default=0, min_val=0)
+                            st = mgr._get_ctrl_state(since=since_log)
+                            self._send_json(mgr._pack_mobile_state(st))
+                            return
+
+                        self._send_json({"ok": False, "message": "Not Found"}, HTTPStatus.NOT_FOUND)
+                    except (ConnectionError, BrokenPipeError):
+                        pass
+                    except Exception as exc:
+                        try:
+                            self._send_json({"ok": False, "message": f"服务端异常：{str(exc)[:120]}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                        except Exception:
+                            pass
+
+                def do_POST(self):
+                    try:
+                        parsed = urlparse(self.path)
+                        try:
+                            body = _safe_read_json(self.rfile, self.headers)
+                        except ValueError:
+                            self._send_json({"ok": False, "message": "请求体超出安全大小限制"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                            return
+
+                        if parsed.path == "/api/mobile/auth":
+                            nick = str(body.get("nickname") or "").strip()
+                            pin = str(body.get("pin") or "").strip()
+                            c_ip = str(self.client_address[0] if self.client_address else "local")
+                            with mgr._lock:
+                                tun_on = bool(mgr._tunnel_running)
+                                tun_kind = str(mgr._tunnel_kind or "")
+                            if c_ip in ("127.0.0.1", "::1") and tun_on:
+                                if tun_kind == "cloudflared":
+                                    cf_ip = str(self.headers.get("CF-Connecting-IP") or "").strip()
+                                    c_ip = f"cf:{cf_ip[:45]}" if cf_ip else "tunnel:cloudflared"
+                                else:
+                                    c_ip = f"tunnel:{tun_kind or 'remote'}"
+                            chk = mgr.verify_pin_and_login(nick, pin, client_id=c_ip)
+                            if not chk.get("ok"):
+                                code = HTTPStatus.TOO_MANY_REQUESTS if chk.get("locked") else HTTPStatus.OK
+                                self._send_json(chk, code)
+                                return
+                            tok = secrets.token_urlsafe(24)
+                            prof = chk.get("profile") or {}
+                            now = time.time()
+                            with mgr._lock:
+                                for tk in [k for k, v in mgr._tokens.items() if (now - v.get("ts", 0)) >= 86400 * 30]:
+                                    mgr._tokens.pop(tk, None)
+                                mgr._tokens[tok] = {
+                                    "nickname": prof.get("nickname") or prof.get("display_name") or nick,
+                                    "avatar": prof.get("avatar") or "",
+                                    "ts": now,
+                                }
+                                if len(mgr._tokens) > 80:
+                                    oldest = sorted(mgr._tokens.items(), key=lambda x: x[1]["ts"])[:20]
+                                    for k, _ in oldest:
+                                        mgr._tokens.pop(k, None)
+                            self._send_json({"ok": True, "mobile_token": tok, "profile": prof})
+                            return
+
                         u = self._authed_user()
                         if u is None:
                             self._send_json({"ok": False, "auth_required": True, "message": "请先输入唯一名字与访问密码连接"}, HTTPStatus.FORBIDDEN)
                             return
-                        qs = parse_qs(parsed.query)
-                        since_log = _safe_int((qs.get("since_log") or ["0"])[0], default=0, min_val=0)
-                        st = mgr.ctrl.get_state(since=since_log)
-                        self._send_json(mgr._pack_mobile_state(st))
-                        return
 
-                    self._send_json({"ok": False, "message": "Not Found"}, HTTPStatus.NOT_FOUND)
-
-                def do_POST(self):
-                    parsed = urlparse(self.path)
-                    try:
-                        body = _safe_read_json(self.rfile, self.headers)
-                    except ValueError:
-                        self._send_json({"ok": False, "message": "请求体超出安全大小限制"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-                        return
-
-                    if parsed.path == "/api/mobile/auth":
-                        nick = str(body.get("nickname") or "").strip()
-                        pin = str(body.get("pin") or "").strip()
-                        c_ip = str(self.client_address[0] if self.client_address else "local")
-                        if c_ip in ("127.0.0.1", "::1") and mgr._tunnel_running:
-                            cf_ip = str(self.headers.get("CF-Connecting-IP") or "").strip()
-                            xff = str(self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-                            fwd = cf_ip or xff
-                            if fwd:
-                                c_ip = f"tunnel:{fwd[:45]}"
-                        chk = mgr.verify_pin_and_login(nick, pin, client_id=c_ip)
-                        if not chk.get("ok"):
-                            code = HTTPStatus.TOO_MANY_REQUESTS if chk.get("locked") else HTTPStatus.OK
-                            self._send_json(chk, code)
-                            return
-                        tok = secrets.token_urlsafe(24)
-                        prof = chk.get("profile") or {}
-                        now = time.time()
-                        with mgr._lock:
-                            for tk in [k for k, v in mgr._tokens.items() if (now - v.get("ts", 0)) >= 86400 * 30]:
-                                mgr._tokens.pop(tk, None)
-                            mgr._tokens[tok] = {
-                                "nickname": prof.get("nickname") or prof.get("display_name") or nick,
-                                "avatar": prof.get("avatar") or "",
-                                "ts": now,
-                            }
-                            if len(mgr._tokens) > 80:
-                                oldest = sorted(mgr._tokens.items(), key=lambda x: x[1]["ts"])[:20]
-                                for k, _ in oldest:
-                                    mgr._tokens.pop(k, None)
-                        self._send_json({"ok": True, "mobile_token": tok, "profile": prof})
-                        return
-
-                    u = self._authed_user()
-                    if u is None:
-                        self._send_json({"ok": False, "auth_required": True, "message": "请先输入唯一名字与访问密码连接"}, HTTPStatus.FORBIDDEN)
-                        return
-
-                    if parsed.path == "/api/mobile/chat":
-                        prompt = str(body.get("prompt") or "").strip()
-                        style_id = str(body.get("style_id") or "custom").strip()
-                        res = mgr.ctrl.summarize_ai(
-                            style_id=style_id,
-                            prompt=prompt,
-                            action="send",
-                            source_device="mobile",
-                            speaker_name=u.get("nickname") or "",
-                        )
-                        if isinstance(res, dict):
-                            res["chat_seq"] = getattr(mgr.ctrl, "_chat_seq", 0)
-                        self._send_json(res)
-                        return
-
-                    if parsed.path == "/api/mobile/action":
-                        r = mgr._exec_remote_action(str(body.get("action") or "").strip())
-                        self._send_json(r if isinstance(r, dict) else {"ok": True})
-                        return
-
-                    if parsed.path == "/api/mobile/confirm-target":
-                        if hasattr(mgr.ctrl, "resolve_target_confirmation"):
-                            r = mgr.ctrl.resolve_target_confirmation(
-                                action=str(body.get("action") or "").strip(),
-                                new_target=str(body.get("new_target") or "").strip(),
-                                pending_id=str(body.get("pending_id") or "").strip(),
+                        if parsed.path == "/api/mobile/chat":
+                            prompt = str(body.get("prompt") or "").strip()
+                            style_id = str(body.get("style_id") or "custom").strip()
+                            res = mgr.ctrl.summarize_ai(
+                                style_id=style_id,
+                                prompt=prompt,
+                                action="send",
                                 source_device="mobile",
                                 speaker_name=u.get("nickname") or "",
                             )
-                        else:
-                            r = {"ok": False, "message": "当前版本不支持远程看图确认"}
-                        self._send_json(r if isinstance(r, dict) else {"ok": False})
-                        return
+                            if isinstance(res, dict):
+                                res["chat_seq"] = getattr(mgr.ctrl, "_chat_seq", 0)
+                            self._send_json(res)
+                            return
 
-                    self._send_json({"ok": False, "message": "Not Found"}, HTTPStatus.NOT_FOUND)
+                        if parsed.path == "/api/mobile/action":
+                            r = mgr._exec_remote_action(str(body.get("action") or "").strip())
+                            self._send_json(r if isinstance(r, dict) else {"ok": True})
+                            return
+
+                        if parsed.path == "/api/mobile/confirm-target":
+                            if hasattr(mgr.ctrl, "resolve_target_confirmation"):
+                                r = mgr.ctrl.resolve_target_confirmation(
+                                    action=str(body.get("action") or "").strip(),
+                                    new_target=str(body.get("new_target") or "").strip(),
+                                    pending_id=str(body.get("pending_id") or "").strip(),
+                                    source_device="mobile",
+                                    speaker_name=u.get("nickname") or "",
+                                )
+                            else:
+                                r = {"ok": False, "message": "当前版本不支持远程看图确认"}
+                            self._send_json(r if isinstance(r, dict) else {"ok": False})
+                            return
+
+                        self._send_json({"ok": False, "message": "Not Found"}, HTTPStatus.NOT_FOUND)
+                    except (ConnectionError, BrokenPipeError):
+                        pass
+                    except Exception as exc:
+                        try:
+                            self._send_json({"ok": False, "message": f"服务端异常：{str(exc)[:120]}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                        except Exception:
+                            pass
 
             class _ExclusiveMobileHTTPServer(ThreadingHTTPServer):
                 allow_reuse_address = False
@@ -3210,64 +3365,92 @@ class MobileBridgeManager:
             self._relay_error = err_tmp
         return ok_tmp
 
+    def _get_ctrl_state(self, since=0):
+        try:
+            return self.ctrl.get_state(since=since, source="mobile")
+        except TypeError:
+            return self.ctrl.get_state(since=since)
+
     def _handle_relay_command(self, obj, nick, down_topic, master_key):
         self._relay_last_active_ts = time.time()
         cmd = str(obj.get("cmd") or "").strip()
         req_id = str(obj.get("req_id") or "")
         params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
-        if cmd == "auth_state":
-            st = self.ctrl.get_state(since=0)
-            self._relay_last_pushed_seq = int(st.get("chat_seq") or 0)
-            self._send_relay_down_packet(down_topic, master_key, {
-                "ok": True,
-                "req_id": req_id,
-                "nickname": nick,
-                "state": self._pack_mobile_state(st),
-            })
-        elif cmd == "chat":
-            res = self.ctrl.summarize_ai(
-                style_id=str(params.get("style_id") or "custom"),
-                prompt=str(params.get("prompt") or ""),
-                action="send",
-                source_device="mobile",
-                speaker_name=nick,
-            )
-            st = self.ctrl.get_state(since=0)
-            self._relay_last_pushed_seq = int(st.get("chat_seq") or 0)
-            self._send_relay_down_packet(down_topic, master_key, {
-                "ok": True,
-                "req_id": req_id,
-                "result": res,
-                "state": self._pack_mobile_state(st),
-            })
-        elif cmd == "action":
-            r = self._exec_remote_action(str(params.get("action") or ""))
-            st = self.ctrl.get_state(since=0)
-            self._send_relay_down_packet(down_topic, master_key, {
-                "ok": True,
-                "req_id": req_id,
-                "result": r,
-                "state": self._pack_mobile_state(st),
-            })
-        elif cmd == "confirm_target":
-            if hasattr(self.ctrl, "resolve_target_confirmation"):
-                r = self.ctrl.resolve_target_confirmation(
-                    action=str(params.get("action") or ""),
-                    new_target=str(params.get("new_target") or ""),
-                    pending_id=str(params.get("pending_id") or ""),
+        try:
+            if cmd == "auth_state":
+                st = self._get_ctrl_state(since=0)
+                seq_val = int(st.get("chat_seq") or 0)
+                if self._send_relay_down_packet(down_topic, master_key, {
+                    "ok": True,
+                    "req_id": req_id,
+                    "nickname": nick,
+                    "state": self._pack_mobile_state(st),
+                }):
+                    self._relay_last_pushed_seq = seq_val
+            elif cmd == "chat":
+                res = self.ctrl.summarize_ai(
+                    style_id=str(params.get("style_id") or "custom"),
+                    prompt=str(params.get("prompt") or ""),
+                    action="send",
                     source_device="mobile",
                     speaker_name=nick,
                 )
+                st = self._get_ctrl_state(since=0)
+                seq_val = int(st.get("chat_seq") or 0)
+                if self._send_relay_down_packet(down_topic, master_key, {
+                    "ok": True,
+                    "req_id": req_id,
+                    "result": res,
+                    "state": self._pack_mobile_state(st),
+                }):
+                    self._relay_last_pushed_seq = seq_val
+            elif cmd == "action":
+                r = self._exec_remote_action(str(params.get("action") or ""))
+                st = self._get_ctrl_state(since=0)
+                self._send_relay_down_packet(down_topic, master_key, {
+                    "ok": True,
+                    "req_id": req_id,
+                    "result": r,
+                    "state": self._pack_mobile_state(st),
+                })
+            elif cmd == "confirm_target":
+                if hasattr(self.ctrl, "resolve_target_confirmation"):
+                    r = self.ctrl.resolve_target_confirmation(
+                        action=str(params.get("action") or ""),
+                        new_target=str(params.get("new_target") or ""),
+                        pending_id=str(params.get("pending_id") or ""),
+                        source_device="mobile",
+                        speaker_name=nick,
+                    )
+                else:
+                    r = {"ok": False, "message": "当前版本不支持远程看图确认"}
+                st = self._get_ctrl_state(since=0)
+                seq_val = int(st.get("chat_seq") or 0)
+                if self._send_relay_down_packet(down_topic, master_key, {
+                    "ok": True,
+                    "req_id": req_id,
+                    "result": r,
+                    "state": self._pack_mobile_state(st),
+                }):
+                    self._relay_last_pushed_seq = seq_val
             else:
-                r = {"ok": False, "message": "当前版本不支持远程看图确认"}
-            st = self.ctrl.get_state(since=0)
-            self._relay_last_pushed_seq = int(st.get("chat_seq") or 0)
-            self._send_relay_down_packet(down_topic, master_key, {
-                "ok": True,
-                "req_id": req_id,
-                "result": r,
-                "state": self._pack_mobile_state(st),
-            })
+                if req_id:
+                    self._send_relay_down_packet(down_topic, master_key, {
+                        "ok": False,
+                        "req_id": req_id,
+                        "message": f"未知云端指令：{cmd}",
+                    })
+        except Exception as exc:
+            self._relay_error = f"cmd:{cmd}: {str(exc)[:80]}"
+            if req_id:
+                try:
+                    self._send_relay_down_packet(down_topic, master_key, {
+                        "ok": False,
+                        "req_id": req_id,
+                        "message": f"电脑处理异常：{str(exc)[:120]}",
+                    })
+                except Exception:
+                    pass
 
     def notify_state_changed(self, force_push=False):
         """电脑端聊天或运行状态变化时，立即唤醒云中继推流线程做 0 延迟推送。"""
@@ -3281,25 +3464,31 @@ class MobileBridgeManager:
     def _cloud_state_push_loop(self):
         while not self._relay_stop.is_set():
             try:
+                self._push_wakeup.clear()
+                force_now = self._force_push_flag.is_set()
                 has_pending = bool(getattr(self.ctrl, "_pending_target_confirm", None))
                 recent_active = (time.time() - self._relay_last_active_ts) < 3600
-                if self.cloud_relay_enabled and (recent_active or self._force_push_flag.is_set() or has_pending):
+                if self.cloud_relay_enabled and (recent_active or force_now or has_pending):
                     nick = self._get_local_nick()
                     if nick:
                         seq_now = int(getattr(self.ctrl, "_chat_seq", 0))
-                        if seq_now != self._relay_last_pushed_seq:
-                            self._relay_last_pushed_seq = seq_now
+                        if force_now or seq_now != self._relay_last_pushed_seq:
                             cred = CloudRelayCrypto.derive_room_and_key(nick, self.mobile_pin)
-                            st = self.ctrl.get_state(since=0)
-                            self._send_relay_down_packet(cred["down_topic"], cred["master_key"], {
+                            st = self._get_ctrl_state(since=0)
+                            if self._send_relay_down_packet(cred["down_topic"], cred["master_key"], {
                                 "ok": True,
                                 "state": self._pack_mobile_state(st),
-                            })
-                    self._force_push_flag.clear()
+                            }):
+                                self._relay_last_pushed_seq = seq_now
+                                if force_now:
+                                    self._force_push_flag.clear()
+                        elif force_now:
+                            self._force_push_flag.clear()
+                    elif force_now:
+                        self._force_push_flag.clear()
             except Exception:
                 pass
             self._push_wakeup.wait(timeout=0.7)
-            self._push_wakeup.clear()
 
     def _mqtt_broker_loop(self, host, port):
         backoff = 1.2
@@ -3317,10 +3506,12 @@ class MobileBridgeManager:
             up_topic = cred["up_topic"]
             down_topic = cred["down_topic"]
             master_key = cred["master_key"]
+            raw_sock = None
             ssock = None
             try:
                 raw_sock = socket.create_connection((host, port), timeout=8.0)
                 ssock = ctx.wrap_socket(raw_sock, server_hostname=host)
+                raw_sock = None
                 ssock.settimeout(8.0)
                 send_lock = threading.Lock()
                 cid = f"smpc_{os.getpid()}_{secrets.token_hex(4)}"
@@ -3342,6 +3533,7 @@ class MobileBridgeManager:
                 backoff = 1.2
 
                 ssock.settimeout(22.0)
+                awaiting_pong = False
                 while not self._relay_stop.is_set():
                     if (
                         not self.cloud_relay_enabled
@@ -3351,11 +3543,17 @@ class MobileBridgeManager:
                         break
                     try:
                         hdr, body = _mqtt_read_packet(ssock)
+                        awaiting_pong = False
                     except (socket.timeout, TimeoutError):
+                        if awaiting_pong:
+                            raise ConnectionError("MQTT PINGRESP timeout")
                         with send_lock:
                             ssock.sendall(b"\xc0\x00")
+                        awaiting_pong = True
                         continue
                     ptype = hdr & 0xF0
+                    if ptype == 0xD0:
+                        continue
                     if ptype == 0x30:
                         _tp, payload_b = _mqtt_parse_publish(hdr, body)
                         raw_txt = payload_b.decode("utf-8", errors="ignore")
@@ -3369,6 +3567,8 @@ class MobileBridgeManager:
                             def _run_cmd(_o=obj):
                                 try:
                                     self._handle_relay_command(_o, nick, down_topic, master_key)
+                                except Exception:
+                                    pass
                                 finally:
                                     self._relay_cmd_sem.release()
 
@@ -3384,11 +3584,12 @@ class MobileBridgeManager:
                     if self._mqtt_conns.get(host, {}).get("sock") is ssock:
                         self._mqtt_conns.pop(host, None)
                     self._relay_connected = bool(self._mqtt_conns)
-                if ssock is not None:
-                    try:
-                        ssock.close()
-                    except Exception:
-                        pass
+                for _s_cls in (ssock, raw_sock):
+                    if _s_cls is not None:
+                        try:
+                            _s_cls.close()
+                        except Exception:
+                            pass
             if not self._relay_stop.is_set():
                 if self._get_local_nick() == nick and self.mobile_pin == pin_snap:
                     time.sleep(backoff)
@@ -3399,6 +3600,7 @@ class MobileBridgeManager:
 
     def stop(self):
         self._relay_stop.set()
+        self._push_wakeup.set()
         self.notify_credentials_changed()
         self.stop_tunnel()
         with self._lock:
@@ -3558,6 +3760,7 @@ class MobileBridgeManager:
             return {"ok": False, "message": "为了远程安全，访问密码不能为空！"}
         with self._lock:
             self.mobile_pin = val
+            self._tokens.clear()
             self._save_remote_cfg()
         self.notify_credentials_changed()
         return {"ok": True, "need_pin": True, "remote_password": val, "message": "访问密码已更新（已同步刷新加密通道）"}
